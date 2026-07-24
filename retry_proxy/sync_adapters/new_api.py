@@ -38,6 +38,21 @@ def _unwrap(response):
     return payload
 
 
+def _is_auth_failure(response):
+    if response.status_code == 401:
+        return True
+    try:
+        payload = response.json()
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(payload, dict) or payload.get("success") is not False:
+        return False
+    message = str(payload.get("message") or "").lower()
+    return any(marker in message for marker in (
+        "登录状态", "重新登录", "login expired", "login required", "unauthorized",
+    ))
+
+
 def _number_text(value):
     try:
         return format(float(value), ".12g")
@@ -50,6 +65,12 @@ def _cookie_header(cookies):
         f"{name}={value}" for name, value in (cookies or {}).items()
         if name and value
     )
+
+
+def _copy_session(session):
+    copied = dict(session or {})
+    copied["cookies"] = dict(copied.get("cookies") or {})
+    return copied
 
 
 def _token_group(item, default_group="default"):
@@ -143,6 +164,8 @@ class NewAPIAdapter(PoolSyncAdapter):
         self._merge_response_cookies(session, response)
         if not session["access_token"] and not session["cookies"]:
             raise PoolSyncError("登录响应缺少可用的访问令牌或会话 Cookie")
+        if not session["cookies"].get("new_api_refresh"):
+            session["password"] = password
         return session
 
     async def _refresh(self, client, source, session):
@@ -173,6 +196,7 @@ class NewAPIAdapter(PoolSyncAdapter):
 
     async def _request(self, client, source, session, method, path, *, params=None,
                        body=None, retry=True):
+        session = _copy_session(session)
         if not session.get("access_token") and (session.get("cookies") or {}).get(
                 "new_api_refresh"):
             session = await self._refresh(client, source, session)
@@ -181,36 +205,76 @@ class NewAPIAdapter(PoolSyncAdapter):
             headers=self._headers(source, session), timeout=20,
         )
         self._merge_response_cookies(session, response)
-        if response.status_code == 401 and retry and (session.get("cookies") or {}).get(
-                "new_api_refresh"):
-            session["access_token"] = ""
-            session = await self._refresh(client, source, session)
-            return await self._request(
-                client, source, session, method, path, params=params, body=body,
-                retry=False,
-            )
+        if retry and _is_auth_failure(response):
+            if (session.get("cookies") or {}).get("new_api_refresh"):
+                refreshed = _copy_session(session)
+                refreshed["access_token"] = ""
+                refreshed = await self._refresh(client, source, refreshed)
+                return await self._request(
+                    client, source, refreshed, method, path, params=params, body=body,
+                    retry=False,
+                )
+            if session.get("access_token") and session.get("cookies"):
+                # Some New API forks send a short-lived bearer together with a
+                # longer-lived legacy session cookie. Retry without the expired
+                # bearer so the server can authenticate the cookie instead.
+                cookie_session = _copy_session(session)
+                cookie_session["access_token"] = ""
+                cookie_response = await client.request(
+                    method, source["base_url"] + path, params=params, json=body,
+                    headers=self._headers(source, cookie_session), timeout=20,
+                )
+                self._merge_response_cookies(cookie_session, cookie_response)
+                if not _is_auth_failure(cookie_response):
+                    return cookie_session, _unwrap(cookie_response)
+            username = str(session.get("username") or "").strip()
+            password = session.get("password") or ""
+            if username and password:
+                relogged = await self.connect(
+                    client, source, {"username": username, "password": password},
+                )
+                return await self._request(
+                    client, source, relogged, method, path, params=params, body=body,
+                    retry=False,
+                )
         return session, _unwrap(response)
 
     async def _fetch_all_tokens(self, client, source, session):
         items = []
         page = 1
+        page_size = 100
+        previous_page_ids = None
         while True:
             session, data = await self._request(
                 client, source, session, "GET", "/api/token/",
-                params={"p": page, "page_size": 100},
+                params={"p": page, "size": page_size, "page_size": page_size},
             )
             if isinstance(data, list):
-                batch, total = data, len(data)
+                return session, data
             elif isinstance(data, dict):
                 batch = data.get("items") or data.get("data") or data.get("list") or []
-                total = int(data.get("total", len(batch)))
+                try:
+                    total = int(data["total"]) if data.get("total") is not None else None
+                except (TypeError, ValueError):
+                    total = None
             else:
                 raise PoolSyncError("Token 列表响应格式无法识别")
             if not isinstance(batch, list):
                 raise PoolSyncError("Token 列表响应格式无法识别")
+            page_ids = tuple(
+                str(item.get("id")) if isinstance(item, dict) and item.get("id") is not None
+                else repr(item)
+                for item in batch
+            )
+            if batch and page_ids == previous_page_ids:
+                raise PoolSyncError("Token 列表分页重复，上游可能不支持分页参数")
+            previous_page_ids = page_ids
             items.extend(batch)
-            if not batch or len(items) >= total or len(batch) < 100:
+            if (not batch or (total is not None and len(items) >= total)
+                    or (total is None and len(batch) < page_size)):
                 return session, items
+            if page >= 1000:
+                raise PoolSyncError("Token 列表分页超过安全上限")
             page += 1
 
     async def _fill_full_keys(self, client, source, session, tokens):
@@ -410,3 +474,10 @@ class NewAPIAdapter(PoolSyncAdapter):
             "email": session.get("email") or session.get("username", ""),
             "username": session.get("username", ""),
         }
+
+    def persistent_session(self, session):
+        persisted = _copy_session(session)
+        if persisted["cookies"].get("new_api_refresh"):
+            persisted.pop("access_token", None)
+            persisted.pop("password", None)
+        return persisted

@@ -105,9 +105,9 @@ KEY_AUTH_SCHEME=           # 空值，直接放裸 key，不加 Bearer 前缀
 
 `sub2api` 适配器使用邮箱密码完成首次登录，随后仅保存刷新令牌，密码不会落盘。它同步完整 Key、Key 名称、分组名称、启用状态、默认倍率及用户专属倍率。已有 Key 的 `models`、`paths` 规则和运行时熔断状态会在热更新时保留。
 
-`newapi` 适配器适用于 [QuantumNous/New-API](https://github.com/QuantumNous/new-api) 及兼容的二次部署。它使用用户名（也可填写站点接受的邮箱）和密码登录，同步当前用户拥有的启用 Token、名称、分组倍率及 Token 模型限制。新版 New API 的列表只返回掩码 Token，适配器会通过受保护的批量接口读取完整 Key；也兼容仍在列表中返回完整 Key、使用 Cookie 会话的旧版本。管理页可按 New API 用户分组创建无限额度、永不过期的 Token，或清空所选分组的远程 Token。
+`newapi` 适配器适用于 [QuantumNous/New-API](https://github.com/QuantumNous/new-api) 及兼容的二次部署。它使用用户名（也可填写站点接受的邮箱）和密码登录，同步当前用户拥有的启用 Token、名称、分组倍率及 Token 模型限制。新版 New API 的列表只返回掩码 Token，适配器会通过受保护的批量接口读取完整 Key；也兼容仍在列表中返回完整 Key、使用 Cookie 会话的旧版本。对于同时返回短期 Bearer 和旧式 `session` Cookie 的兼容部署，Bearer 失效后会自动退回 Cookie 会话重试。管理页可按 New API 用户分组创建无限额度、永不过期的 Token，或清空所选分组的远程 Token。
 
-New API 登录密码不会保存。状态文件只保留自动续期所需的刷新 Cookie（旧版本为登录会话 Cookie），短期 `access_token` 会在写盘前剔除；因此仍须保护 `KEY_POOL_SYNC_STATE_FILE`，不要把它提交到版本库或通过不受信任的文件共享服务分发。启用两步验证或强制人机验证的账号当前不能通过该适配器登录。
+支持刷新 Cookie 的新版 New API 只保留自动续期所需的刷新 Cookie，短期 `access_token` 和登录密码会在写盘前剔除。没有刷新 Cookie、同时依赖 Bearer 和旧式 `session` Cookie 的兼容部署无法续签短期 Bearer，因此会在状态文件中保留 Bearer、登录 Cookie 和密码；会话失效时适配器自动重新登录，以维持定时同步。因此必须保护 `KEY_POOL_SYNC_STATE_FILE`，不要把它提交到版本库或通过不受信任的文件共享服务分发。状态文件权限默认为 `0600`，但这不等同于加密存储。启用两步验证、强制人机验证或禁用密码登录的账号无法使用自动重新登录。
 
 连接时若提示上游返回 HTTP 403 HTML/CDN 页面，请先确认 `base_url` 填写的是站点根地址（不含 `/api/v1` 等接口路径），再检查代理所在机器的出口 IP 是否被上游 CDN/WAF 拦截，以及站点是否强制启用了人机验证。在线同步通过服务端 API 登录，无法完成浏览器交互式验证；需要由站点管理员为该 API 调用提供可用的访问策略。
 

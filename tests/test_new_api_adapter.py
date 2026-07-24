@@ -3,6 +3,7 @@ import unittest
 
 import httpx
 
+from retry_proxy.pool_sync import PoolSyncManager
 from retry_proxy.sync_adapters import ADAPTERS, PoolSyncError
 from retry_proxy.sync_adapters.new_api import NewAPIAdapter, _unwrap
 
@@ -17,6 +18,41 @@ def api_response(data=None, *, success=True, status=200, headers=None):
 class NewAPIAdapterTests(unittest.IsolatedAsyncioTestCase):
     def test_adapter_is_registered(self):
         self.assertIsInstance(ADAPTERS["newapi"], NewAPIAdapter)
+
+    def test_persistent_session_keeps_bearer_only_without_refresh_cookie(self):
+        adapter = NewAPIAdapter()
+        legacy = adapter.persistent_session({
+            "access_token": "legacy-access", "password": "legacy-password",
+            "cookies": {"session": "legacy-session"},
+        })
+        current = adapter.persistent_session({
+            "access_token": "short-access", "password": "unused-password",
+            "cookies": {"new_api_refresh": "refresh-cookie"},
+        })
+
+        self.assertEqual(legacy["access_token"], "legacy-access")
+        self.assertEqual(legacy["password"], "legacy-password")
+        self.assertNotIn("access_token", current)
+        self.assertNotIn("password", current)
+        self.assertEqual(current["cookies"]["new_api_refresh"], "refresh-cookie")
+
+    def test_pool_sync_state_keeps_legacy_new_api_bearer(self):
+        adapter = NewAPIAdapter()
+        manager = PoolSyncManager({}, config=None, adapters={"newapi": adapter})
+        manager.sources = {"source": {
+            "id": "source", "adapter": "newapi", "base_url": "https://legacy.test",
+            "session": {
+                "access_token": "persistent-access",
+                "password": "persistent-password",
+                "cookies": {"session": "persistent-session"},
+            },
+        }}
+
+        persisted = manager._persistent_sources()[0]["session"]
+
+        self.assertEqual(persisted["access_token"], "persistent-access")
+        self.assertEqual(persisted["password"], "persistent-password")
+        self.assertEqual(persisted["cookies"]["session"], "persistent-session")
 
     def test_non_json_cloudflare_response_does_not_expose_body(self):
         response = httpx.Response(
@@ -134,6 +170,164 @@ class NewAPIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([request.url.path for request in calls], [
             "/api/user/auth/refresh", "/api/token/", "/api/user/self/groups",
         ])
+
+    async def test_expired_bearer_falls_back_to_legacy_cookie_session(self):
+        token_requests = []
+
+        async def handler(request):
+            if request.url.path == "/api/token/":
+                token_requests.append(request)
+                if len(token_requests) == 1:
+                    self.assertEqual(request.headers["authorization"], "Bearer expired")
+                    return httpx.Response(200, json={
+                        "success": False,
+                        "message": "登录状态已失效，请重新登录",
+                        "data": None,
+                    })
+                self.assertNotIn("authorization", request.headers)
+                self.assertIn("session=legacy-cookie", request.headers["cookie"])
+                self.assertEqual(request.headers["new-api-user"], "9")
+                return api_response({"items": [], "total": 0})
+            if request.url.path == "/api/user/self/groups":
+                self.assertNotIn("authorization", request.headers)
+                return api_response({})
+            raise AssertionError(request.url)
+
+        session = {
+            "access_token": "expired", "user_id": 9,
+            "cookies": {"session": "legacy-cookie"},
+        }
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            session, entries = await NewAPIAdapter().fetch(
+                client, {"base_url": "https://legacy.test"}, session,
+            )
+
+        self.assertEqual(entries, [])
+        self.assertEqual(session["access_token"], "")
+        self.assertEqual(len(token_requests), 2)
+
+    async def test_failed_cookie_fallback_relogs_in_without_mutating_original_session(self):
+        calls = []
+
+        async def handler(request):
+            calls.append(request)
+            if request.url.path == "/api/user/login":
+                return api_response({
+                    "access_token": "fresh-access",
+                    "user": {"id": 9, "username": "legacy"},
+                }, headers={"set-cookie": "session=fresh-session; Path=/; HttpOnly"})
+            if request.url.path == "/api/token/":
+                authorization = request.headers.get("authorization")
+                cookie = request.headers.get("cookie", "")
+                if authorization == "Bearer fresh-access" and "session=fresh-session" in cookie:
+                    return api_response({"items": [], "total": 0})
+                return httpx.Response(200, json={
+                    "success": False,
+                    "message": "登录状态已失效，请重新登录",
+                    "data": None,
+                })
+            if request.url.path == "/api/user/self/groups":
+                return api_response({})
+            raise AssertionError(request.url)
+
+        original = {
+            "username": "legacy", "password": "secret", "user_id": 9,
+            "access_token": "expired", "cookies": {"session": "expired-session"},
+        }
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            session, entries = await NewAPIAdapter().fetch(
+                client, {"base_url": "https://legacy.test"}, original,
+            )
+
+        self.assertEqual(entries, [])
+        self.assertEqual(original["access_token"], "expired")
+        self.assertEqual(original["cookies"], {"session": "expired-session"})
+        self.assertEqual(session["access_token"], "fresh-access")
+        self.assertEqual(session["password"], "secret")
+        self.assertEqual([request.url.path for request in calls[:4]], [
+            "/api/token/", "/api/token/", "/api/user/login", "/api/token/",
+        ])
+
+    async def test_failed_cookie_fallback_does_not_mutate_session_without_password(self):
+        async def handler(request):
+            return httpx.Response(200, json={
+                "success": False,
+                "message": "登录状态已失效，请重新登录",
+                "data": None,
+            })
+
+        original = {
+            "username": "legacy", "user_id": 9, "access_token": "expired",
+            "cookies": {"session": "expired-session"},
+        }
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with self.assertRaisesRegex(PoolSyncError, "登录状态已失效"):
+                await NewAPIAdapter().fetch(
+                    client, {"base_url": "https://legacy.test"}, original,
+                )
+
+        self.assertEqual(original["access_token"], "expired")
+        self.assertEqual(original["cookies"], {"session": "expired-session"})
+
+    async def test_token_pagination_supports_size_and_short_server_pages(self):
+        pages = []
+
+        async def handler(request):
+            self.assertEqual(request.url.path, "/api/token/")
+            page = int(request.url.params["p"])
+            pages.append(page)
+            self.assertEqual(request.url.params["size"], "100")
+            self.assertEqual(request.url.params["page_size"], "100")
+            start = (page - 1) * 10
+            count = 10 if page == 1 else 5
+            return api_response({
+                "items": [{"id": index, "key": f"sk-{index}"}
+                          for index in range(start, start + count)],
+                "total": 15,
+            })
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            _, tokens = await NewAPIAdapter()._fetch_all_tokens(
+                client,
+                {"base_url": "https://legacy.test"},
+                {"cookies": {"session": "legacy-cookie"}},
+            )
+
+        self.assertEqual(pages, [1, 2])
+        self.assertEqual(len(tokens), 15)
+
+    async def test_top_level_token_list_of_exact_page_size_is_not_paginated(self):
+        calls = 0
+
+        async def handler(request):
+            nonlocal calls
+            calls += 1
+            return api_response([{"id": index, "key": f"sk-{index}"}
+                                 for index in range(100)])
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            _, tokens = await NewAPIAdapter()._fetch_all_tokens(
+                client, {"base_url": "https://legacy.test"},
+                {"cookies": {"session": "legacy-cookie"}},
+            )
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(len(tokens), 100)
+
+    async def test_repeated_token_page_is_rejected(self):
+        async def handler(request):
+            return api_response({
+                "items": [{"id": index, "key": f"sk-{index}"}
+                          for index in range(100)],
+                "total": 200,
+            })
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with self.assertRaisesRegex(PoolSyncError, "分页重复"):
+                await NewAPIAdapter()._fetch_all_tokens(
+                    client, {"base_url": "https://legacy.test"},
+                    {"cookies": {"session": "legacy-cookie"}},
+                )
 
     async def test_legacy_cookie_session_and_full_token_list_are_supported(self):
         async def handler(request):

@@ -63,3 +63,9 @@ class PoolSyncAdapter(ABC):
 
     def public_session(self, session):
         return {}
+
+    def persistent_session(self, session):
+        """Return the session fields that may be written to the state file."""
+        persisted = dict(session or {})
+        persisted.pop("access_token", None)
+        return persisted

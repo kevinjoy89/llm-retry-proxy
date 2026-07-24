@@ -119,8 +119,8 @@ class PoolSyncManager:
         sources = []
         for source in self.sources.values():
             item = dict(source)
-            item["session"] = dict(item.get("session") or {})
-            item["session"].pop("access_token", None)
+            adapter = self._adapter(item["adapter"])
+            item["session"] = adapter.persistent_session(item.get("session") or {})
             sources.append(item)
         return sources
 
