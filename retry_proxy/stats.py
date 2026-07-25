@@ -29,8 +29,15 @@ def _status_category(s) -> str:
     return "5xx"
 
 
+def _req_cancelled(r: dict) -> bool:
+    """Return whether the downstream ended a Responses stream early."""
+    return r.get("stream_status") == "cancelled"
+
+
 def _req_succeeded(r: dict) -> bool:
     """Prefer the recorded stream outcome, falling back to the HTTP status."""
+    if _req_cancelled(r):
+        return False
     if "succeeded" in r:
         return bool(r["succeeded"])
     return r.get("final_status", 0) < 400
@@ -54,7 +61,8 @@ def _model_key(r: dict) -> str:
 
 def _agg_by(records: list, key: str, label: str, key_fn=None):
     buckets = defaultdict(lambda: {
-        "requests": 0, "retries": 0, "succeeded": 0, "first_ok": 0, "max_retries": 0, "fail": 0,
+        "requests": 0, "retries": 0, "succeeded": 0, "first_ok": 0,
+        "cancelled": 0, "max_retries": 0, "fail": 0,
         "durations": [], "fail_statuses": Counter(),
     })
     for r in records:
@@ -62,7 +70,10 @@ def _agg_by(records: list, key: str, label: str, key_fn=None):
         b = buckets[k]
         b["requests"] += 1
         b["retries"] += r.get("retries", 0)
-        if _req_succeeded(r):
+        cancelled = _req_cancelled(r)
+        if cancelled:
+            b["cancelled"] += 1
+        elif _req_succeeded(r):
             b["succeeded"] += 1
             if r.get("first_ok", r.get("retries", 0) == 0):
                 b["first_ok"] += 1
@@ -73,7 +84,7 @@ def _agg_by(records: list, key: str, label: str, key_fn=None):
         if rc:
             for code in rc:
                 b["fail_statuses"][code] += 1
-        elif not _req_succeeded(r):
+        elif not cancelled and not _req_succeeded(r):
             failure_status = r.get("stream_error_status") or r.get("upstream_status", 0)
             b["fail_statuses"][failure_status] += 1
         b["max_retries"] = max(b["max_retries"], r.get("retries", 0))
@@ -84,16 +95,18 @@ def _agg_by(records: list, key: str, label: str, key_fn=None):
     for k, b in buckets.items():
         ds = sorted(b["durations"])
         n = len(ds)
+        measured = b["requests"] - b["cancelled"]
         dom = b["fail_statuses"].most_common(1)
         out.append({
             label: k,
             "requests": b["requests"],
             "retries": b["retries"],
             "avg_retries": round(b["retries"] / b["requests"], 2) if b["requests"] else 0,
-            "success_rate": round(b["succeeded"] / b["requests"], 4) if b["requests"] else 0,
-            "availability_pct": round(b["succeeded"] / b["requests"] * 100, 2) if b["requests"] else 0,
-            "upstream_availability_pct": round(b["first_ok"] / b["requests"] * 100, 2) if b["requests"] else 0,
+            "success_rate": round(b["succeeded"] / measured, 4) if measured else 0,
+            "availability_pct": round(b["succeeded"] / measured * 100, 2) if measured else 0,
+            "upstream_availability_pct": round(b["first_ok"] / measured * 100, 2) if measured else 0,
             "failed": b["fail"],
+            "cancelled": b["cancelled"],
             "max_retries": b["max_retries"],
             "avg_duration": round(sum(ds) / n, 3) if n else 0,
             "p95_duration": round(_percentile(ds, 0.95), 3) if n else 0,
@@ -139,6 +152,9 @@ def _agg_by_key(records: list, key_aliases: dict = None) -> list:
             bucket = attempts[key_id]
             bucket["attempts"] += 1
             bucket["legacy"] += 1
+            if _req_cancelled(record):
+                bucket["ignored"] += 1
+                continue
             available = _req_succeeded(record)
             bucket["available" if available else "failed"] += 1
             bucket["events"].append((ts, record_index, 0, available))
@@ -285,6 +301,8 @@ def _upstream_window_stats(records: list) -> list:
         prev_total = 0
         prev_first_ok = 0
         for t, r in parsed:
+            if _req_cancelled(r):
+                continue
             if t >= cutoff:
                 total += 1
                 if _req_succeeded(r) and r.get("first_ok", r.get("retries", 0) == 0):
@@ -317,14 +335,16 @@ def _mode_comparison(records: list) -> list:
     """按竞速模式聚合对比数据。旧日志无 mode 字段的归入 'off'（串行）。"""
     buckets = defaultdict(lambda: {
         "requests": 0, "retries": 0, "succeeded": 0, "first_ok": 0,
-        "max_retries": 0, "fail": 0, "durations": [],
+        "cancelled": 0, "max_retries": 0, "fail": 0, "durations": [],
     })
     for r in records:
         m = r.get("mode", "") or "off"
         b = buckets[m]
         b["requests"] += 1
         b["retries"] += r.get("retries", 0)
-        if _req_succeeded(r):
+        if _req_cancelled(r):
+            b["cancelled"] += 1
+        elif _req_succeeded(r):
             b["succeeded"] += 1
             if r.get("first_ok", r.get("retries", 0) == 0):
                 b["first_ok"] += 1
@@ -343,6 +363,7 @@ def _mode_comparison(records: list) -> list:
         b = buckets[m]
         ds = sorted(b["durations"])
         n = len(ds)
+        measured = b["requests"] - b["cancelled"]
         out.append({
             "mode": m,
             "mode_label": MODE_LABELS.get(m, "未知/旧数据"),
@@ -351,8 +372,9 @@ def _mode_comparison(records: list) -> list:
             "avg_retries": round(b["retries"] / b["requests"], 2) if b["requests"] else 0,
             "succeeded": b["succeeded"],
             "failed": b["fail"],
-            "availability_pct": round(b["succeeded"] / b["requests"] * 100, 2) if b["requests"] else 0,
-            "upstream_availability_pct": round(b["first_ok"] / b["requests"] * 100, 2) if b["requests"] else 0,
+            "cancelled": b["cancelled"],
+            "availability_pct": round(b["succeeded"] / measured * 100, 2) if measured else 0,
+            "upstream_availability_pct": round(b["first_ok"] / measured * 100, 2) if measured else 0,
             "avg_duration": round(sum(ds) / n, 3) if n else 0,
             "p95_duration": round(_percentile(ds, 0.95), 3) if n else 0,
             "max_retries": b["max_retries"],
@@ -362,12 +384,14 @@ def _mode_comparison(records: list) -> list:
 
 def compute_stats(records: list, range_str: str, config: dict) -> dict:
     total = len(records)
+    cancelled = sum(1 for r in records if _req_cancelled(r))
+    measured = total - cancelled
     total_retries = sum(r.get("retries", 0) for r in records)
     succeeded = sum(1 for r in records if _req_succeeded(r))
     upstream_ok = sum(1 for r in records if _req_succeeded(r) and r.get("first_ok", r.get("retries", 0) == 0))
-    failed = total - succeeded
-    avail = round(succeeded / total * 100, 2) if total else 0
-    upstream_avail = round(upstream_ok / total * 100, 2) if total else 0
+    failed = measured - succeeded
+    avail = round(succeeded / measured * 100, 2) if measured else 0
+    upstream_avail = round(upstream_ok / measured * 100, 2) if measured else 0
 
     dist = Counter(r.get("retries", 0) for r in records)
     retry_distribution = [{"retries": k, "count": v} for k, v in sorted(dist.items())]
@@ -401,14 +425,19 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
     else:
         ts_slice = 10  # "2026-07-07"
 
-    tl = defaultdict(lambda: {"requests": 0, "retries": 0, "succeeded": 0, "first_ok": 0, "failed": 0})
+    tl = defaultdict(lambda: {
+        "requests": 0, "retries": 0, "succeeded": 0, "first_ok": 0,
+        "failed": 0, "cancelled": 0,
+    })
     for r in records:
         ts = r.get("ts", "")
         bucket = ts[:ts_slice] if len(ts) >= ts_slice else ts
         b = tl[bucket]
         b["requests"] += 1
         b["retries"] += r.get("retries", 0)
-        if _req_succeeded(r):
+        if _req_cancelled(r):
+            b["cancelled"] += 1
+        elif _req_succeeded(r):
             b["succeeded"] += 1
             if r.get("first_ok", r.get("retries", 0) == 0):
                 b["first_ok"] += 1
@@ -416,11 +445,12 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
             b["failed"] += 1
     timeline = []
     for b, s in sorted(tl.items()):
+        bucket_measured = s["requests"] - s["cancelled"]
         timeline.append({
             "ts": b, "requests": s["requests"], "retries": s["retries"],
-            "succeeded": s["succeeded"], "failed": s["failed"],
-            "availability_pct": round(s["succeeded"] / s["requests"] * 100, 2) if s["requests"] else 0,
-            "upstream_availability_pct": round(s["first_ok"] / s["requests"] * 100, 2) if s["requests"] else 0,
+            "succeeded": s["succeeded"], "failed": s["failed"], "cancelled": s["cancelled"],
+            "availability_pct": round(s["succeeded"] / bucket_measured * 100, 2) if bucket_measured else 0,
+            "upstream_availability_pct": round(s["first_ok"] / bucket_measured * 100, 2) if bucket_measured else 0,
         })
 
     upstream_sc = Counter()
@@ -486,6 +516,8 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
     cur_streak = 0
     cur_type = None
     for r in records:
+        if _req_cancelled(r):
+            continue
         ok = _req_succeeded(r)
         if ok:
             if cur_type == "success":
@@ -513,6 +545,7 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
         "ts": r.get("ts", ""), "model": _model_key(r), "path": r.get("path", ""),
         "retries": r.get("retries", 0), "duration_s": round(r.get("duration_s", 0), 2),
         "upstream_status": r.get("upstream_status", 0), "succeeded": _req_succeeded(r),
+        "cancelled": _req_cancelled(r),
     } for r in slowest]
 
     fastest = sorted(
@@ -526,7 +559,9 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
         "upstream_status": r.get("upstream_status", 0), "succeeded": _req_succeeded(r),
     } for r in fastest]
 
-    hour_buckets = defaultdict(lambda: {"requests": 0, "retries": 0, "succeeded": 0, "first_ok": 0})
+    hour_buckets = defaultdict(lambda: {
+        "requests": 0, "retries": 0, "succeeded": 0, "first_ok": 0, "cancelled": 0,
+    })
     for r in records:
         ts = r.get("ts", "")
         try:
@@ -535,17 +570,23 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
             continue
         hour_buckets[h]["requests"] += 1
         hour_buckets[h]["retries"] += r.get("retries", 0)
-        if _req_succeeded(r):
+        if _req_cancelled(r):
+            hour_buckets[h]["cancelled"] += 1
+        elif _req_succeeded(r):
             hour_buckets[h]["succeeded"] += 1
             if r.get("first_ok", r.get("retries", 0) == 0):
                 hour_buckets[h]["first_ok"] += 1
     by_hour = []
     for h in range(24):
-        s = hour_buckets.get(h, {"requests": 0, "retries": 0, "succeeded": 0, "first_ok": 0})
+        s = hour_buckets.get(h, {
+            "requests": 0, "retries": 0, "succeeded": 0, "first_ok": 0, "cancelled": 0,
+        })
+        hour_measured = s["requests"] - s["cancelled"]
         by_hour.append({
             "hour": h, "requests": s["requests"], "retries": s["retries"],
-            "availability_pct": round(s["succeeded"] / s["requests"] * 100, 2) if s["requests"] else 0,
-            "upstream_availability_pct": round(s["first_ok"] / s["requests"] * 100, 2) if s["requests"] else 0,
+            "cancelled": s["cancelled"],
+            "availability_pct": round(s["succeeded"] / hour_measured * 100, 2) if hour_measured else 0,
+            "upstream_availability_pct": round(s["first_ok"] / hour_measured * 100, 2) if hour_measured else 0,
         })
 
     by_path = _agg_by(records, "path", "path")
@@ -557,10 +598,11 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
             "total_requests": total,
             "total_retries": total_retries,
             "avg_retries": round(total_retries / total, 2) if total else 0,
-            "success_rate": round(succeeded / total, 4) if total else 0,
+            "success_rate": round(succeeded / measured, 4) if measured else 0,
             "availability_pct": avail,
             "upstream_availability_pct": upstream_avail,
             "failed_requests": failed,
+            "cancelled_requests": cancelled,
         },
         "by_provider": _agg_by(records, "provider", "provider"),
         "by_model": [m for m in _agg_by(records, "model", "model", key_fn=_model_key) if not m["model"].endswith("/(unknown)")],

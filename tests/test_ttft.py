@@ -82,6 +82,34 @@ class ResponsesStreamStateTests(unittest.TestCase):
             ("missing_terminal", None, False),
         )
 
+    def test_cancellation_after_terminal_event_keeps_completed_status(self):
+        state = _new_responses_stream_state()
+        _consume_responses_sse(
+            state,
+            b'data: {"type":"response.completed","response":{}}\n\n',
+        )
+
+        self.assertEqual(
+            _finish_responses_stream_state(
+                state, "text/event-stream", override="cancelled",
+            ),
+            ("completed", None, True),
+        )
+
+    def test_cancellation_before_terminal_event_stays_cancelled(self):
+        state = _new_responses_stream_state()
+        _consume_responses_sse(
+            state,
+            b'data: {"type":"response.output_item.done","item":{}}\n\n',
+        )
+
+        self.assertEqual(
+            _finish_responses_stream_state(
+                state, "text/event-stream", override="cancelled",
+            ),
+            ("cancelled", None, False),
+        )
+
     def test_html_bad_gateway_is_not_treated_as_responses_success(self):
         state = _new_responses_stream_state()
 

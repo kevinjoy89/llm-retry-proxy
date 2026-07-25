@@ -1,7 +1,8 @@
+import asyncio
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 from fastapi import HTTPException
@@ -10,6 +11,17 @@ from starlette.requests import Request
 from retry_proxy.config import admin_session_value, can_use_key_pool, require_admin
 from retry_proxy.api import create_handlers
 from retry_proxy.key_pool import KeyEntry, KeyPool
+
+
+class _BlockingStream(httpx.AsyncByteStream):
+    def __init__(self, first_chunk):
+        self.first_chunk = first_chunk
+        self.waiting = asyncio.Event()
+
+    async def __aiter__(self):
+        yield self.first_chunk
+        self.waiting.set()
+        await asyncio.Future()
 
 
 def _request(authorization="", cookie="", path="/stats/api"):
@@ -77,6 +89,71 @@ class ProxyPoolAuthTests(unittest.TestCase):
 
 
 class ProxyPoolRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_responses_stream_is_logged_as_client_end(self):
+        config = SimpleNamespace(
+            proxy_api_key="", dlp_mode="off", dlp_max_body_bytes=1024,
+            image_upstream_user_agent="", image_upstream_originator="",
+        )
+        upstream_stream = _BlockingStream(
+            b'data: {"type":"response.output_item.done","item":{}}\n\n',
+        )
+        upstream_response = httpx.Response(
+            200, stream=upstream_stream,
+            headers={"content-type": "text/event-stream"},
+            request=httpx.Request("POST", "https://upstream.test/responses"),
+        )
+        pool = KeyPool([("pool-key", "pool-key")])
+        entry = pool.entries[0]
+        result = SimpleNamespace(
+            response=upstream_response, winner_attempt=1, total_sent=1,
+            last_status=200, retry_codes=[], first_ok=True,
+            key_id=entry.key_id,
+            key_attempts=[{"key_id": entry.key_id, "available": True}],
+            started_at=time.time(), key_entry=entry,
+            response_started_mono=time.monotonic(),
+        )
+        service = SimpleNamespace(
+            request=lambda *args, **kwargs: None,
+            hedge_mode_for=lambda request_pool: "off",
+        )
+        store = SimpleNamespace(write=AsyncMock())
+        trace_logger = Mock()
+        proxy = create_handlers(service, store)[-1]
+        request = Request({
+            "type": "http", "method": "POST", "path": "/responses",
+            "headers": [(b"content-type", b"application/json")],
+            "query_string": b"", "server": ("test", 80), "client": ("127.0.0.1", 1),
+        }, receive=AsyncMock(return_value={
+            "type": "http.request",
+            "body": b'{"model":"grok-test","stream":true}',
+            "more_body": False,
+        }))
+
+        with patch("retry_proxy.api.settings", config), \
+                patch("retry_proxy.config.settings", config), \
+                patch("retry_proxy.api.logger", trace_logger), \
+                patch("retry_proxy.api.KEY_POOLS", {"https://upstream.test": pool}), \
+                patch("retry_proxy.api.match_route",
+                      return_value=("https://upstream.test", "test", "responses")), \
+                patch("retry_proxy.api._run_until_disconnect", AsyncMock(return_value=result)):
+            response = await proxy("responses", request)
+            iterator = response.body_iterator.__aiter__()
+            await iterator.__anext__()
+            next_chunk = asyncio.create_task(iterator.__anext__())
+            await upstream_stream.waiting.wait()
+            next_chunk.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await next_chunk
+
+        record = store.write.await_args.args[0]
+        self.assertEqual(record["stream_status"], "cancelled")
+        self.assertFalse(record["succeeded"])
+        self.assertIsNone(record["key_attempts"][-1]["available"])
+        info_messages = [call.args[0] for call in trace_logger.info.call_args_list]
+        warning_messages = [call.args[0] for call in trace_logger.warning.call_args_list]
+        self.assertTrue(any("Responses流客户端已结束" in message for message in info_messages))
+        self.assertFalse(any("Responses流失败" in message for message in warning_messages))
+
     async def test_responses_stream_logs_embedded_502_after_body_finishes(self):
         config = SimpleNamespace(
             proxy_api_key="", dlp_mode="off", dlp_max_body_bytes=1024,

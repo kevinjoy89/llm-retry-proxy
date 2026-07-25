@@ -467,7 +467,8 @@ function renderOverview(s,d,c,rc){
   ue.textContent=ua.toFixed(1)+'%';ue.style.color=availColor(ua);
   const a=s.availability_pct,ae=document.getElementById('s_avail');
   ae.textContent=a.toFixed(1)+'%';ae.style.color=availColor(a);
-  document.getElementById('s_avail_hint').textContent=`上游 ${ua.toFixed(1)}% · ${s.failed_requests} 次失败`;
+  const cancelled=s.cancelled_requests||0;
+  document.getElementById('s_avail_hint').textContent=`上游 ${ua.toFixed(1)}% · ${s.failed_requests} 次失败${cancelled?` · ${cancelled} 次客户端取消`:''}`;
   document.getElementById('s_fail').textContent=s.failed_requests;
   document.getElementById('s_p95').textContent=d.p95;
   if(c){
@@ -607,7 +608,7 @@ function renderDetailTable(tbodyId, rows){
     <td class="mono">${esc(r.ts).slice(0,19)}</td><td>${esc(r.model)}</td><td class="mono">${esc(r.path)}</td>
     <td class="num">${r.duration_s}</td><td class="num">${r.retries}</td>
     <td class="num">${r.upstream_status===0?'异常':r.upstream_status}</td>
-    <td>${r.succeeded?'<span class="pill ok">成功</span>':'<span class="pill danger">失败</span>'}</td></tr>`).join('');
+    <td>${r.cancelled?'<span class="pill muted">客户端取消</span>':r.succeeded?'<span class="pill ok">成功</span>':'<span class="pill danger">失败</span>'}</td></tr>`).join('');
 }
 
 function renderByHourChart(data){

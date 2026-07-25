@@ -70,8 +70,8 @@ python -m retry_proxy.dlp validate
 | `attempts` | 总尝试次数（含首次） |
 | `retries` | 重试次数 = `attempts - 1` |
 | `duration_s` | 总耗时（秒） |
-| `succeeded` | 请求是否完整成功。普通请求按 `final_status < 400` 判断；流式 Responses 请求还必须收到 `response.completed` 或 `response.incomplete` 终止事件 |
-| `stream_status` | 流式 Responses 请求的可选结果：`completed`、`incomplete`、`error`、`missing_terminal`、`invalid_content_type`、`transport_error` 或 `cancelled` |
+| `succeeded` | 请求是否完整成功。普通请求按 `final_status < 400` 判断；流式 Responses 请求还必须收到 `response.completed` 或 `response.incomplete` 终止事件。客户端取消时该字段仍为 `false`，但统计聚合会把它作为中性结果，不计入失败数和可用率分母 |
+| `stream_status` | 流式 Responses 请求的可选结果：`completed`、`incomplete`、`error`、`missing_terminal`、`invalid_content_type`、`transport_error` 或 `cancelled`。`cancelled` 表示下游客户端在终止事件前结束连接，不代表上游或客户端工具执行失败，也不会熔断对应 key |
 | `stream_error_status` | 流内错误事件或错误页面中识别出的可选 HTTP 状态码，例如 `502`；外层 HTTP 状态仍由 `upstream_status` / `final_status` 如实记录 |
 | `retry_codes` | 重试过程中上游返回的错误码列表，如 `[503, 503, 429]`。无重试时为空数组 `[]` |
 | `key_id` | 号池模式下使用的 key 标识。配置 `sort` 时为 `label|sort`，否则为 `label`；未设 label 时使用 key 前 8 字符 |

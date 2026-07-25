@@ -240,7 +240,7 @@ def _consume_responses_sse(state, chunk):
         state["buffer"] = state["buffer"][-65_536:]
 
 
-def _finish_responses_stream_state(state, content_type, saw_html=False):
+def _finish_responses_stream_state(state, content_type, saw_html=False, override=""):
     if "text/event-stream" not in (content_type or "").lower():
         return "invalid_content_type", (502 if saw_html else None), False
     if state["error"]:
@@ -249,6 +249,8 @@ def _finish_responses_stream_state(state, content_type, saw_html=False):
         return "completed", None, True
     if state["terminal"] == "response.incomplete":
         return "incomplete", None, True
+    if override:
+        return override, None, False
     return "missing_terminal", None, False
 
 
@@ -300,21 +302,26 @@ async def _run_until_disconnect(request, awaitable):
 def _summary_view(summary):
     out = []
     for name, b in summary.items():
+        measured = b["requests"] - b.get("cancelled", 0)
         out.append({"name": name, "requests": b["requests"], "retries": b["retries"],
                     "avg_retries": round(b["retries"] / b["requests"], 2) if b["requests"] else 0,
-                    "availability_pct": round(b["succeeded"] / b["requests"] * 100, 2) if b["requests"] else 0,
-                    "upstream_availability_pct": round(b.get("first_ok", 0) / b["requests"] * 100, 2) if b["requests"] else 0,
+                    "availability_pct": round(b["succeeded"] / measured * 100, 2) if measured else 0,
+                    "upstream_availability_pct": round(b.get("first_ok", 0) / measured * 100, 2) if measured else 0,
+                    "cancelled": b.get("cancelled", 0),
                     "max_retries": b["max_retries"]})
     return sorted(out, key=lambda x: x["requests"], reverse=True)
 
 
 def _cumulative(summary):
     total = summary["total_requests"]
+    cancelled = summary.get("total_cancelled", 0)
+    measured = total - cancelled
     return {"total_requests": total, "total_retries": summary["total_retries"],
             "avg_retries": round(summary["total_retries"] / total, 2) if total else 0,
-            "availability_pct": round(summary["total_succeeded"] / total * 100, 2) if total else 0,
-            "upstream_availability_pct": round(summary.get("total_first_ok", 0) / total * 100, 2) if total else 0,
+            "availability_pct": round(summary["total_succeeded"] / measured * 100, 2) if measured else 0,
+            "upstream_availability_pct": round(summary.get("total_first_ok", 0) / measured * 100, 2) if measured else 0,
             "succeeded": summary["total_succeeded"], "failed": summary["total_failed"],
+            "cancelled": cancelled,
             "by_provider": _summary_view(summary["by_provider"]), "by_model": _summary_view({k: v for k, v in summary["by_model"].items() if not k.endswith("/(unknown)")}),
             "by_key": _summary_view(summary.get("by_key", {})),
             "by_status": [{"status": k, "count": v} for k, v in sorted(summary["by_status"].items(), key=lambda x: -x[1])],
@@ -634,11 +641,8 @@ def create_handlers(service, store, pool_sync=None):
                 finally:
                     if responses_stream:
                         stream_status, stream_error_status, succeeded = _finish_responses_stream_state(
-                            stream_state, content_type, bad_gateway_body,
+                            stream_state, content_type, bad_gateway_body, stream_override,
                         )
-                        if stream_override:
-                            stream_status = stream_override
-                            succeeded = False
                         if not succeeded and entry is not None:
                             availability = None if stream_status == "cancelled" else False
                             for attempt in reversed(key_attempts):
@@ -656,6 +660,12 @@ def create_handlers(service, store, pool_sync=None):
                             logger.info(
                                 f"{_tag(request.method, path, provider, model_name, client_ip)} "
                                 f"Responses流结束 status={stream_status} HTTP={response.status_code} "
+                                f"总{time.time() - start:.2f}s"
+                            )
+                        elif stream_status == "cancelled":
+                            logger.info(
+                                f"{_tag(request.method, path, provider, model_name, client_ip)} "
+                                f"Responses流客户端已结束 HTTP={response.status_code} "
                                 f"总{time.time() - start:.2f}s"
                             )
                         else:

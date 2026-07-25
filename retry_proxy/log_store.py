@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 from .config import logger, settings
 from .routes import is_excluded_path
-from .stats import _model_key, _normalize_provider, _req_succeeded
+from .stats import _model_key, _normalize_provider, _req_cancelled, _req_succeeded
 
 
 class RetryLogStore:
@@ -14,14 +14,17 @@ class RetryLogStore:
         self.summary_cache = None
 
     def _new_summary(self):
-        return {"version": 5, "total_requests": 0, "total_retries": 0, "total_succeeded": 0,
-                "total_failed": 0, "total_first_ok": 0, "by_provider": {}, "by_model": {},
+        return {"version": 6, "total_requests": 0, "total_retries": 0, "total_succeeded": 0,
+                "total_failed": 0, "total_cancelled": 0, "total_first_ok": 0,
+                "by_provider": {}, "by_model": {},
                 "by_key": {}, "by_status": {}, "first_ts": None, "last_ts": None}
 
     def _update(self, summary, r):
         summary["total_requests"] += 1
         summary["total_retries"] += r.get("retries", 0)
-        if _req_succeeded(r):
+        if _req_cancelled(r):
+            summary["total_cancelled"] += 1
+        elif _req_succeeded(r):
             summary["total_succeeded"] += 1
             if r.get("first_ok", r.get("retries", 0) == 0): summary["total_first_ok"] += 1
         else: summary["total_failed"] += 1
@@ -31,9 +34,14 @@ class RetryLogStore:
         for field, key in (("by_provider", _normalize_provider(r.get("provider", "") or "(unknown)")),
                            ("by_model", _model_key(r)), ("by_key", r.get("key_id", ""))):
             if not key: continue
-            b = summary[field].setdefault(key, {"requests": 0, "retries": 0, "succeeded": 0, "first_ok": 0, "failed": 0, "max_retries": 0})
+            b = summary[field].setdefault(key, {
+                "requests": 0, "retries": 0, "succeeded": 0, "first_ok": 0,
+                "failed": 0, "cancelled": 0, "max_retries": 0,
+            })
             b["requests"] += 1; b["retries"] += r.get("retries", 0)
-            if _req_succeeded(r):
+            if _req_cancelled(r):
+                b["cancelled"] += 1
+            elif _req_succeeded(r):
                 b["succeeded"] += 1
                 if r.get("first_ok", r.get("retries", 0) == 0): b["first_ok"] += 1
             else: b["failed"] += 1
@@ -114,12 +122,13 @@ class RetryLogStore:
         except Exception as e:
             logger.warning(f"读取累计汇总失败，重新初始化: {e}")
             self.summary_cache = self._rebuild()
-        if self.summary_cache.get("version", 1) < 4:
+        if self.summary_cache.get("version", 1) < 6:
             logger.info("累计汇总格式过旧，从日志重建...")
             self.summary_cache = self._rebuild()
             if self.summary_cache.get("total_requests", 0) > 0: self._save()
-        self.summary_cache.setdefault("version", 5)
-        for key in ("total_requests", "total_retries", "total_succeeded", "total_failed", "total_first_ok"): self.summary_cache.setdefault(key, 0)
+        self.summary_cache.setdefault("version", 6)
+        for key in ("total_requests", "total_retries", "total_succeeded", "total_failed",
+                    "total_cancelled", "total_first_ok"): self.summary_cache.setdefault(key, 0)
         for key in ("by_provider", "by_model", "by_key", "by_status"): self.summary_cache.setdefault(key, {})
         self.summary_cache.setdefault("first_ts", None); self.summary_cache.setdefault("last_ts", None)
         self._cleanup()

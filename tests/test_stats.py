@@ -1,9 +1,51 @@
 import unittest
 
-from retry_proxy.stats import _agg_by, _agg_by_key, compute_key_pool_stats
+from retry_proxy.api import _cumulative
+from retry_proxy.log_store import RetryLogStore
+from retry_proxy.stats import _agg_by, _agg_by_key, compute_key_pool_stats, compute_stats
 
 
 class KeyAvailabilityStatsTests(unittest.TestCase):
+    def test_client_cancellation_is_excluded_from_failure_and_availability(self):
+        records = [
+            {"provider": "test", "model": "model", "final_status": 200,
+             "upstream_status": 200, "succeeded": True, "first_ok": True, "retries": 0},
+            {"provider": "test", "model": "model", "final_status": 503,
+             "upstream_status": 503, "succeeded": False, "first_ok": False, "retries": 0},
+            {"provider": "test", "model": "model", "final_status": 200,
+             "upstream_status": 200, "succeeded": False, "first_ok": True, "retries": 0,
+             "stream_status": "cancelled"},
+        ]
+
+        aggregate = _agg_by(records, "model", "model")[0]
+        stats = compute_stats(records, "today", {})
+
+        self.assertEqual(aggregate["requests"], 3)
+        self.assertEqual(aggregate["cancelled"], 1)
+        self.assertEqual(aggregate["failed"], 1)
+        self.assertEqual(aggregate["availability_pct"], 50)
+        self.assertEqual(stats["summary"]["total_requests"], 3)
+        self.assertEqual(stats["summary"]["cancelled_requests"], 1)
+        self.assertEqual(stats["summary"]["failed_requests"], 1)
+        self.assertEqual(stats["summary"]["success_rate"], 0.5)
+        self.assertEqual(stats["summary"]["availability_pct"], 50)
+
+    def test_cumulative_summary_tracks_cancellation_as_neutral(self):
+        store = RetryLogStore()
+        summary = store._new_summary()
+        store._update(summary, {
+            "provider": "test", "model": "model", "key_id": "key",
+            "upstream_status": 200, "final_status": 200, "retries": 0,
+            "succeeded": False, "stream_status": "cancelled",
+        })
+
+        cumulative = _cumulative(summary)
+
+        self.assertEqual(cumulative["total_requests"], 1)
+        self.assertEqual(cumulative["cancelled"], 1)
+        self.assertEqual(cumulative["failed"], 0)
+        self.assertEqual(cumulative["availability_pct"], 0)
+
     def test_stream_failure_overrides_successful_http_status(self):
         records = [{
             "provider": "test",
