@@ -10,9 +10,10 @@ env/
 
 # Environment / secrets
 .env
-key_pool.csv
-key_pool.csv~
-key_pool.csz~
+.env.*
+!.env.example
+key_pool*.csv*
+!key_pool.csv.example
 
 # Logs & runtime data
 logs/
@@ -20,6 +21,7 @@ logs.import/
 *.log
 *.jsonl
 *.jsonl.bak
+*.bak
 retry_log.jsonl.bak
 
 # OS
@@ -33,6 +35,8 @@ desktop.ini
 *.swp
 *~
 
-# Local tooling
+# Local tooling & AI tools
 .omo/
+.opencode/
+.codegraph/
 .playwright-mcp/
