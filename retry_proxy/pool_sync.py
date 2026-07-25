@@ -118,6 +118,10 @@ def _parse_experience_payload(payload, transform=None):
     return normalized
 
 
+def _manual_source_key_id(key):
+    return hashlib.sha256(f"manual-key:{key}".encode("utf-8")).hexdigest()[:12]
+
+
 class PoolSyncManager:
     """Schedules provider adapters and atomically applies their normalized key sets."""
 
@@ -470,7 +474,8 @@ class PoolSyncManager:
                 return await self._sync_source_locked(source_id)
             connected = [
                 sid for sid, source in self.sources.items()
-                if self._adapter(source["adapter"]).connected(source.get("session") or {})
+                if source.get("adapter") != "manual"
+                and self._adapter(source["adapter"]).connected(source.get("session") or {})
             ]
             if not connected:
                 raise PoolSyncError("没有已连接的号池同步来源")
@@ -1226,8 +1231,184 @@ class PoolSyncManager:
         }
 
     def _has_connected_sources(self):
-        return any(self._adapter(source["adapter"]).connected(source.get("session") or {})
+        return any(source.get("adapter") != "manual"
+                   and self._adapter(source["adapter"]).connected(source.get("session") or {})
                    for source in self.sources.values())
+
+    async def add_manual_keys(self, base_url, keys, provider="", route_prefix=""):
+        base_url = (base_url or self.default_url).strip().rstrip("/")
+        if not base_url.startswith(("http://", "https://")):
+            raise PoolSyncError("上游地址必须以 http:// 或 https:// 开头")
+        if not keys:
+            raise PoolSyncError("Key 列表不能为空")
+        provider = (provider or self.config.provider).strip()
+        source_id = _source_id("manual", base_url)
+        normalized_route_prefix = None
+        if route_prefix is not None:
+            try:
+                normalized_route_prefix = normalize_route_prefix(route_prefix)
+            except ValueError as exc:
+                raise PoolSyncError(str(exc)) from exc
+        async with self._lock:
+            source = self.sources.get(source_id)
+            if source is not None and source.get("adapter") != "manual":
+                raise PoolSyncError("该上游地址已由在线同步连接接管，请先删除或使用其他地址")
+            conflict = next((s for s in self.sources.values()
+                             if s.get("base_url") == base_url and s.get("adapter") != "manual"), None)
+            if conflict is not None:
+                raise PoolSyncError("该上游地址已由在线同步连接接管，请先删除或使用其他地址")
+            existing_keys = {item.get("key") for item in (source.get("entries") or []) if isinstance(item, dict)} if source else set()
+            entries = list(source.get("entries") or []) if source else []
+            added = 0
+            skipped = 0
+            for item in keys:
+                key = (item.get("key") or "").strip()
+                if not key:
+                    continue
+                if key in existing_keys:
+                    skipped += 1
+                    continue
+                models = item.get("models")
+                if isinstance(models, str):
+                    models = [p.strip() for p in models.split(";") if p.strip()]
+                paths = item.get("paths")
+                if isinstance(paths, str):
+                    paths = [p.strip() for p in paths.split(";") if p.strip()]
+                entries.append({
+                    "source_key_id": _manual_source_key_id(key),
+                    "key": key,
+                    "label": (item.get("label") or "").strip(),
+                    "sort": (item.get("sort") or "").strip(),
+                    "group_id": str(item.get("group_id") or "").strip(),
+                    "group_name": (item.get("group_name") or "").strip(),
+                    "key_name": "",
+                    "platform": "",
+                    "allow_image_generation": False,
+                    "routing_capabilities": {},
+                    "models": models or [],
+                    "paths": paths or [],
+                    "auth": item.get("auth"),
+                })
+                added += 1
+            if added == 0:
+                raise PoolSyncError("所有 Key 均已存在或为空，未添加新 Key")
+            if source is None:
+                source = {
+                    "id": source_id,
+                    "adapter": "manual",
+                    "base_url": base_url,
+                    "provider": provider,
+                    "session": {},
+                    "entries": entries,
+                    "route_prefix": normalized_route_prefix or "",
+                    "strategy": "cost",
+                    "target_ttft_s": 5.0,
+                    "session_affinity": False,
+                    "check_model": "",
+                    "disabled_key_ids": [],
+                    "group_model_cache": {},
+                    "group_model_rejections": {},
+                    "last_sync_at": _now_iso(),
+                    "last_attempt_at": _now_iso(),
+                    "last_error": "",
+                }
+                if normalized_route_prefix is not None:
+                    source["route_prefix"] = normalized_route_prefix
+                try:
+                    source["pool_url"] = self._resolve_pool_url(source)
+                except ValueError:
+                    source["pool_url"] = base_url
+                if self.route_registry is not None and source.get("route_prefix"):
+                    try:
+                        self.route_registry.register(
+                            source_id, source["route_prefix"], base_url, provider,
+                        )
+                    except ValueError as exc:
+                        logger.warning(f"手动号池代理路由未注册: {exc}")
+                self.sources[source_id] = source
+            else:
+                source["entries"] = entries
+                source["last_sync_at"] = _now_iso()
+            self._activate(source)
+            self._save_state()
+            logger.info(
+                f"手动号池已更新: upstream={base_url} 新增={added} 跳过={skipped} "
+                f"总计={len(entries)}"
+            )
+        return self.status()
+
+    async def remove_manual_keys(self, source_id, source_key_ids):
+        async with self._lock:
+            source = self.sources.get(source_id)
+            if source is None:
+                raise PoolSyncError("号池同步连接不存在")
+            if source.get("adapter") != "manual":
+                raise PoolSyncError("只能从手动管理的号池中删除 Key")
+            if not source_key_ids:
+                raise PoolSyncError("请指定要删除的 Key")
+            remove_set = {str(kid) for kid in source_key_ids if kid}
+            original_count = len(source.get("entries") or [])
+            source["entries"] = [
+                item for item in source.get("entries") or []
+                if str(item.get("source_key_id", "")) not in remove_set
+            ]
+            removed = original_count - len(source["entries"])
+            if removed == 0:
+                raise PoolSyncError("未找到指定的 Key")
+            disabled_key_ids = {
+                str(value) for value in source.get("disabled_key_ids", [])
+                if value not in (None, "")
+            }
+            source["disabled_key_ids"] = sorted(disabled_key_ids - remove_set)
+            if not source["entries"]:
+                pool_url = self._pool_url(source)
+                self.sources.pop(source_id, None)
+                self._restore_static(pool_url)
+                if self.route_registry is not None:
+                    self.route_registry.unregister(source_id)
+                logger.info(
+                    f"手动号池已清空并移除: upstream={source['base_url']}"
+                )
+            else:
+                self._activate(source)
+            self._save_state()
+            logger.info(
+                f"手动号池 Key 已删除: upstream={source['base_url']} "
+                f"删除={removed} 剩余={len(source.get('entries', []))}"
+            )
+        return self.status()
+
+    async def update_manual_key(self, source_id, source_key_id, updates):
+        if not source_key_id:
+            raise PoolSyncError("source_key_id 不能为空")
+        allowed_fields = {"label", "sort", "group_id", "group_name", "models", "paths", "auth"}
+        filtered = {key: value for key, value in (updates or {}).items() if key in allowed_fields}
+        if not filtered:
+            raise PoolSyncError("没有可更新的字段")
+        async with self._lock:
+            source = self.sources.get(source_id)
+            if source is None:
+                raise PoolSyncError("号池同步连接不存在")
+            if source.get("adapter") != "manual":
+                raise PoolSyncError("只能编辑手动管理的号池 Key")
+            entry = next(
+                (item for item in source.get("entries") or []
+                 if str(item.get("source_key_id")) == str(source_key_id)),
+                None,
+            )
+            if entry is None:
+                raise PoolSyncError("指定的 Key 不存在")
+            for field, value in filtered.items():
+                if field == "models" and isinstance(value, str):
+                    value = [p.strip() for p in value.split(";") if p.strip()]
+                if field == "paths" and isinstance(value, str):
+                    value = [p.strip() for p in value.split(";") if p.strip()]
+                if field == "group_id" and value is not None:
+                    value = str(value)
+                entry[field] = value
+            self._activate(source)
+            self._save_state()
+        return self.status()
 
     async def start(self):
         if self._task is None and self._has_connected_sources() and self.config.key_pool_sync_interval > 0:

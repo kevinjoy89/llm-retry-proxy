@@ -1113,5 +1113,201 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.status()["defaults"]["base_url"], "https://configured-pool.test")
 
 
+class ManualAdapterTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.state_file = os.path.join(self.tempdir.name, "sync.json")
+        self.config = SimpleNamespace(
+            key_pool_sync_state_file=self.state_file,
+            key_pool_sync_default_adapter="manual",
+            key_pool_sync_default_url="https://manual.test",
+            key_pool_sync_interval=0,
+            provider="manual-provider",
+        )
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    async def test_add_manual_keys_creates_source_and_pool(self):
+        from retry_proxy.sync_adapters.manual import ManualAdapter
+        pools = {}
+        manager = PoolSyncManager(pools, self.config, None, {"manual": ManualAdapter()})
+
+        status = await manager.add_manual_keys(
+            "https://manual.test",
+            [{"key": "sk-key-1", "label": "Key One", "sort": "1"}],
+        )
+
+        self.assertIn("https://manual.test", pools)
+        self.assertEqual(len(pools["https://manual.test"].entries), 1)
+        self.assertEqual(pools["https://manual.test"].entries[0].key, "sk-key-1")
+        self.assertEqual(pools["https://manual.test"].entries[0].label, "Key One")
+        self.assertEqual(status["sources"][0]["adapter"], "manual")
+        self.assertEqual(status["sources"][0]["key_count"], 1)
+
+    async def test_add_manual_keys_appends_to_existing(self):
+        from retry_proxy.sync_adapters.manual import ManualAdapter
+        pools = {}
+        manager = PoolSyncManager(pools, self.config, None, {"manual": ManualAdapter()})
+
+        await manager.add_manual_keys(
+            "https://manual.test",
+            [{"key": "sk-key-1", "label": "First"}],
+        )
+        status = await manager.add_manual_keys(
+            "https://manual.test",
+            [{"key": "sk-key-2", "label": "Second"}],
+        )
+
+        self.assertEqual(len(pools["https://manual.test"].entries), 2)
+        self.assertEqual(status["sources"][0]["key_count"], 2)
+
+    async def test_add_manual_keys_skips_duplicate(self):
+        from retry_proxy.sync_adapters.manual import ManualAdapter
+        pools = {}
+        manager = PoolSyncManager(pools, self.config, None, {"manual": ManualAdapter()})
+
+        await manager.add_manual_keys(
+            "https://manual.test",
+            [{"key": "sk-key-1"}],
+        )
+        # Adding the same key again should skip
+        with self.assertRaises(PoolSyncError):
+            await manager.add_manual_keys(
+                "https://manual.test",
+                [{"key": "sk-key-1"}],
+            )
+        # Pool still has just 1 entry
+        self.assertEqual(len(pools["https://manual.test"].entries), 1)
+
+    async def test_add_manual_keys_with_models_and_paths(self):
+        from retry_proxy.sync_adapters.manual import ManualAdapter
+        pools = {}
+        manager = PoolSyncManager(pools, self.config, None, {"manual": ManualAdapter()})
+
+        status = await manager.add_manual_keys(
+            "https://manual.test",
+            [{"key": "sk-key-1", "models": "gpt-4*;claude*", "paths": "v1/chat/*"}],
+        )
+
+        entry = pools["https://manual.test"].entries[0]
+        self.assertEqual(entry.models, ("gpt-4*", "claude*"))
+        self.assertEqual(entry.paths, ("v1/chat/*",))
+
+    async def test_remove_manual_keys(self):
+        from retry_proxy.sync_adapters.manual import ManualAdapter
+        pools = {}
+        manager = PoolSyncManager(pools, self.config, None, {"manual": ManualAdapter()})
+
+        status = await manager.add_manual_keys(
+            "https://manual.test",
+            [{"key": "sk-key-1"}, {"key": "sk-key-2"}],
+        )
+        source_id = status["sources"][0]["id"]
+        source_key_id = status["sources"][0]["keys"][0]["source_key_id"]
+
+        status = await manager.remove_manual_keys(source_id, [source_key_id])
+        self.assertEqual(len(pools["https://manual.test"].entries), 1)
+        self.assertEqual(pools["https://manual.test"].entries[0].key, "sk-key-2")
+
+    async def test_remove_all_manual_keys_deletes_source(self):
+        from retry_proxy.sync_adapters.manual import ManualAdapter
+        pools = {}
+        manager = PoolSyncManager(pools, self.config, None, {"manual": ManualAdapter()})
+
+        status = await manager.add_manual_keys(
+            "https://manual.test",
+            [{"key": "sk-key-1"}],
+        )
+        source_id = status["sources"][0]["id"]
+        source_key_id = status["sources"][0]["keys"][0]["source_key_id"]
+
+        await manager.remove_manual_keys(source_id, [source_key_id])
+        self.assertNotIn("https://manual.test", pools)
+        self.assertEqual(len(manager.sources), 0)
+
+    async def test_update_manual_key(self):
+        from retry_proxy.sync_adapters.manual import ManualAdapter
+        pools = {}
+        manager = PoolSyncManager(pools, self.config, None, {"manual": ManualAdapter()})
+
+        status = await manager.add_manual_keys(
+            "https://manual.test",
+            [{"key": "sk-key-1", "label": "Original"}],
+        )
+        source_id = status["sources"][0]["id"]
+        source_key_id = status["sources"][0]["keys"][0]["source_key_id"]
+
+        await manager.update_manual_key(source_id, source_key_id, {"label": "Updated", "sort": "2"})
+        self.assertEqual(pools["https://manual.test"].entries[0].label, "Updated")
+        self.assertEqual(pools["https://manual.test"].entries[0].sort, "2")
+
+    async def test_manual_source_persistence(self):
+        from retry_proxy.sync_adapters.manual import ManualAdapter
+        pools = {}
+        manager = PoolSyncManager(pools, self.config, None, {"manual": ManualAdapter()})
+
+        status = await manager.add_manual_keys(
+            "https://manual.test",
+            [{"key": "sk-key-1", "label": "Persisted"}],
+        )
+        source_id = status["sources"][0]["id"]
+
+        # Simulate restart
+        restored_pools = {}
+        restored = PoolSyncManager(
+            restored_pools, self.config, None, {"manual": ManualAdapter()},
+        )
+        restored.load_state()
+
+        self.assertIn(source_id, restored.sources)
+        self.assertEqual(len(restored_pools["https://manual.test"].entries), 1)
+        self.assertEqual(restored_pools["https://manual.test"].entries[0].key, "sk-key-1")
+
+    async def test_cannot_add_manual_to_online_sync_url(self):
+        from retry_proxy.sync_adapters.manual import ManualAdapter
+        pools = {}
+        manager = PoolSyncManager(pools, self.config, FakeClient(), {"manual": ManualAdapter(), "sub2api": Sub2APIAdapter()})
+
+        # First connect via sub2api
+        await manager.connect("sub2api", "https://upstream.test", "test", {
+            "email": "user@example.com", "password": "secret",
+        })
+
+        # Then try to add manual keys to the same URL
+        with self.assertRaises(PoolSyncError) as raised:
+            await manager.add_manual_keys(
+                "https://upstream.test",
+                [{"key": "sk-manual-1"}],
+            )
+        self.assertIn("在线同步连接接管", str(raised.exception))
+
+    async def test_cannot_remove_from_non_manual_source(self):
+        from retry_proxy.sync_adapters.manual import ManualAdapter
+        pools = {}
+        manager = PoolSyncManager(pools, self.config, FakeClient(), {"manual": ManualAdapter(), "sub2api": Sub2APIAdapter()})
+
+        status = await manager.connect("sub2api", "https://upstream.test", "test", {
+            "email": "user@example.com", "password": "secret",
+        })
+        source_id = status["sources"][0]["id"]
+
+        with self.assertRaises(PoolSyncError) as raised:
+            await manager.remove_manual_keys(source_id, ["any-key"])
+        self.assertIn("手动管理", str(raised.exception))
+
+    async def test_manual_source_not_auto_synced(self):
+        from retry_proxy.sync_adapters.manual import ManualAdapter
+        pools = {}
+        manager = PoolSyncManager(pools, self.config, None, {"manual": ManualAdapter()})
+
+        await manager.add_manual_keys(
+            "https://manual.test",
+            [{"key": "sk-key-1"}],
+        )
+
+        self.assertFalse(manager._has_connected_sources())
+
+
 if __name__ == "__main__":
     unittest.main()
