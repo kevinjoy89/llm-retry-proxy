@@ -95,6 +95,8 @@ class KeyPool:
         self.entries = [KeyEntry(k[0], k[1] if len(k) > 1 else "") if isinstance(k, tuple) else KeyEntry(k) for k in keys]
         self.provider, self._current, self._sticky_until = provider, None, 0.0
         self.strategy, self.target_ttft_s = "cost", 5.0
+        self.external_retest_weight = 0.5
+        self.external_ttft_prior_strength = 2.0
         self.session_affinity = False
         self._session_routes = OrderedDict()
         self._selection_count = 0
@@ -102,6 +104,7 @@ class KeyPool:
         self._view_access_sequence = 0
         self._last_view_access = 0
         self._metrics = {}
+        self.prior_metrics = {}
         self._balanced_group = None
         self._failover_floor = None
         self._probe_cursor_group = None
@@ -202,14 +205,20 @@ class KeyPool:
             view.entries = selected
             view.strategy = self.strategy
             view.target_ttft_s = self.target_ttft_s
+            view.external_retest_weight = self.external_retest_weight
+            view.external_ttft_prior_strength = self.external_ttft_prior_strength
             view.session_affinity = self.session_affinity
+            view.prior_metrics = self.prior_metrics
             view._view_entry_ids = entry_ids
             view._workload = workload
             self._views[signature] = view
         else:
             self._views[signature].strategy = self.strategy
             self._views[signature].target_ttft_s = self.target_ttft_s
+            self._views[signature].external_retest_weight = self.external_retest_weight
+            self._views[signature].external_ttft_prior_strength = self.external_ttft_prior_strength
             self._views[signature].session_affinity = self.session_affinity
+            self._views[signature].prior_metrics = self.prior_metrics
         self._view_access_sequence += 1
         self._views[signature]._last_view_access = self._view_access_sequence
         return self._views[signature]
@@ -308,16 +317,47 @@ class KeyPool:
             })
             group["entries"].append(entry)
             group["sort"] = min(group["sort"], self._sort_value(entry))
+        now = time.time()
+        stale_after = max(float(self._setting("key_ttft_stale_after", 300)), 0.0)
+        try:
+            prior_strength = max(float(self.external_ttft_prior_strength), 0.0)
+        except (TypeError, ValueError):
+            prior_strength = 0.0
         for key, group in groups.items():
+            prior = self.prior_metrics.get(key) or {}
+            external_ttft = prior.get("ttft")
+            external_last_ts = float(prior.get("last_ts") or 0.0)
+            external_fresh = (
+                self.strategy == "ttft" and prior_strength > 0
+                and external_ttft is not None
+                and (not external_last_ts or now - external_last_ts < stale_after)
+            )
             metric = self._metrics.get(key)
             if metric:
-                group["ttft"] = metric["ewma"]
-                group["samples"] = metric["samples"]
-                group["last_ts"] = metric["last_ts"]
                 group["slow_streak"] = metric["slow_streak"]
                 group["recovery_streak"] = metric["recovery_streak"]
                 group["next_probe_at"] = metric["next_probe_at"]
                 group["probe_reserved_until"] = metric["probe_reserved_until"]
+                if metric["samples"]:
+                    group["ttft"] = metric["ewma"]
+                    group["samples"] = metric["samples"]
+                    group["last_ts"] = metric["last_ts"]
+                    group["metric_source"] = "local"
+                    if external_fresh:
+                        local_weight = float(metric["samples"])
+                        group["ttft"] = (
+                            group["ttft"] * local_weight
+                            + float(external_ttft) * prior_strength
+                        ) / (local_weight + prior_strength)
+                        group["metric_source"] = "blended"
+                    continue
+            if external_fresh:
+                group["ttft"] = float(external_ttft)
+                group["samples"] = prior.get("samples", 0)
+                group["last_ts"] = external_last_ts
+                group["metric_source"] = "external"
+            elif self.strategy == "ttft" and external_last_ts:
+                group["last_ts"] = external_last_ts
         return groups
 
     @staticmethod
@@ -330,6 +370,44 @@ class KeyPool:
             "slow_streak": 0, "recovery_streak": 0,
             "next_probe_at": 0.0, "probe_reserved_until": 0.0,
         })
+
+    def _ordered_probe_candidates(self, candidates, now):
+        try:
+            weight = min(max(float(self.external_retest_weight), 0.0), 1.0)
+        except (TypeError, ValueError):
+            weight = 0.0
+        if weight <= 0 or len(candidates) < 2:
+            return candidates
+        stale_after = max(float(self._setting("key_ttft_stale_after", 300)), 0.0)
+        external = {}
+        for key, _ in candidates:
+            prior = self.prior_metrics.get(key) or {}
+            value = prior.get("ttft")
+            last_ts = float(prior.get("last_ts") or 0.0)
+            if value is None or last_ts and now - last_ts >= stale_after:
+                continue
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value >= 0:
+                external[key] = value
+        if not external:
+            return candidates
+        known = sorted(external, key=lambda key: (external[key], key))
+        denominator = max(len(known) - 1, 1)
+        external_ranks = {
+            key: index / denominator for index, key in enumerate(known)
+        }
+        cost_denominator = max(len(candidates) - 1, 1)
+        ranked = []
+        for cost_index, candidate in enumerate(candidates):
+            key = candidate[0]
+            cost_rank = cost_index / cost_denominator
+            external_rank = external_ranks.get(key, 1.0)
+            score = (1 - weight) * cost_rank + weight * external_rank
+            ranked.append((score, external_rank, cost_rank, cost_index, candidate))
+        return [item[-1] for item in sorted(ranked, key=lambda item: item[:-1])]
 
     def _balanced_pick(self, groups):
         now = time.time()
@@ -346,6 +424,7 @@ class KeyPool:
         reserve_for = max(float(self._setting("key_ttft_retest_interval", 60)), 1.0)
         cheaper = [(key, item) for key, item in ordered
                    if item["sort"] < current["sort"]]
+        cheaper = self._ordered_probe_candidates(cheaper, now)
         if self._active_probe_group is not None and now >= self._probe_reserved_until:
             self._active_probe_group = None
         if (cheaper and now >= self._next_probe_at
@@ -501,23 +580,35 @@ class KeyPool:
             if current_key not in groups and view._current is not None:
                 current_key = view._group_key(view._current)
             current = groups.get(current_key)
-            current_metric = view._metrics.get(current_key, {}) if current_key else {}
-            current_last_ts = current_metric.get("last_ts", 0.0)
+            local_metric = view._metrics.get(current_key, {}) if current_key else {}
+            current_metric = local_metric if local_metric.get("samples") else (
+                view.prior_metrics.get(current_key, {})
+                if view.strategy == "ttft" and current_key else {}
+            )
+            metric_source = current.get("metric_source", "") if current else ""
+            current_last_ts = current.get("last_ts", 0.0) if current else 0.0
             current_stale = bool(current_last_ts and now - current_last_ts >= stale_after)
-            if current is None or not current_metric.get("samples"):
+            if current is None or current.get("ttft") is None:
                 state = "learning"
-            elif current_metric.get("slow_streak"):
+            elif local_metric.get("slow_streak"):
                 state = "slow_confirming"
             elif current_stale:
                 state = "stale"
+            elif metric_source == "external":
+                state = "external"
+            elif metric_source == "blended":
+                state = "blended"
             else:
                 state = "active"
             cheaper = []
             if current is not None:
-                for key, group in groups.items():
-                    if group["sort"] >= current["sort"]:
-                        continue
+                candidates = view._ordered_probe_candidates([
+                    (key, group) for key, group in groups.items()
+                    if group["sort"] < current["sort"]
+                ], now)
+                for key, group in candidates:
                     metric = view._metrics.get(key, {})
+                    prior = view.prior_metrics.get(key) or {}
                     cheaper.append({
                         "group_id": key,
                         "group_name": group["entries"][0].group_name or group["entries"][0].label,
@@ -525,6 +616,7 @@ class KeyPool:
                         "recovery_streak": metric.get("recovery_streak", 0),
                         "next_probe_at": metric.get("next_probe_at", 0.0),
                         "probe_inflight": metric.get("probe_reserved_until", 0.0) > now,
+                        "external_ttft": prior.get("ttft"),
                     })
             endpoint_family, model = view._workload
             result.append({
@@ -534,10 +626,11 @@ class KeyPool:
                 "current_group_name": (current["entries"][0].group_name
                                        or current["entries"][0].label) if current else "",
                 "current_sort": str(current["entries"][0].sort) if current else "",
-                "ttft_ewma": (round(current_metric["ewma"], 3)
-                              if current_metric.get("ewma") is not None else None),
-                "samples": current_metric.get("samples", 0),
+                "ttft_ewma": round(current["ttft"], 3)
+                if current and current.get("ttft") is not None else None,
+                "samples": current.get("samples", 0) if current else 0,
                 "last_ts": current_last_ts,
+                "metric_source": metric_source,
                 "stale": current_stale,
                 "state": state,
                 "slow_streak": current_metric.get("slow_streak", 0),
@@ -751,7 +844,12 @@ _AUTH_STRIP_HEADERS = {"authorization", settings.key_auth_header}
 def clone_key_pool(pool: KeyPool) -> KeyPool:
     """Copy pool configuration and health without sharing mutable entries."""
     clone = KeyPool([], pool.provider)
+    clone.external_retest_weight = pool.external_retest_weight
+    clone.external_ttft_prior_strength = pool.external_ttft_prior_strength
     clone.session_affinity = pool.session_affinity
+    clone.prior_metrics = {
+        key: dict(value) for key, value in pool.prior_metrics.items()
+    }
     clone.entries = []
     for entry in pool.entries:
         copied = KeyEntry(
@@ -811,7 +909,10 @@ def replace_key_pool(url: str, replacement: KeyPool, pools=None):
     previous.provider = replacement.provider
     previous.strategy = replacement.strategy
     previous.target_ttft_s = replacement.target_ttft_s
+    previous.external_retest_weight = replacement.external_retest_weight
+    previous.external_ttft_prior_strength = replacement.external_ttft_prior_strength
     previous.session_affinity = replacement.session_affinity
+    previous.prior_metrics = replacement.prior_metrics
     previous._current = next((entry for entry in merged if entry.key == current_key), None)
     if previous._current is None:
         previous._sticky_until = 0.0
@@ -825,6 +926,9 @@ def replace_key_pool(url: str, replacement: KeyPool, pools=None):
         view.provider = replacement.provider
         view.strategy = replacement.strategy
         view.target_ttft_s = replacement.target_ttft_s
+        view.external_retest_weight = replacement.external_retest_weight
+        view.external_ttft_prior_strength = replacement.external_ttft_prior_strength
+        view.prior_metrics = previous.prior_metrics
 
     pools[url] = previous
     return previous

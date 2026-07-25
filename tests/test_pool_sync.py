@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 import httpx
 
 from retry_proxy.key_pool import KeyEntry, KeyPool
-from retry_proxy.pool_sync import PoolSyncManager
+from retry_proxy.pool_sync import PoolSyncManager, _parse_experience_payload
 from retry_proxy.routes import RouteRegistry
 from retry_proxy.sync_adapters import PoolSyncError
 from retry_proxy.sync_adapters.sub2api import Sub2APIAdapter, _model_ids, _unwrap
@@ -251,6 +251,65 @@ class Sub2APIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(session["access_token"], "access-2")
         self.assertEqual(session["refresh_token"], "refresh-2")
+
+
+class ExternalDataParserTests(unittest.TestCase):
+    TRANSFORM = {
+        "items_path": "rows", "id_path": "id", "ttft_path": "latency",
+        "ttft_unit": "ms", "name_path": "", "platform_path": "",
+        "rate_path": "", "samples_path": "", "timestamp_path": "",
+    }
+
+    def test_configurable_paths_normalize_external_rows(self):
+        items = _parse_experience_payload({
+            "result": {"rows": [{
+                "identity": {"value": "remote-a"},
+                "title": "Fast", "latency": 1.25, "count": "8",
+                "observed": "2026-07-25T18:41:34Z",
+            }]},
+        }, {
+            "items_path": "result.rows", "id_path": "identity.value",
+            "name_path": "title", "platform_path": "", "rate_path": "",
+            "ttft_path": "latency", "ttft_unit": "s",
+            "samples_path": "count", "timestamp_path": "observed",
+        })
+
+        self.assertEqual(items[0]["id"], "remote-a")
+        self.assertEqual(items[0]["name"], "Fast")
+        self.assertEqual(items[0]["ttft"], 1.25)
+        self.assertEqual(items[0]["samples"], 8)
+        self.assertGreater(items[0]["last_ts"], 0)
+
+    def test_top_level_array_and_missing_optional_fields_are_supported(self):
+        items = _parse_experience_payload([
+            {"key": "fast", "latency": 0.75},
+        ], {
+            "items_path": "$", "id_path": "key", "ttft_path": "latency",
+            "ttft_unit": "s", "name_path": "", "platform_path": "",
+            "rate_path": "", "samples_path": "", "timestamp_path": "",
+        })
+
+        self.assertEqual(items, [{
+            "id": "fast", "name": "fast", "platform": "",
+            "rate_multiplier": None, "ttft": 0.75, "samples": 1,
+            "last_ts": 0.0,
+        }])
+
+    def test_generic_query_params_and_legacy_sample_param_are_supported(self):
+        generic = PoolSyncManager._normalize_experience_source(
+            "https://metrics.test/groups", transform=self.TRANSFORM,
+            query_params={"limit": 50, "scope": "public"},
+        )
+        legacy = PoolSyncManager._normalize_experience_source(
+            "https://metrics.test/groups", 50, "limit", self.TRANSFORM,
+        )
+
+        self.assertEqual(generic["query_params"], {
+            "limit": "50", "scope": "public",
+        })
+        self.assertNotIn("sample_param", generic)
+        self.assertEqual(legacy["sample_param"], "limit")
+        self.assertEqual(legacy["samples"], 50)
 
 
 class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -616,12 +675,14 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
         view._selection_count = 19
 
         status = await manager.set_source_settings(
-            source_id, "balanced", 4.5, "test-model", True,
+            source_id, "balanced", 4.5, "test-model", True, 0.75, 5,
         )
 
         source = status["sources"][0]
         self.assertEqual(source["strategy"], "balanced")
         self.assertEqual(source["target_ttft_s"], 4.5)
+        self.assertEqual(source["external_retest_weight"], 0.75)
+        self.assertEqual(source["external_ttft_prior_strength"], 5)
         self.assertTrue(source["session_affinity"])
         self.assertEqual(source["ttft_policy"]["confirmations"], 2)
         self.assertIn("scheduler_views", source)
@@ -629,13 +690,42 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pool.strategy, "balanced")
         self.assertTrue(pool.session_affinity)
         self.assertEqual(pool.target_ttft_s, 4.5)
+        self.assertEqual(pool.external_retest_weight, 0.75)
+        self.assertEqual(pool.external_ttft_prior_strength, 5)
+        self.assertEqual(view.external_retest_weight, 0.75)
+        self.assertEqual(view.external_ttft_prior_strength, 5)
         self.assertEqual(pool._selection_count, 0)
         self.assertEqual(view._selection_count, 0)
         with open(self.state_file, encoding="utf-8") as f:
             persisted = json.load(f)
         self.assertEqual(persisted["sources"][0]["strategy"], "balanced")
+        self.assertEqual(persisted["sources"][0]["external_retest_weight"], 0.75)
+        self.assertEqual(persisted["sources"][0]["external_ttft_prior_strength"], 5)
         self.assertEqual(persisted["sources"][0]["check_model"], "test-model")
         self.assertTrue(persisted["sources"][0]["session_affinity"])
+        restored_pools = {}
+        restored = PoolSyncManager(
+            restored_pools, self.config, FakeClient(), {"sub2api": Sub2APIAdapter()},
+        )
+        restored.load_state()
+        self.assertEqual(
+            restored_pools["https://upstream.test"].external_retest_weight, 0.75,
+        )
+        self.assertEqual(
+            restored_pools["https://upstream.test"].external_ttft_prior_strength, 5,
+        )
+
+    async def test_source_strategy_rejects_non_finite_numbers(self):
+        manager = PoolSyncManager({}, self.config, FakeClient(), {"sub2api": Sub2APIAdapter()})
+
+        cases = [
+            ({"target_ttft_s": float("nan")}, "首 Token 上限"),
+            ({"external_retest_weight": float("inf")}, "外部复测权重"),
+            ({"external_ttft_prior_strength": float("-inf")}, "外部参考强度"),
+        ]
+        for values, message in cases:
+            with self.subTest(values=values), self.assertRaisesRegex(PoolSyncError, message):
+                await manager.set_source_settings("missing", "balanced", **values)
 
     async def test_availability_check_cools_failed_group_and_reset_clears_it(self):
         manager = PoolSyncManager({}, self.config, FakeClient(), {"sub2api": Sub2APIAdapter()})
@@ -894,6 +984,124 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status["sources"][0]["key_count"], 0)
         self.assertEqual(pools["https://upstream.test"].entries, [])
+
+    async def test_external_data_source_maps_groups_and_decays_ttft_prior(self):
+        client = FakeClient()
+        client.created.append(3)
+        original_get = client.get
+        external_url = "https://metrics.test/group-latency"
+
+        async def get_with_external(url, params=None, headers=None, timeout=None):
+            if url == external_url:
+                self.assertEqual(params, {"limit": "50", "scope": "public"})
+                return response({"payload": {"groups": [
+                    {"remote_id": "slow", "label": "Slow", "latency_ms": 8000,
+                     "count": 50, "time": "2026-07-25T18:41:34Z"},
+                    {"remote_id": "fast", "label": "Fast", "latency_ms": 1000,
+                     "count": 50, "time": "2026-07-25T18:41:34Z"},
+                ]}})
+            return await original_get(url, params, headers, timeout)
+
+        client.get = get_with_external
+        pools = {}
+        manager = PoolSyncManager(
+            pools, self.config, client, {"sub2api": Sub2APIAdapter()},
+        )
+        status = await manager.connect(
+            "sub2api", "https://upstream.test", "test",
+            {"email": "user@example.com", "password": "secret"},
+        )
+        source_id = status["sources"][0]["id"]
+        transform = {
+            "items_path": "payload.groups", "id_path": "remote_id",
+            "name_path": "label", "platform_path": "", "rate_path": "",
+            "ttft_path": "latency_ms", "ttft_unit": "ms",
+            "samples_path": "count", "timestamp_path": "time",
+        }
+
+        await manager.set_experience_source(
+            source_id, external_url, transform=transform,
+            query_params={"limit": 50, "scope": "public"},
+        )
+        await manager.set_experience_mapping(source_id, {"2": "slow", "3": "fast"})
+        await manager.set_source_settings(source_id, "ttft")
+
+        pool = pools["https://upstream.test"]
+        self.assertEqual(pool.pick().group_id, "3")
+        fast = next(entry for entry in pool.entries if entry.group_id == "3")
+        pool.record_ttft(fast, 12.0)
+        self.assertEqual(pool.pick().group_id, "3")
+        for _ in range(3):
+            pool.record_ttft(fast, 12.0)
+        self.assertEqual(pool.pick().group_id, "2")
+
+        restored_pools = {}
+        restored = PoolSyncManager(
+            restored_pools, self.config, FakeClient(), {"sub2api": Sub2APIAdapter()},
+        )
+        restored.load_state()
+        restored_pool = restored_pools["https://upstream.test"]
+        self.assertEqual(restored_pool.prior_metrics["3"]["ttft"], 1.0)
+        self.assertEqual(restored_pool.strategy, "ttft")
+
+        await manager.set_source_settings(source_id, "cost")
+        self.assertEqual(pool.pick().group_id, "2")
+        public = manager.status()["sources"][0]
+        self.assertEqual(public["experience"]["mappings"], {"2": "slow", "3": "fast"})
+        self.assertIn("external_group_id", pool.prior_metrics["2"])
+
+        changed_transform = {**transform, "id_path": "label"}
+        status = await manager.set_experience_source(
+            source_id, external_url, transform=changed_transform,
+            query_params={"limit": 50, "scope": "public"},
+        )
+        self.assertEqual(status["sources"][0]["experience"]["mappings"], {})
+
+        await manager.set_experience_source(source_id, "")
+        self.assertEqual(pool.prior_metrics, {})
+        with open(self.state_file, encoding="utf-8") as f:
+            persisted = json.load(f)
+        self.assertEqual(persisted["sources"][0]["experience_source"], {})
+
+    async def test_external_refresh_failure_does_not_fail_normal_pool_sync(self):
+        client = FakeClient()
+        original_get = client.get
+        external_url = "https://metrics.test/groups"
+        fail = False
+
+        async def get_with_external(url, params=None, headers=None, timeout=None):
+            if url == external_url:
+                if fail:
+                    return response({"error": "down"}, 503)
+                return response({"data": {"items": [{
+                    "group_id": 10, "code": "Fast", "avg_ttft_ms": 500,
+                    "sample_count": 10, "last_sample_at": "2026-07-25T18:41:34Z",
+                }]}})
+            return await original_get(url, params, headers, timeout)
+
+        client.get = get_with_external
+        manager = PoolSyncManager(
+            {}, self.config, client, {"sub2api": Sub2APIAdapter()},
+        )
+        status = await manager.connect(
+            "sub2api", "https://upstream.test", "test",
+            {"email": "user@example.com", "password": "secret"},
+        )
+        source_id = status["sources"][0]["id"]
+        await manager.set_experience_source(source_id, external_url, transform={
+            "items_path": "data.items", "id_path": "group_id",
+            "ttft_path": "avg_ttft_ms", "ttft_unit": "ms",
+            "name_path": "code", "platform_path": "", "rate_path": "",
+            "samples_path": "sample_count", "timestamp_path": "last_sample_at",
+        }, query_params={})
+        fail = True
+
+        status = await manager.sync_now(source_id)
+
+        source = status["sources"][0]
+        self.assertEqual(source["key_count"], 1)
+        self.assertIn("HTTP 503", source["experience"]["last_error"])
+        self.assertEqual(len(source["experience"]["items"]), 1)
 
     def test_single_existing_pool_is_used_as_generic_default_url(self):
         self.config.key_pool_sync_default_url = "https://default-without-pool.test"

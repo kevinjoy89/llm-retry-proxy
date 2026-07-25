@@ -1,10 +1,13 @@
 import asyncio
 import hashlib
 import json
+import math
 import os
+import re
 import tempfile
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -22,6 +25,97 @@ def _now_iso():
 def _source_id(adapter, base_url):
     value = f"{adapter}:{base_url.rstrip('/')}".encode("utf-8")
     return hashlib.sha256(value).hexdigest()[:16]
+
+
+def _experience_timestamp(value):
+    if not value:
+        return 0.0
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+_EXPERIENCE_PATH_PATTERN = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$")
+_EXPERIENCE_TRANSFORM_DEFAULTS = {
+    "items_path": "",
+    "id_path": "",
+    "name_path": "",
+    "platform_path": "",
+    "rate_path": "",
+    "ttft_path": "",
+    "ttft_unit": "ms",
+    "samples_path": "",
+    "timestamp_path": "",
+}
+
+
+def _experience_value(value, path):
+    if path == "$":
+        return value
+    if not path:
+        return None
+    for part in path.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return None
+        value = value[part]
+    return value
+
+
+def _parse_experience_payload(payload, transform=None):
+    transform = {**_EXPERIENCE_TRANSFORM_DEFAULTS, **(transform or {})}
+    items = _experience_value(payload, transform["items_path"])
+    if not isinstance(items, list):
+        raise PoolSyncError(f"外部数据列表路径无效: {transform['items_path']}")
+    normalized = []
+    seen = set()
+    for raw in items:
+        raw_id = _experience_value(raw, transform["id_path"])
+        if not isinstance(raw, dict) or raw_id in (None, ""):
+            continue
+        item_id = str(raw_id)
+        if item_id in seen:
+            raise PoolSyncError(f"外部数据包含重复分组 ID: {item_id}")
+        seen.add(item_id)
+        ttft = _experience_value(raw, transform["ttft_path"])
+        try:
+            ttft = float(ttft) if ttft is not None else None
+            if ttft is not None and transform["ttft_unit"] == "ms":
+                ttft /= 1000
+            if ttft is not None and (not math.isfinite(ttft) or ttft < 0):
+                ttft = None
+        except (TypeError, ValueError):
+            ttft = None
+        sample_count = 1
+        if transform["samples_path"]:
+            try:
+                sample_count = max(int(_experience_value(
+                    raw, transform["samples_path"],
+                ) or 0), 0)
+            except (TypeError, ValueError):
+                sample_count = 0
+        try:
+            rate = float(_experience_value(raw, transform["rate_path"]))
+            rate = rate if math.isfinite(rate) else None
+        except (TypeError, ValueError):
+            rate = None
+        normalized.append({
+            "id": item_id,
+            "name": str(_experience_value(raw, transform["name_path"]) or item_id).strip(),
+            "platform": str(_experience_value(
+                raw, transform["platform_path"],
+            ) or "").strip().lower(),
+            "rate_multiplier": rate,
+            "ttft": ttft,
+            "samples": sample_count,
+            "last_ts": _experience_timestamp(_experience_value(
+                raw, transform["timestamp_path"],
+            )),
+        })
+    return normalized
 
 
 class PoolSyncManager:
@@ -62,6 +156,10 @@ class PoolSyncManager:
         pool = KeyPool([], source.get("provider") or self.config.provider)
         pool.strategy = source.get("strategy", "cost")
         pool.target_ttft_s = float(source.get("target_ttft_s", 5.0))
+        pool.external_retest_weight = float(source.get("external_retest_weight", 0.5))
+        pool.external_ttft_prior_strength = float(
+            source.get("external_ttft_prior_strength", 2.0)
+        )
         pool.session_affinity = bool(source.get("session_affinity", False))
         disabled_key_ids = {
             str(value) for value in source.get("disabled_key_ids", [])
@@ -77,6 +175,25 @@ class PoolSyncManager:
                 self._routing_capabilities(source, item),
                 item.get("auth"),
             ))
+        external_items = {
+            str(item.get("id")): item
+            for item in source.get("experience_items", [])
+            if isinstance(item, dict) and item.get("id") not in (None, "")
+        }
+        mappings = source.get("experience_mappings") or {}
+        fetched_ts = _experience_timestamp(source.get("experience_last_sync_at"))
+        for local_group_id, external_group_id in mappings.items():
+            item = external_items.get(str(external_group_id))
+            if not item or item.get("ttft") is None or not item.get("samples"):
+                continue
+            pool.prior_metrics[str(local_group_id)] = {
+                "ttft": float(item["ttft"]),
+                "samples": int(item["samples"]),
+                "last_ts": fetched_ts,
+                "observed_ts": float(item.get("last_ts") or 0.0),
+                "external_group_id": str(external_group_id),
+                "name": item.get("name", ""),
+            }
         pool.finalize_entries()
         return pool
 
@@ -151,8 +268,15 @@ class PoolSyncManager:
                     source["group_model_rejections"] = {}
                 source.setdefault("strategy", "cost")
                 source.setdefault("target_ttft_s", 5.0)
+                source.setdefault("external_retest_weight", 0.5)
+                source.setdefault("external_ttft_prior_strength", 2.0)
                 source.setdefault("session_affinity", False)
                 source.setdefault("check_model", "")
+                source.setdefault("experience_source", {})
+                source.setdefault("experience_items", [])
+                source.setdefault("experience_mappings", {})
+                source.setdefault("experience_last_sync_at", "")
+                source.setdefault("experience_last_error", "")
                 source["disabled_key_ids"] = [
                     str(value) for value in source.get("disabled_key_ids", [])
                     if value not in (None, "")
@@ -185,7 +309,7 @@ class PoolSyncManager:
             return
         directory = os.path.dirname(os.path.abspath(self.state_file))
         os.makedirs(directory, exist_ok=True)
-        state = {"version": 4, "interval": self.config.key_pool_sync_interval,
+        state = {"version": 5, "interval": self.config.key_pool_sync_interval,
                  "sources": self._persistent_sources()}
         fd, temp_path = tempfile.mkstemp(prefix=".pool_sync_", suffix=".json", dir=directory)
         try:
@@ -273,9 +397,14 @@ class PoolSyncManager:
                 "id": source_id, "adapter": adapter_name, "base_url": base_url,
                 "provider": requested_provider, "session": {}, "entries": [],
                 "route_prefix": "", "strategy": "cost", "target_ttft_s": 5.0,
+                "external_retest_weight": 0.5,
+                "external_ttft_prior_strength": 2.0,
                 "session_affinity": False,
                 "check_model": "", "disabled_key_ids": [], "group_model_cache": {},
                 "group_model_rejections": {},
+                "experience_source": {}, "experience_items": [],
+                "experience_mappings": {}, "experience_last_sync_at": "",
+                "experience_last_error": "",
                 "last_sync_at": "", "last_attempt_at": "", "last_error": "",
             })
             source["provider"] = requested_provider
@@ -317,6 +446,8 @@ class PoolSyncManager:
             session, entries = await adapter.fetch(self.client, source, source.get("session") or {})
             source["session"] = session
             source["entries"] = self._merge_local_rules(source, entries)
+            if (source.get("experience_source") or {}).get("url"):
+                await self._refresh_experience_locked(source, raise_errors=False)
             self._activate(source)
             source["last_sync_at"] = _now_iso()
             source["last_error"] = ""
@@ -390,6 +521,183 @@ class PoolSyncManager:
                 raise PoolSyncError("号池同步连接不存在")
             source["group_rules"] = normalized
             source["entries"] = self._merge_local_rules(source, [dict(item) for item in source.get("entries") or []])
+            self._activate(source)
+            self._save_state()
+            return self.status()
+
+    @staticmethod
+    def _normalize_experience_source(url, samples=100, sample_param="samples",
+                                     transform=None, query_params=None):
+        url = str(url or "").strip()
+        if not url:
+            return {}
+        parsed = urlsplit(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise PoolSyncError("外部数据 URL 必须是有效的 http:// 或 https:// 地址")
+        if parsed.username or parsed.password or parsed.fragment:
+            raise PoolSyncError("外部数据 URL 不能包含账号、密码或片段")
+        if len(url) > 2048:
+            raise PoolSyncError("外部数据 URL 过长")
+        normalized_params = None
+        if query_params is not None:
+            if not isinstance(query_params, dict):
+                raise PoolSyncError("外部数据查询参数必须是对象")
+            if len(query_params) > 32:
+                raise PoolSyncError("外部数据查询参数不能超过 32 个")
+            normalized_params = {}
+            for raw_name, raw_value in query_params.items():
+                name = str(raw_name or "").strip()
+                if not name or len(name) > 128 or "\n" in name or "\r" in name:
+                    raise PoolSyncError("外部数据查询参数名无效")
+                if isinstance(raw_value, (dict, list)) or raw_value is None:
+                    raise PoolSyncError(f"外部数据查询参数值无效: {name}")
+                value = str(raw_value)
+                if len(value) > 2048 or "\n" in value or "\r" in value:
+                    raise PoolSyncError(f"外部数据查询参数值无效: {name}")
+                normalized_params[name] = value
+        else:
+            try:
+                samples = int(samples)
+            except (TypeError, ValueError) as exc:
+                raise PoolSyncError("外部数据样本数必须是整数") from exc
+            if samples < 1 or samples > 1000:
+                raise PoolSyncError("外部数据样本数必须在 1 到 1000 之间")
+            sample_param = str(sample_param or "").strip()
+            if sample_param and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", sample_param):
+                raise PoolSyncError("外部数据样本参数名只能包含字母、数字、下划线和连字符")
+        normalized_transform = dict(_EXPERIENCE_TRANSFORM_DEFAULTS)
+        if transform is not None:
+            if not isinstance(transform, dict):
+                raise PoolSyncError("外部数据转换规则必须是对象")
+            for name in normalized_transform:
+                if name in transform:
+                    normalized_transform[name] = transform[name]
+        for name in normalized_transform:
+            if name == "ttft_unit":
+                continue
+            value = str(normalized_transform.get(name) or "").strip()
+            if name in ("items_path", "id_path", "ttft_path") and not value:
+                raise PoolSyncError(f"外部数据转换字段不能为空: {name}")
+            if value == "$" and name != "items_path":
+                raise PoolSyncError(f"外部数据字段路径无效: {value}")
+            if value != "$" and value and not _EXPERIENCE_PATH_PATTERN.fullmatch(value):
+                raise PoolSyncError(f"外部数据字段路径无效: {value}")
+            normalized_transform[name] = value
+        unit = str(normalized_transform.get("ttft_unit") or "ms").strip().lower()
+        if unit not in ("ms", "s"):
+            raise PoolSyncError("TTFT 单位必须是 ms 或 s")
+        normalized_transform["ttft_unit"] = unit
+        config = {"url": url, "transform": normalized_transform}
+        if normalized_params is not None:
+            config["query_params"] = normalized_params
+        else:
+            config.update({"samples": samples, "sample_param": sample_param})
+        return config
+
+    async def _fetch_experience_items(self, config):
+        if "query_params" in config:
+            params = config.get("query_params") or None
+        else:
+            params = ({config["sample_param"]: config["samples"]}
+                      if config.get("sample_param") else None)
+        response = await self.client.get(
+            config["url"], params=params,
+            headers={"Accept": "application/json"}, timeout=20,
+        )
+        if response.status_code >= 400:
+            raise PoolSyncError(f"外部数据接口请求失败 (HTTP {response.status_code})")
+        try:
+            payload = response.json()
+        except (TypeError, ValueError) as exc:
+            raise PoolSyncError("外部数据接口返回了非 JSON 响应") from exc
+        return _parse_experience_payload(payload, config.get("transform"))
+
+    async def _refresh_experience_locked(self, source, raise_errors=True):
+        config = source.get("experience_source") or {}
+        if not config.get("url"):
+            return []
+        try:
+            items = await self._fetch_experience_items(config)
+            source["experience_items"] = items
+            source["experience_last_sync_at"] = _now_iso()
+            source["experience_last_error"] = ""
+            return items
+        except Exception as exc:
+            source["experience_last_error"] = str(exc)
+            if raise_errors:
+                if isinstance(exc, PoolSyncError):
+                    raise
+                raise PoolSyncError(f"外部数据读取失败: {exc}") from exc
+            logger.warning(
+                f"外部数据刷新失败，继续使用原有调度: upstream={source['base_url']} "
+                f"error={exc}"
+            )
+            return source.get("experience_items") or []
+
+    async def set_experience_source(self, source_id, url, samples=100,
+                                    sample_param="samples", transform=None,
+                                    query_params=None):
+        config = self._normalize_experience_source(
+            url, samples, sample_param, transform, query_params,
+        )
+        async with self._lock:
+            source = self.sources.get(source_id)
+            if source is None:
+                raise PoolSyncError("号池同步连接不存在")
+            if not config:
+                source["experience_source"] = {}
+                source["experience_items"] = []
+                source["experience_mappings"] = {}
+                source["experience_last_sync_at"] = ""
+                source["experience_last_error"] = ""
+                self._activate(source)
+                self._save_state()
+                return self.status()
+            items = await self._fetch_experience_items(config)
+            previous_config = source.get("experience_source") or {}
+            previous_transform = previous_config.get("transform") or {}
+            identity_changed = any((
+                previous_config.get("url") != config["url"],
+                previous_transform.get("items_path") != config["transform"]["items_path"],
+                previous_transform.get("id_path") != config["transform"]["id_path"],
+            ))
+            source["experience_source"] = config
+            source["experience_items"] = items
+            source["experience_last_sync_at"] = _now_iso()
+            source["experience_last_error"] = ""
+            if previous_config.get("url") and identity_changed:
+                source["experience_mappings"] = {}
+            self._activate(source)
+            self._save_state()
+            return self.status()
+
+    async def set_experience_mapping(self, source_id, mappings):
+        if not isinstance(mappings, dict):
+            raise PoolSyncError("外部数据分组映射必须是对象")
+        normalized = {
+            str(local_id): str(external_id)
+            for local_id, external_id in mappings.items()
+            if local_id not in (None, "") and external_id not in (None, "")
+        }
+        async with self._lock:
+            source = self.sources.get(source_id)
+            if source is None:
+                raise PoolSyncError("号池同步连接不存在")
+            local_ids = {
+                str(item.get("group_id")) for item in source.get("entries") or []
+                if item.get("group_id") not in (None, "")
+            }
+            external_ids = {
+                str(item.get("id")) for item in source.get("experience_items") or []
+                if isinstance(item, dict) and item.get("id") not in (None, "")
+            }
+            unknown_local = set(normalized) - local_ids
+            unknown_external = set(normalized.values()) - external_ids
+            if unknown_local:
+                raise PoolSyncError(f"本地分组不存在: {sorted(unknown_local)[0]}")
+            if unknown_external:
+                raise PoolSyncError(f"外部分组不存在: {sorted(unknown_external)[0]}")
+            source["experience_mappings"] = normalized
             self._activate(source)
             self._save_state()
             return self.status()
@@ -505,21 +813,43 @@ class PoolSyncManager:
             return self.status()
 
     async def set_source_settings(self, source_id, strategy, target_ttft_s=5.0,
-                                  check_model="", session_affinity=None):
+                                  check_model="", session_affinity=None,
+                                  external_retest_weight=None,
+                                  external_ttft_prior_strength=None):
         if strategy not in KEY_POOL_STRATEGIES:
             raise PoolSyncError("号池策略必须是 cost、ttft 或 balanced")
         try:
             target = float(target_ttft_s)
         except (TypeError, ValueError) as exc:
             raise PoolSyncError("可接受首 Token 上限必须是数字") from exc
-        if target < 0.1 or target > 300:
+        if not math.isfinite(target) or target < 0.1 or target > 300:
             raise PoolSyncError("可接受首 Token 上限必须在 0.1 到 300 秒之间")
+        if external_retest_weight is not None:
+            try:
+                external_weight = float(external_retest_weight)
+            except (TypeError, ValueError) as exc:
+                raise PoolSyncError("外部复测权重必须是数字") from exc
+            if not math.isfinite(external_weight) or external_weight < 0 or external_weight > 1:
+                raise PoolSyncError("外部复测权重必须在 0 到 1 之间")
+        if external_ttft_prior_strength is not None:
+            try:
+                prior_strength = float(external_ttft_prior_strength)
+            except (TypeError, ValueError) as exc:
+                raise PoolSyncError("外部参考强度必须是数字") from exc
+            if not math.isfinite(prior_strength) or prior_strength < 0 or prior_strength > 100:
+                raise PoolSyncError("外部参考强度必须在 0 到 100 之间")
         async with self._lock:
             source = self.sources.get(source_id)
             if source is None:
                 raise PoolSyncError("号池同步连接不存在")
+            if external_retest_weight is None:
+                external_weight = float(source.get("external_retest_weight", 0.5))
+            if external_ttft_prior_strength is None:
+                prior_strength = float(source.get("external_ttft_prior_strength", 2.0))
             source["strategy"] = strategy
             source["target_ttft_s"] = target
+            source["external_retest_weight"] = external_weight
+            source["external_ttft_prior_strength"] = prior_strength
             source["check_model"] = str(check_model or "").strip()
             if session_affinity is not None:
                 source["session_affinity"] = bool(session_affinity)
@@ -527,6 +857,8 @@ class PoolSyncManager:
             if pool is not None:
                 pool.strategy = strategy
                 pool.target_ttft_s = target
+                pool.external_retest_weight = external_weight
+                pool.external_ttft_prior_strength = prior_strength
                 pool.session_affinity = bool(source.get("session_affinity", False))
                 if not pool.session_affinity:
                     pool._session_routes.clear()
@@ -540,6 +872,8 @@ class PoolSyncManager:
                 for view in pool._views.values():
                     view.strategy = strategy
                     view.target_ttft_s = target
+                    view.external_retest_weight = external_weight
+                    view.external_ttft_prior_strength = prior_strength
                     view.session_affinity = pool.session_affinity
                     if not view.session_affinity:
                         view._session_routes.clear()
@@ -814,6 +1148,7 @@ class PoolSyncManager:
             for item in source.get("entries") or []:
                 raw_key = item.get("key", "")
                 entry = runtime.get(raw_key)
+                prior = pool.prior_metrics.get(str(item.get("group_id") or "")) if pool else None
                 visible_entries.append({
                     "source_key_id": item.get("source_key_id"),
                     "enabled": str(item.get("source_key_id")) not in disabled_key_ids,
@@ -836,6 +1171,10 @@ class PoolSyncManager:
                     "ttft_stale": bool(entry and entry.ttft_last_ts and
                                        now - entry.ttft_last_ts >= getattr(
                                            self.config, "key_ttft_stale_after", 300)),
+                    "experience_ttft_s": (round(prior["ttft"], 3)
+                                           if prior and prior.get("ttft") is not None else None),
+                    "experience_samples": prior.get("samples", 0) if prior else 0,
+                    "experience_last_ts": prior.get("observed_ts", 0) if prior else 0,
                     "probe_latency_s": (round(entry.probe_latency_s, 3)
                                         if entry and entry.probe_latency_s is not None else None),
                     "probe_last_ts": entry.probe_last_ts if entry else 0,
@@ -851,6 +1190,10 @@ class PoolSyncManager:
                 "last_error": source.get("last_error", ""),
                 "strategy": source.get("strategy", "cost"),
                 "target_ttft_s": source.get("target_ttft_s", 5.0),
+                "external_retest_weight": source.get("external_retest_weight", 0.5),
+                "external_ttft_prior_strength": source.get(
+                    "external_ttft_prior_strength", 2.0,
+                ),
                 "session_affinity": bool(source.get("session_affinity", False)),
                 "ttft_policy": {
                     "stale_after": getattr(self.config, "key_ttft_stale_after", 300),
@@ -859,6 +1202,13 @@ class PoolSyncManager:
                     "hysteresis": getattr(self.config, "key_ttft_hysteresis", 0.1),
                 },
                 "scheduler_views": pool.scheduler_status(now) if pool else [],
+                "experience": {
+                    **(source.get("experience_source") or {}),
+                    "items": [dict(item) for item in source.get("experience_items") or []],
+                    "mappings": dict(source.get("experience_mappings") or {}),
+                    "last_sync_at": source.get("experience_last_sync_at", ""),
+                    "last_error": source.get("experience_last_error", ""),
+                },
                 "check_model": source.get("check_model", ""),
                 "key_count": len(visible_entries), "keys": visible_entries,
                 "operation": dict(self.operations.get(source["id"]) or {}),

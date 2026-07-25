@@ -244,6 +244,28 @@ async def key_pools_group_rules(request: Request):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+async def key_pools_experience_source(request: Request):
+    try:
+        body = await _json_object(request)
+        return await pool_sync.set_experience_source(
+            body.get("source_id"), body.get("url"), body.get("samples", 100),
+            body.get("sample_param", "samples"), body.get("transform"),
+            body.get("query_params") if "query_params" in body else None,
+        )
+    except PoolSyncError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+async def key_pools_experience_mapping(request: Request):
+    try:
+        body = await _json_object(request)
+        return await pool_sync.set_experience_mapping(
+            body.get("source_id"), body.get("mappings") or {},
+        )
+    except PoolSyncError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 async def key_pools_clear_keys(request: Request):
     try:
         body = await _json_object(request)
@@ -269,6 +291,8 @@ async def key_pools_source_settings(request: Request):
         return await pool_sync.set_source_settings(
             body.get("source_id"), body.get("strategy"), body.get("target_ttft_s", 5.0),
             body.get("check_model", ""), body.get("session_affinity"),
+            body.get("external_retest_weight"),
+            body.get("external_ttft_prior_strength"),
         )
     except PoolSyncError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -342,6 +366,8 @@ app.add_api_route("/admin/key-pools/api/disconnect", key_pools_disconnect, metho
 app.add_api_route("/admin/key-pools/api/catalog", key_pools_catalog, methods=["GET"], dependencies=admin_dependencies)
 app.add_api_route("/admin/key-pools/api/create-keys", key_pools_create_keys, methods=["POST"], dependencies=admin_dependencies)
 app.add_api_route("/admin/key-pools/api/group-rules", key_pools_group_rules, methods=["POST"], dependencies=admin_dependencies)
+app.add_api_route("/admin/key-pools/api/experience-source", key_pools_experience_source, methods=["POST"], dependencies=admin_dependencies)
+app.add_api_route("/admin/key-pools/api/experience-mapping", key_pools_experience_mapping, methods=["POST"], dependencies=admin_dependencies)
 app.add_api_route("/admin/key-pools/api/clear-keys", key_pools_clear_keys, methods=["POST"], dependencies=admin_dependencies)
 app.add_api_route("/admin/key-pools/api/settings", key_pools_settings, methods=["POST"], dependencies=admin_dependencies)
 app.add_api_route("/admin/key-pools/api/source-settings", key_pools_source_settings, methods=["POST"], dependencies=admin_dependencies)

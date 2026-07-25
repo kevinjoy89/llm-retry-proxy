@@ -60,6 +60,46 @@ class KeyPoolStickyTests(unittest.TestCase):
 
         self.assertEqual(pool.pick().group_id, "fast")
 
+    def test_ttft_strategy_blends_fresh_external_prior_with_local_samples(self):
+        pool = KeyPool([])
+        pool.entries = [
+            KeyEntry("one", "one", sort="0.02", group_id="one"),
+            KeyEntry("two", "two", sort="0.10", group_id="two"),
+        ]
+        pool.finalize_entries()
+        pool.strategy = "ttft"
+        pool.external_ttft_prior_strength = 2
+        pool.prior_metrics = {
+            "one": {"ttft": 2.0, "samples": 20, "last_ts": 90},
+            "two": {"ttft": 6.0, "samples": 20, "last_ts": 90},
+        }
+
+        with patch("retry_proxy.key_pool.time.time", return_value=100):
+            pool.record_ttft(pool.entries[0], 8.0)
+            pool.record_ttft(pool.entries[1], 3.0)
+            groups = pool._group_metrics(pool.entries)
+
+        self.assertAlmostEqual(groups["one"]["ttft"], 4.0)
+        self.assertAlmostEqual(groups["two"]["ttft"], 5.0)
+        self.assertEqual(groups["one"]["metric_source"], "blended")
+
+    def test_ttft_strategy_can_disable_or_expire_external_prior(self):
+        pool = KeyPool([])
+        pool.entries = [KeyEntry("one", "one", group_id="one")]
+        pool.finalize_entries()
+        pool.strategy = "ttft"
+        pool.prior_metrics = {
+            "one": {"ttft": 2.0, "samples": 20, "last_ts": 90},
+        }
+        fake_settings = SimpleNamespace(key_ttft_stale_after=5)
+
+        with patch("retry_proxy.key_pool.settings", fake_settings), \
+                patch("retry_proxy.key_pool.time.time", return_value=100):
+            self.assertIsNone(pool._group_metrics(pool.entries)["one"]["ttft"])
+            pool.external_ttft_prior_strength = 0
+            pool.prior_metrics["one"]["last_ts"] = 100
+            self.assertIsNone(pool._group_metrics(pool.entries)["one"]["ttft"])
+
     def test_balanced_strategy_upgrades_after_two_slow_samples(self):
         pool = KeyPool([])
         pool.entries = [
@@ -197,6 +237,61 @@ class KeyPoolStickyTests(unittest.TestCase):
                 patch("retry_proxy.key_pool.time.time", return_value=160):
             self.assertLess(pool._sticky_until, 160)
             self.assertEqual(pool.pick().group_id, "cheap-2")
+
+    def test_balanced_external_weight_prioritizes_faster_probe_candidate(self):
+        pool = KeyPool([])
+        pool.entries = [
+            KeyEntry("cheap-1", "cheap-1", sort="0.01", group_id="cheap-1"),
+            KeyEntry("cheap-2", "cheap-2", sort="0.02", group_id="cheap-2"),
+            KeyEntry("cheap-3", "cheap-3", sort="0.03", group_id="cheap-3"),
+            KeyEntry("current", "current", sort="0.10", group_id="current"),
+        ]
+        pool.finalize_entries()
+        pool.strategy = "balanced"
+        pool.external_retest_weight = 1.0
+        pool.prior_metrics = {
+            "cheap-1": {"ttft": 8.0, "samples": 10, "last_ts": 100},
+            "cheap-2": {"ttft": 4.0, "samples": 10, "last_ts": 100},
+            "cheap-3": {"ttft": 1.0, "samples": 10, "last_ts": 100},
+        }
+        pool._balanced_group = "current"
+        pool._current = pool.entries[3]
+        pool._next_probe_at = 100
+        fake_settings = SimpleNamespace(
+            key_ttft_retest_interval=60, key_ttft_stale_after=300,
+        )
+
+        with patch("retry_proxy.key_pool.settings", fake_settings), \
+                patch("retry_proxy.key_pool.time.time", return_value=100):
+            self.assertEqual(pool.pick().group_id, "cheap-3")
+
+    def test_zero_or_stale_external_weight_keeps_cost_probe_order(self):
+        pool = KeyPool([])
+        pool.entries = [
+            KeyEntry("cheap-1", "cheap-1", sort="0.01", group_id="cheap-1"),
+            KeyEntry("cheap-2", "cheap-2", sort="0.02", group_id="cheap-2"),
+            KeyEntry("current", "current", sort="0.10", group_id="current"),
+        ]
+        pool.finalize_entries()
+        candidates = list(pool._group_metrics(pool.entries).items())[:2]
+        pool.prior_metrics = {
+            "cheap-1": {"ttft": 8.0, "samples": 10, "last_ts": 100},
+            "cheap-2": {"ttft": 1.0, "samples": 10, "last_ts": 100},
+        }
+
+        pool.external_retest_weight = 0
+        self.assertEqual(
+            [key for key, _ in pool._ordered_probe_candidates(candidates, 100)],
+            ["cheap-1", "cheap-2"],
+        )
+        pool.external_retest_weight = 1
+        with patch("retry_proxy.key_pool.settings", SimpleNamespace(
+                key_ttft_stale_after=300,
+        )):
+            self.assertEqual(
+                [key for key, _ in pool._ordered_probe_candidates(candidates, 400)],
+                ["cheap-1", "cheap-2"],
+            )
 
     def test_slow_successful_recovery_probe_keeps_current_anchor(self):
         pool = KeyPool([])
