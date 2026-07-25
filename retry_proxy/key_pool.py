@@ -7,6 +7,8 @@ import time
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
+from collections import OrderedDict
+
 from .config import logger, settings
 
 _FAILURE_KIND_PRIORITY = {"transport": 1, "probe": 2, "upstream": 2, "rate_limit": 3, "auth": 4}
@@ -94,7 +96,7 @@ class KeyPool:
         self.provider, self._current, self._sticky_until = provider, None, 0.0
         self.strategy, self.target_ttft_s = "cost", 5.0
         self.session_affinity = False
-        self._session_routes = {}
+        self._session_routes = OrderedDict()
         self._selection_count = 0
         self._views = {}
         self._view_access_sequence = 0
@@ -218,21 +220,21 @@ class KeyPool:
         if route is None:
             if len(self._session_routes) >= _SESSION_ROUTE_LIMIT:
                 cutoff = now - _SESSION_ROUTE_IDLE
-                self._session_routes = {
-                    key: value for key, value in self._session_routes.items()
-                    if value.get("last_used", 0.0) >= cutoff
-                }
+                expired = [
+                    key for key, value in self._session_routes.items()
+                    if value.get("last_used", 0.0) < cutoff
+                ]
+                for key in expired:
+                    self._session_routes.pop(key, None)
                 if len(self._session_routes) >= _SESSION_ROUTE_LIMIT:
-                    oldest = min(
-                        self._session_routes,
-                        key=lambda key: self._session_routes[key].get("last_used", 0.0),
-                    )
-                    self._session_routes.pop(oldest, None)
+                    self._session_routes.popitem(last=False)
             route = {
                 "current": None, "sticky_until": 0.0,
                 "failover_floor": None, "last_used": now,
             }
             self._session_routes[session_id] = route
+        else:
+            self._session_routes.move_to_end(session_id)
         route["last_used"] = now
         return route
 

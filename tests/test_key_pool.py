@@ -1,3 +1,4 @@
+import asyncio
 import json
 import unittest
 from types import SimpleNamespace
@@ -1012,6 +1013,45 @@ class KeyPoolCooldownWaitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.total_sent, 1)
         self.assertEqual(pool.entries[0].last_failure_status, 403)
         sleep.assert_not_awaited()
+
+    def test_session_routes_lru_eviction(self):
+        pool = KeyPool([("key1", "k1"), ("key2", "k2")])
+        with patch("retry_proxy.key_pool._SESSION_ROUTE_LIMIT", 3):
+            pool._session_route("sess-1")
+            pool._session_route("sess-2")
+            pool._session_route("sess-3")
+            self.assertEqual(list(pool._session_routes.keys()), ["sess-1", "sess-2", "sess-3"])
+
+            # Accessing sess-1 moves it to the end (MRU)
+            pool._session_route("sess-1")
+            self.assertEqual(list(pool._session_routes.keys()), ["sess-2", "sess-3", "sess-1"])
+
+            # Adding a 4th session triggers LRU eviction of sess-2
+            pool._session_route("sess-4")
+            self.assertEqual(list(pool._session_routes.keys()), ["sess-3", "sess-1", "sess-4"])
+
+    async def test_concurrent_session_and_failover_routing(self):
+        pool = KeyPool([("key1", "k1"), ("key2", "k2"), ("key3", "k3")])
+        pool.session_affinity = True
+
+        async def worker(session_id: str):
+            for _ in range(50):
+                entry = pool._pick_for_session(session_id)
+                self.assertIsNotNone(entry)
+                await asyncio.sleep(0.001)
+
+        tasks = [asyncio.create_task(worker(f"session-{i % 5}")) for i in range(20)]
+        await asyncio.gather(*tasks)
+
+        self.assertEqual(len(pool._session_routes), 5)
+        for i in range(5):
+            sess_key = f"session-{i}"
+            self.assertIn(sess_key, pool._session_routes)
+            route = pool._session_routes[sess_key]
+            self.assertIn("current", route)
+            self.assertIn("sticky_until", route)
+            self.assertIn("last_used", route)
+            self.assertGreater(route["last_used"], 0.0)
 
 
 if __name__ == "__main__":
