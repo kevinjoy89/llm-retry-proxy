@@ -23,6 +23,7 @@ from .retry import (
     set_client_ip,
 )
 from .stats import _normalize_provider, _req_succeeded, _upstream_window_stats, compute_key_pool_stats, compute_stats
+from .usage import UsageAccumulator
 
 SKIP_REQUEST_HEADERS = {
     "host", "content-length", "transfer-encoding", "connection", "keep-alive",
@@ -261,6 +262,36 @@ def _is_streaming_json(body):
         return False
 
 
+def _maybe_inject_stream_usage(body, endpoint_family):
+    """Inject ``stream_options.include_usage`` for OpenAI Chat streaming requests
+    when token statistics are enabled. Returns the (possibly rewritten) body.
+
+    Only injects when the client did not set ``include_usage`` at all; an
+    explicit ``false`` is respected so clients that opted out for response-size
+    or privacy reasons keep their choice. Any sibling ``stream_options`` keys
+    are preserved.
+    """
+    if not getattr(settings, "token_stats_inject_usage", True) or endpoint_family != "chat":
+        return body
+    if len(body) > 262144:
+        # Skip overly large bodies: re-encoding them is wasteful and rare.
+        return body
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return body
+    if not isinstance(payload, dict) or payload.get("stream") is not True:
+        return body
+    stream_options = payload.get("stream_options")
+    if isinstance(stream_options, dict) and "include_usage" in stream_options:
+        # Client made an explicit choice (true or false); respect it.
+        return body
+    base = stream_options if isinstance(stream_options, dict) else {}
+    merged = {**base, "include_usage": True}
+    payload["stream_options"] = merged
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
 def outbound_request_headers(request_headers, path, model, config=settings):
     headers = filter_headers(request_headers, SKIP_REQUEST_HEADERS)
     # httpx decodes response bodies before ``aiter_bytes`` yields them, and
@@ -308,7 +339,10 @@ def _summary_view(summary):
                     "availability_pct": round(b["succeeded"] / measured * 100, 2) if measured else 0,
                     "upstream_availability_pct": round(b.get("first_ok", 0) / measured * 100, 2) if measured else 0,
                     "cancelled": b.get("cancelled", 0),
-                    "max_retries": b["max_retries"]})
+                    "max_retries": b["max_retries"],
+                    "prompt_tokens": b.get("prompt_tokens", 0),
+                    "completion_tokens": b.get("completion_tokens", 0),
+                    "total_tokens": b.get("total_tokens", 0)})
     return sorted(out, key=lambda x: x["requests"], reverse=True)
 
 
@@ -322,6 +356,9 @@ def _cumulative(summary):
             "upstream_availability_pct": round(summary.get("total_first_ok", 0) / measured * 100, 2) if measured else 0,
             "succeeded": summary["total_succeeded"], "failed": summary["total_failed"],
             "cancelled": cancelled,
+            "total_prompt_tokens": summary.get("total_prompt_tokens", 0),
+            "total_completion_tokens": summary.get("total_completion_tokens", 0),
+            "total_tokens": summary.get("total_tokens", 0),
             "by_provider": _summary_view(summary["by_provider"]), "by_model": _summary_view({k: v for k, v in summary["by_model"].items() if not k.endswith("/(unknown)")}),
             "by_key": _summary_view(summary.get("by_key", {})),
             "by_status": [{"status": k, "count": v} for k, v in sorted(summary["by_status"].items(), key=lambda x: -x[1])],
@@ -528,6 +565,7 @@ def create_handlers(service, store, pool_sync=None):
             }}, ensure_ascii=False)
             return Response(payload, status_code=403, media_type="application/json")
         key_pool = upstream if request_pool else ""
+        body = _maybe_inject_stream_usage(body, endpoint_family)
         ip_token = set_client_ip(client_ip)
         try:
             result = await _run_until_disconnect(
@@ -578,8 +616,6 @@ def create_handlers(service, store, pool_sync=None):
             endpoint_family == "responses" and _is_streaming_json(body)
             and response.status_code < 400
         )
-        if not responses_stream:
-            await write_log(response.status_code, response.status_code < 400)
         if (pool_sync is not None and request_pool is not None and entry is not None
                 and entry.group_id and model_name and 400 <= response.status_code < 500):
             try:
@@ -592,6 +628,7 @@ def create_handlers(service, store, pool_sync=None):
                         upstream, entry.group_id, model_name,
                     )
                 await response.aclose()
+                await write_log(response.status_code, False)
                 return Response(error_body, status_code=response.status_code, headers=headers)
         # 流式响应禁用反向代理缓冲，否则 nginx/群晖反代会攒批 flush 导致远程访问"一顿一顿"
         if "event-stream" in response.headers.get("content-type", "") or response.headers.get("content-length") is None:
@@ -602,8 +639,10 @@ def create_handlers(service, store, pool_sync=None):
             content_type = response.headers.get("content-type", "")
             is_sse = "event-stream" in content_type
             stream_state = _new_responses_stream_state()
+            usage_acc = UsageAccumulator(endpoint_family, is_sse, content_type)
             bad_gateway_body = False
             stream_override = ""
+            log_written = False
             try:
                 async for chunk in response.aiter_bytes():
                     if responses_stream and chunk:
@@ -628,6 +667,7 @@ def create_handlers(service, store, pool_sync=None):
                             sent_at = getattr(result, "response_started_mono", 0.0)
                             if request_pool is not None and entry is not None and sent_at > 0:
                                 request_pool.record_ttft(entry, time.monotonic() - sent_at)
+                    usage_acc.feed_chunk(chunk)
                     yield chunk
             except httpx.TransportError as e:
                 stream_override = "transport_error"
@@ -639,6 +679,12 @@ def create_handlers(service, store, pool_sync=None):
                 try:
                     await response.aclose()
                 finally:
+                    usage = usage_acc.finalize()
+                    usage_extra = {}
+                    if usage is not None:
+                        usage_extra = {"prompt_tokens": usage[0],
+                                       "completion_tokens": usage[1],
+                                       "total_tokens": usage[2]}
                     if responses_stream:
                         stream_status, stream_error_status, succeeded = _finish_responses_stream_state(
                             stream_state, content_type, bad_gateway_body, stream_override,
@@ -677,6 +723,11 @@ def create_handlers(service, store, pool_sync=None):
                         extra = {"stream_status": stream_status}
                         if stream_error_status:
                             extra["stream_error_status"] = stream_error_status
+                        extra.update(usage_extra)
                         await write_log(response.status_code, succeeded, **extra)
+                        log_written = True
+                    if not log_written:
+                        succeeded = response.status_code < 400 and not stream_override
+                        await write_log(response.status_code, succeeded, **usage_extra)
         return StreamingResponse(body_gen(), status_code=response.status_code, headers=headers, media_type=response.headers.get("content-type"))
     return health, stats_page, stats_api, logs_page, logs_history, logs_stream, proxy

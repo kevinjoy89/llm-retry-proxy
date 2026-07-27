@@ -63,6 +63,7 @@ def _agg_by(records: list, key: str, label: str, key_fn=None):
     buckets = defaultdict(lambda: {
         "requests": 0, "retries": 0, "succeeded": 0, "first_ok": 0,
         "cancelled": 0, "max_retries": 0, "fail": 0,
+        "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
         "durations": [], "fail_statuses": Counter(),
     })
     for r in records:
@@ -70,6 +71,9 @@ def _agg_by(records: list, key: str, label: str, key_fn=None):
         b = buckets[k]
         b["requests"] += 1
         b["retries"] += r.get("retries", 0)
+        b["prompt_tokens"] += r.get("prompt_tokens", 0) or 0
+        b["completion_tokens"] += r.get("completion_tokens", 0) or 0
+        b["total_tokens"] += r.get("total_tokens", 0) or 0
         cancelled = _req_cancelled(r)
         if cancelled:
             b["cancelled"] += 1
@@ -108,6 +112,9 @@ def _agg_by(records: list, key: str, label: str, key_fn=None):
             "failed": b["fail"],
             "cancelled": b["cancelled"],
             "max_retries": b["max_retries"],
+            "prompt_tokens": b["prompt_tokens"],
+            "completion_tokens": b["completion_tokens"],
+            "total_tokens": b["total_tokens"],
             "avg_duration": round(sum(ds) / n, 3) if n else 0,
             "p95_duration": round(_percentile(ds, 0.95), 3) if n else 0,
             "max_duration": round(ds[-1], 3) if n else 0,
@@ -335,13 +342,17 @@ def _mode_comparison(records: list) -> list:
     """按竞速模式聚合对比数据。旧日志无 mode 字段的归入 'off'（串行）。"""
     buckets = defaultdict(lambda: {
         "requests": 0, "retries": 0, "succeeded": 0, "first_ok": 0,
-        "cancelled": 0, "max_retries": 0, "fail": 0, "durations": [],
+        "cancelled": 0, "max_retries": 0, "fail": 0,
+        "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "durations": [],
     })
     for r in records:
         m = r.get("mode", "") or "off"
         b = buckets[m]
         b["requests"] += 1
         b["retries"] += r.get("retries", 0)
+        b["prompt_tokens"] += r.get("prompt_tokens", 0) or 0
+        b["completion_tokens"] += r.get("completion_tokens", 0) or 0
+        b["total_tokens"] += r.get("total_tokens", 0) or 0
         if _req_cancelled(r):
             b["cancelled"] += 1
         elif _req_succeeded(r):
@@ -375,6 +386,9 @@ def _mode_comparison(records: list) -> list:
             "cancelled": b["cancelled"],
             "availability_pct": round(b["succeeded"] / measured * 100, 2) if measured else 0,
             "upstream_availability_pct": round(b["first_ok"] / measured * 100, 2) if measured else 0,
+            "prompt_tokens": b["prompt_tokens"],
+            "completion_tokens": b["completion_tokens"],
+            "total_tokens": b["total_tokens"],
             "avg_duration": round(sum(ds) / n, 3) if n else 0,
             "p95_duration": round(_percentile(ds, 0.95), 3) if n else 0,
             "max_retries": b["max_retries"],
@@ -392,6 +406,9 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
     failed = measured - succeeded
     avail = round(succeeded / measured * 100, 2) if measured else 0
     upstream_avail = round(upstream_ok / measured * 100, 2) if measured else 0
+    total_prompt_tokens = sum(r.get("prompt_tokens", 0) or 0 for r in records)
+    total_completion_tokens = sum(r.get("completion_tokens", 0) or 0 for r in records)
+    total_tokens = sum(r.get("total_tokens", 0) or 0 for r in records)
 
     dist = Counter(r.get("retries", 0) for r in records)
     retry_distribution = [{"retries": k, "count": v} for k, v in sorted(dist.items())]
@@ -428,6 +445,7 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
     tl = defaultdict(lambda: {
         "requests": 0, "retries": 0, "succeeded": 0, "first_ok": 0,
         "failed": 0, "cancelled": 0,
+        "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
     })
     for r in records:
         ts = r.get("ts", "")
@@ -435,6 +453,9 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
         b = tl[bucket]
         b["requests"] += 1
         b["retries"] += r.get("retries", 0)
+        b["prompt_tokens"] += r.get("prompt_tokens", 0) or 0
+        b["completion_tokens"] += r.get("completion_tokens", 0) or 0
+        b["total_tokens"] += r.get("total_tokens", 0) or 0
         if _req_cancelled(r):
             b["cancelled"] += 1
         elif _req_succeeded(r):
@@ -451,6 +472,7 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
             "succeeded": s["succeeded"], "failed": s["failed"], "cancelled": s["cancelled"],
             "availability_pct": round(s["succeeded"] / bucket_measured * 100, 2) if bucket_measured else 0,
             "upstream_availability_pct": round(s["first_ok"] / bucket_measured * 100, 2) if bucket_measured else 0,
+            "total_tokens": s["total_tokens"],
         })
 
     upstream_sc = Counter()
@@ -561,6 +583,7 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
 
     hour_buckets = defaultdict(lambda: {
         "requests": 0, "retries": 0, "succeeded": 0, "first_ok": 0, "cancelled": 0,
+        "total_tokens": 0,
     })
     for r in records:
         ts = r.get("ts", "")
@@ -570,6 +593,7 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
             continue
         hour_buckets[h]["requests"] += 1
         hour_buckets[h]["retries"] += r.get("retries", 0)
+        hour_buckets[h]["total_tokens"] += r.get("total_tokens", 0) or 0
         if _req_cancelled(r):
             hour_buckets[h]["cancelled"] += 1
         elif _req_succeeded(r):
@@ -580,6 +604,7 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
     for h in range(24):
         s = hour_buckets.get(h, {
             "requests": 0, "retries": 0, "succeeded": 0, "first_ok": 0, "cancelled": 0,
+            "total_tokens": 0,
         })
         hour_measured = s["requests"] - s["cancelled"]
         by_hour.append({
@@ -587,6 +612,7 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
             "cancelled": s["cancelled"],
             "availability_pct": round(s["succeeded"] / hour_measured * 100, 2) if hour_measured else 0,
             "upstream_availability_pct": round(s["first_ok"] / hour_measured * 100, 2) if hour_measured else 0,
+            "total_tokens": s["total_tokens"],
         })
 
     by_path = _agg_by(records, "path", "path")
@@ -603,6 +629,9 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
             "upstream_availability_pct": upstream_avail,
             "failed_requests": failed,
             "cancelled_requests": cancelled,
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_completion_tokens": total_completion_tokens,
+            "total_tokens": total_tokens,
         },
         "by_provider": _agg_by(records, "provider", "provider"),
         "by_model": [m for m in _agg_by(records, "model", "model", key_fn=_model_key) if not m["model"].endswith("/(unknown)")],
