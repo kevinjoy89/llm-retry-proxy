@@ -152,6 +152,28 @@ class KeyPool:
                 fingerprint = hashlib.sha256(entry.key.encode("utf-8")).hexdigest()[:8]
                 entry.key_id = f"{base}#{fingerprint}"
 
+    def apply_settings(self, strategy, target_ttft_s, external_retest_weight,
+                       external_ttft_prior_strength, session_affinity):
+        """Apply selection settings and reset scheduler state derived from them.
+
+        Centralizes the update so callers (e.g. PoolSyncManager.set_source_settings)
+        do not reach into private scheduler fields directly.
+        """
+        self.strategy = strategy
+        self.target_ttft_s = target_ttft_s
+        self.external_retest_weight = external_retest_weight
+        self.external_ttft_prior_strength = external_ttft_prior_strength
+        self.session_affinity = session_affinity
+        if not session_affinity:
+            self._session_routes.clear()
+        self._selection_count = 0
+        self._balanced_group = None
+        for metric in self._metrics.values():
+            metric.update({
+                "slow_streak": 0, "recovery_streak": 0,
+                "next_probe_at": 0.0, "probe_reserved_until": 0.0,
+            })
+
     @staticmethod
     def _capability_matches(entry, model, endpoint_family, model_scope):
         capabilities = entry.routing_capabilities

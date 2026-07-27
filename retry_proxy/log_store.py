@@ -6,7 +6,8 @@ from datetime import datetime, timedelta
 
 from .config import logger, settings
 from .routes import is_excluded_path
-from .stats import _model_key, _normalize_provider, _req_cancelled, _req_succeeded
+from .stats import (_model_key, _normalize_provider, _req_cancelled,
+                    _req_first_ok, _req_succeeded)
 
 # 汇总落盘的最小间隔（秒）。每条日志仍即时追加到 JSONL，但累计汇总
 # 按此间隔节流，避免高 QPS 下每请求全量序列化+fsync 成为瓶颈。
@@ -33,7 +34,7 @@ class RetryLogStore:
             summary["total_cancelled"] += 1
         elif _req_succeeded(r):
             summary["total_succeeded"] += 1
-            if r.get("first_ok", r.get("retries", 0) == 0): summary["total_first_ok"] += 1
+            if _req_first_ok(r): summary["total_first_ok"] += 1
         else: summary["total_failed"] += 1
         if r.get("ts"):
             summary["first_ts"] = summary["first_ts"] or r["ts"]
@@ -50,7 +51,7 @@ class RetryLogStore:
                 b["cancelled"] += 1
             elif _req_succeeded(r):
                 b["succeeded"] += 1
-                if r.get("first_ok", r.get("retries", 0) == 0): b["first_ok"] += 1
+                if _req_first_ok(r): b["first_ok"] += 1
             else: b["failed"] += 1
             b["max_retries"] = max(b["max_retries"], r.get("retries", 0))
         statuses = [r.get("upstream_status", 0), *r.get("retry_codes", [])]

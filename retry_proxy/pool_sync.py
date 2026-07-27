@@ -15,6 +15,10 @@ from .config import logger, settings
 from .key_pool import (KEY_POOLS, KEY_POOL_STRATEGIES, KeyEntry, KeyPool,
                        clone_key_pool, replace_key_pool)
 from .routes import normalize_route_prefix
+from .experience_data import (_EXPERIENCE_PATH_PATTERN,
+                             _EXPERIENCE_TRANSFORM_DEFAULTS,
+                             _experience_timestamp, _experience_value,
+                             _parse_experience_payload)
 from .secrets_crypto import (SENSITIVE_FIELDS, decrypt_session, derive_key,
                              encrypt_session)
 from .sync_adapters import ADAPTERS, PoolSyncError
@@ -39,85 +43,6 @@ def _experience_timestamp(value):
         return parsed.timestamp()
     except (TypeError, ValueError, OverflowError):
         return 0.0
-
-
-_EXPERIENCE_PATH_PATTERN = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$")
-_EXPERIENCE_TRANSFORM_DEFAULTS = {
-    "items_path": "",
-    "id_path": "",
-    "name_path": "",
-    "platform_path": "",
-    "rate_path": "",
-    "ttft_path": "",
-    "ttft_unit": "ms",
-    "samples_path": "",
-    "timestamp_path": "",
-}
-
-
-def _experience_value(value, path):
-    if path == "$":
-        return value
-    if not path:
-        return None
-    for part in path.split("."):
-        if not isinstance(value, dict) or part not in value:
-            return None
-        value = value[part]
-    return value
-
-
-def _parse_experience_payload(payload, transform=None):
-    transform = {**_EXPERIENCE_TRANSFORM_DEFAULTS, **(transform or {})}
-    items = _experience_value(payload, transform["items_path"])
-    if not isinstance(items, list):
-        raise PoolSyncError(f"外部数据列表路径无效: {transform['items_path']}")
-    normalized = []
-    seen = set()
-    for raw in items:
-        raw_id = _experience_value(raw, transform["id_path"])
-        if not isinstance(raw, dict) or raw_id in (None, ""):
-            continue
-        item_id = str(raw_id)
-        if item_id in seen:
-            raise PoolSyncError(f"外部数据包含重复分组 ID: {item_id}")
-        seen.add(item_id)
-        ttft = _experience_value(raw, transform["ttft_path"])
-        try:
-            ttft = float(ttft) if ttft is not None else None
-            if ttft is not None and transform["ttft_unit"] == "ms":
-                ttft /= 1000
-            if ttft is not None and (not math.isfinite(ttft) or ttft < 0):
-                ttft = None
-        except (TypeError, ValueError):
-            ttft = None
-        sample_count = 1
-        if transform["samples_path"]:
-            try:
-                sample_count = max(int(_experience_value(
-                    raw, transform["samples_path"],
-                ) or 0), 0)
-            except (TypeError, ValueError):
-                sample_count = 0
-        try:
-            rate = float(_experience_value(raw, transform["rate_path"]))
-            rate = rate if math.isfinite(rate) else None
-        except (TypeError, ValueError):
-            rate = None
-        normalized.append({
-            "id": item_id,
-            "name": str(_experience_value(raw, transform["name_path"]) or item_id).strip(),
-            "platform": str(_experience_value(
-                raw, transform["platform_path"],
-            ) or "").strip().lower(),
-            "rate_multiplier": rate,
-            "ttft": ttft,
-            "samples": sample_count,
-            "last_ts": _experience_timestamp(_experience_value(
-                raw, transform["timestamp_path"],
-            )),
-        })
-    return normalized
 
 
 class PoolSyncManager:
@@ -898,35 +823,14 @@ class PoolSyncManager:
                 source["session_affinity"] = bool(session_affinity)
             pool = self.pools.get(self._pool_url(source))
             if pool is not None:
-                pool.strategy = strategy
-                pool.target_ttft_s = target
-                pool.external_retest_weight = external_weight
-                pool.external_ttft_prior_strength = prior_strength
-                pool.session_affinity = bool(source.get("session_affinity", False))
-                if not pool.session_affinity:
-                    pool._session_routes.clear()
-                pool._selection_count = 0
-                pool._balanced_group = None
-                for metric in pool._metrics.values():
-                    metric.update({
-                        "slow_streak": 0, "recovery_streak": 0,
-                        "next_probe_at": 0.0, "probe_reserved_until": 0.0,
-                    })
+                affinity = bool(source.get("session_affinity", False))
+                pool.apply_settings(
+                    strategy, target, external_weight, prior_strength, affinity,
+                )
                 for view in pool._views.values():
-                    view.strategy = strategy
-                    view.target_ttft_s = target
-                    view.external_retest_weight = external_weight
-                    view.external_ttft_prior_strength = prior_strength
-                    view.session_affinity = pool.session_affinity
-                    if not view.session_affinity:
-                        view._session_routes.clear()
-                    view._selection_count = 0
-                    view._balanced_group = None
-                    for metric in view._metrics.values():
-                        metric.update({
-                            "slow_streak": 0, "recovery_streak": 0,
-                            "next_probe_at": 0.0, "probe_reserved_until": 0.0,
-                        })
+                    view.apply_settings(
+                        strategy, target, external_weight, prior_strength, affinity,
+                    )
             self._save_state()
             return self.status()
 

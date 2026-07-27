@@ -43,6 +43,15 @@ def _req_succeeded(r: dict) -> bool:
     return r.get("final_status", 0) < 400
 
 
+def _req_first_ok(r: dict) -> bool:
+    """Whether the request succeeded on the first attempt (no retries).
+
+    Falls back to ``retries == 0`` for records written by older versions that
+    lack an explicit ``first_ok`` field.
+    """
+    return r.get("first_ok", r.get("retries", 0) == 0)
+
+
 _PROVIDER_ALIASES = {
     "anthropic": "xfyun",
     "讯飞星辰 Coding Plan": "xfyun",
@@ -75,7 +84,7 @@ def _agg_by(records: list, key: str, label: str, key_fn=None):
             b["cancelled"] += 1
         elif _req_succeeded(r):
             b["succeeded"] += 1
-            if r.get("first_ok", r.get("retries", 0) == 0):
+            if _req_first_ok(r):
                 b["first_ok"] += 1
         else:
             b["fail"] += 1
@@ -305,11 +314,11 @@ def _upstream_window_stats(records: list) -> list:
                 continue
             if t >= cutoff:
                 total += 1
-                if _req_succeeded(r) and r.get("first_ok", r.get("retries", 0) == 0):
+                if _req_succeeded(r) and _req_first_ok(r):
                     first_ok += 1
             elif t >= prev_cutoff:
                 prev_total += 1
-                if _req_succeeded(r) and r.get("first_ok", r.get("retries", 0) == 0):
+                if _req_succeeded(r) and _req_first_ok(r):
                     prev_first_ok += 1
         cur_ua = round(first_ok / total * 100, 2) if total else None
         prev_ua = round(prev_first_ok / prev_total * 100, 2) if prev_total else None
@@ -346,7 +355,7 @@ def _mode_comparison(records: list) -> list:
             b["cancelled"] += 1
         elif _req_succeeded(r):
             b["succeeded"] += 1
-            if r.get("first_ok", r.get("retries", 0) == 0):
+            if _req_first_ok(r):
                 b["first_ok"] += 1
         else:
             b["fail"] += 1
@@ -388,7 +397,7 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
     measured = total - cancelled
     total_retries = sum(r.get("retries", 0) for r in records)
     succeeded = sum(1 for r in records if _req_succeeded(r))
-    upstream_ok = sum(1 for r in records if _req_succeeded(r) and r.get("first_ok", r.get("retries", 0) == 0))
+    upstream_ok = sum(1 for r in records if _req_succeeded(r) and _req_first_ok(r))
     failed = measured - succeeded
     avail = round(succeeded / measured * 100, 2) if measured else 0
     upstream_avail = round(upstream_ok / measured * 100, 2) if measured else 0
@@ -439,7 +448,7 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
             b["cancelled"] += 1
         elif _req_succeeded(r):
             b["succeeded"] += 1
-            if r.get("first_ok", r.get("retries", 0) == 0):
+            if _req_first_ok(r):
                 b["first_ok"] += 1
         else:
             b["failed"] += 1
@@ -577,7 +586,7 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
             hour_buckets[h]["cancelled"] += 1
         elif _req_succeeded(r):
             hour_buckets[h]["succeeded"] += 1
-            if r.get("first_ok", r.get("retries", 0) == 0):
+            if _req_first_ok(r):
                 hour_buckets[h]["first_ok"] += 1
     by_hour = []
     for h in range(24):
