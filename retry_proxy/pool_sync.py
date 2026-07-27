@@ -1111,90 +1111,95 @@ class PoolSyncManager:
             await self.stop()
         return result
 
+    def _visible_entry(self, source, item, pool, runtime, disabled_key_ids, now):
+        raw_key = item.get("key", "")
+        entry = runtime.get(raw_key)
+        prior = pool.prior_metrics.get(str(item.get("group_id") or "")) if pool else None
+        ttft_stale_after = getattr(self.config, "key_ttft_stale_after", 300)
+        return {
+            "source_key_id": item.get("source_key_id"),
+            "enabled": str(item.get("source_key_id")) not in disabled_key_ids,
+            "key_masked": _mask_key(raw_key),
+            "label": item.get("label", ""), "sort": item.get("sort", ""),
+            "group_id": str(item.get("group_id") or ""),
+            "key_name": item.get("key_name", ""), "group_name": item.get("group_name", ""),
+            "platform": item.get("platform", ""),
+            "allow_image_generation": bool(item.get("allow_image_generation")),
+            "routing_capabilities": self._routing_capabilities(source, item),
+            "models": item.get("models", []),
+            "paths": item.get("paths", []),
+            "cooled": bool(entry and entry.cooldown_until > now),
+            "cooldown_remaining": round(max(entry.cooldown_until - now, 0), 1) if entry else 0,
+            "last_failure_status": entry.last_failure_status if entry else None,
+            "last_failure_kind": entry.last_failure_kind if entry else "",
+            "ttft_ewma": round(entry.ttft_ewma, 3) if entry and entry.ttft_ewma is not None else None,
+            "ttft_samples": entry.ttft_samples if entry else 0,
+            "ttft_last_ts": entry.ttft_last_ts if entry else 0,
+            "ttft_stale": bool(entry and entry.ttft_last_ts and
+                               now - entry.ttft_last_ts >= ttft_stale_after),
+            "experience_ttft_s": (round(prior["ttft"], 3)
+                                   if prior and prior.get("ttft") is not None else None),
+            "experience_samples": prior.get("samples", 0) if prior else 0,
+            "experience_last_ts": prior.get("observed_ts", 0) if prior else 0,
+            "probe_latency_s": (round(entry.probe_latency_s, 3)
+                                if entry and entry.probe_latency_s is not None else None),
+            "probe_last_ts": entry.probe_last_ts if entry else 0,
+        }
+
+    def _source_status(self, source, now):
+        adapter = self._adapter(source["adapter"])
+        pool = self.pools.get(self._pool_url(source))
+        route_prefix = source.get("route_prefix", "")
+        if not route_prefix and self.route_registry is not None:
+            route_prefix = self.route_registry.environment_prefix_for_url(source["base_url"])
+        runtime = {entry.key: entry for entry in pool.entries} if pool else {}
+        disabled_key_ids = {
+            str(value) for value in source.get("disabled_key_ids", [])
+            if value not in (None, "")
+        }
+        visible_entries = [
+            self._visible_entry(source, item, pool, runtime, disabled_key_ids, now)
+            for item in (source.get("entries") or [])
+        ]
+        return {
+            "id": source["id"], "adapter": source["adapter"], "adapter_label": adapter.label,
+            "base_url": source["base_url"], "provider": source.get("provider", ""),
+            "route_prefix": route_prefix,
+            "connected": adapter.connected(source.get("session") or {}),
+            "account": adapter.public_session(source.get("session") or {}),
+            "last_sync_at": source.get("last_sync_at", ""),
+            "last_attempt_at": source.get("last_attempt_at", ""),
+            "last_error": source.get("last_error", ""),
+            "strategy": source.get("strategy", "cost"),
+            "target_ttft_s": source.get("target_ttft_s", 5.0),
+            "external_retest_weight": source.get("external_retest_weight", 0.5),
+            "external_ttft_prior_strength": source.get(
+                "external_ttft_prior_strength", 2.0,
+            ),
+            "session_affinity": bool(source.get("session_affinity", False)),
+            "ttft_policy": {
+                "stale_after": getattr(self.config, "key_ttft_stale_after", 300),
+                "retest_interval": getattr(self.config, "key_ttft_retest_interval", 60),
+                "confirmations": getattr(self.config, "key_ttft_confirmations", 2),
+                "hysteresis": getattr(self.config, "key_ttft_hysteresis", 0.1),
+            },
+            "scheduler_views": pool.scheduler_status(now) if pool else [],
+            "experience": {
+                **(source.get("experience_source") or {}),
+                "items": [dict(item) for item in source.get("experience_items") or []],
+                "mappings": dict(source.get("experience_mappings") or {}),
+                "last_sync_at": source.get("experience_last_sync_at", ""),
+                "last_error": source.get("experience_last_error", ""),
+            },
+            "check_model": source.get("check_model", ""),
+            "key_count": len(visible_entries), "keys": visible_entries,
+            "operation": dict(self.operations.get(source["id"]) or {}),
+        }
+
     def status(self, source_id=None):
         selected = [self.sources[source_id]] if source_id in self.sources else list(self.sources.values())
-        public_sources = []
         now = datetime.now().timestamp()
-        for source in selected:
-            adapter = self._adapter(source["adapter"])
-            pool = self.pools.get(self._pool_url(source))
-            route_prefix = source.get("route_prefix", "")
-            if not route_prefix and self.route_registry is not None:
-                route_prefix = self.route_registry.environment_prefix_for_url(source["base_url"])
-            runtime = {entry.key: entry for entry in pool.entries} if pool else {}
-            disabled_key_ids = {
-                str(value) for value in source.get("disabled_key_ids", [])
-                if value not in (None, "")
-            }
-            visible_entries = []
-            for item in source.get("entries") or []:
-                raw_key = item.get("key", "")
-                entry = runtime.get(raw_key)
-                prior = pool.prior_metrics.get(str(item.get("group_id") or "")) if pool else None
-                visible_entries.append({
-                    "source_key_id": item.get("source_key_id"),
-                    "enabled": str(item.get("source_key_id")) not in disabled_key_ids,
-                    "key_masked": _mask_key(raw_key),
-                    "label": item.get("label", ""), "sort": item.get("sort", ""),
-                    "group_id": str(item.get("group_id") or ""),
-                    "key_name": item.get("key_name", ""), "group_name": item.get("group_name", ""),
-                    "platform": item.get("platform", ""),
-                    "allow_image_generation": bool(item.get("allow_image_generation")),
-                    "routing_capabilities": self._routing_capabilities(source, item),
-                    "models": item.get("models", []),
-                    "paths": item.get("paths", []),
-                    "cooled": bool(entry and entry.cooldown_until > now),
-                    "cooldown_remaining": round(max(entry.cooldown_until - now, 0), 1) if entry else 0,
-                    "last_failure_status": entry.last_failure_status if entry else None,
-                    "last_failure_kind": entry.last_failure_kind if entry else "",
-                    "ttft_ewma": round(entry.ttft_ewma, 3) if entry and entry.ttft_ewma is not None else None,
-                    "ttft_samples": entry.ttft_samples if entry else 0,
-                    "ttft_last_ts": entry.ttft_last_ts if entry else 0,
-                    "ttft_stale": bool(entry and entry.ttft_last_ts and
-                                       now - entry.ttft_last_ts >= getattr(
-                                           self.config, "key_ttft_stale_after", 300)),
-                    "experience_ttft_s": (round(prior["ttft"], 3)
-                                           if prior and prior.get("ttft") is not None else None),
-                    "experience_samples": prior.get("samples", 0) if prior else 0,
-                    "experience_last_ts": prior.get("observed_ts", 0) if prior else 0,
-                    "probe_latency_s": (round(entry.probe_latency_s, 3)
-                                        if entry and entry.probe_latency_s is not None else None),
-                    "probe_last_ts": entry.probe_last_ts if entry else 0,
-                })
-            public_sources.append({
-                "id": source["id"], "adapter": source["adapter"], "adapter_label": adapter.label,
-                "base_url": source["base_url"], "provider": source.get("provider", ""),
-                "route_prefix": route_prefix,
-                "connected": adapter.connected(source.get("session") or {}),
-                "account": adapter.public_session(source.get("session") or {}),
-                "last_sync_at": source.get("last_sync_at", ""),
-                "last_attempt_at": source.get("last_attempt_at", ""),
-                "last_error": source.get("last_error", ""),
-                "strategy": source.get("strategy", "cost"),
-                "target_ttft_s": source.get("target_ttft_s", 5.0),
-                "external_retest_weight": source.get("external_retest_weight", 0.5),
-                "external_ttft_prior_strength": source.get(
-                    "external_ttft_prior_strength", 2.0,
-                ),
-                "session_affinity": bool(source.get("session_affinity", False)),
-                "ttft_policy": {
-                    "stale_after": getattr(self.config, "key_ttft_stale_after", 300),
-                    "retest_interval": getattr(self.config, "key_ttft_retest_interval", 60),
-                    "confirmations": getattr(self.config, "key_ttft_confirmations", 2),
-                    "hysteresis": getattr(self.config, "key_ttft_hysteresis", 0.1),
-                },
-                "scheduler_views": pool.scheduler_status(now) if pool else [],
-                "experience": {
-                    **(source.get("experience_source") or {}),
-                    "items": [dict(item) for item in source.get("experience_items") or []],
-                    "mappings": dict(source.get("experience_mappings") or {}),
-                    "last_sync_at": source.get("experience_last_sync_at", ""),
-                    "last_error": source.get("experience_last_error", ""),
-                },
-                "check_model": source.get("check_model", ""),
-                "key_count": len(visible_entries), "keys": visible_entries,
-                "operation": dict(self.operations.get(source["id"]) or {}),
-            })
+        public_sources = [self._source_status(source, now) for source in selected]
         return {
             "interval": self.config.key_pool_sync_interval,
             "defaults": {"adapter": self.config.key_pool_sync_default_adapter,
