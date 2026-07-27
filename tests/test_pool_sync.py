@@ -214,12 +214,75 @@ class Sub2APIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source["group_model_cache"]["2"], ["gpt-5.4", "gpt-4.1"])
         self.assertTrue(entries[0]["routing_capabilities"]["model_list_known"])
 
+    async def test_repeated_key_page_raises_instead_of_looping_forever(self):
+        # Regression: a misbehaving upstream returning the same page each time
+        # used to loop without bound, holding the sync lock. Now it raises.
+        adapter = Sub2APIAdapter()
+
+        class RepeatingKeyClient:
+            async def get(self, url, params=None, headers=None, timeout=None):
+                page = (params or {}).get("page", 1)
+                if url.endswith("/keys"):
+                    # Always report total=200 and return a full page (100 items)
+                    # of the SAME ids each time, so the loop would never end
+                    # without the duplicate-page guard.
+                    page_items = [
+                        {"id": 100 + i, "key": f"sk-{i}", "name": f"A{i}",
+                         "group_id": 2, "status": "active",
+                         "group": {"id": 2, "name": "Team", "platform": "openai",
+                                   "status": "active", "rate_multiplier": 0.05}}
+                        for i in range(100)
+                    ]
+                    return response({"code": 0, "data": {
+                        "items": page_items, "total": 200}})
+                if url.endswith("/groups/available"):
+                    return response({"code": 0, "data": [
+                        {"id": 2, "name": "Team", "platform": "openai",
+                         "status": "active", "rate_multiplier": 0.05}]})
+                if url.endswith("/groups/rates"):
+                    return response({"code": 0, "data": {"2": 0.03}})
+                if url.endswith("/v1/models"):
+                    return response({"object": "list", "data": []})
+                raise AssertionError(url)
+
+        source = {"base_url": "https://upstream.test"}
+        session = {"access_token": "access-1", "refresh_token": "refresh-1"}
+        with self.assertRaises(PoolSyncError) as raised:
+            await adapter.fetch(RepeatingKeyClient(), source, session)
+        self.assertIn("分页重复", str(raised.exception))
+
+    async def test_non_numeric_total_raises_pool_sync_error(self):
+        adapter = Sub2APIAdapter()
+
+        class BadTotalClient:
+            async def get(self, url, params=None, headers=None, timeout=None):
+                if url.endswith("/keys"):
+                    return response({"code": 0, "data": {
+                        "items": [{"id": 1, "key": "k", "name": "n", "group_id": 2,
+                                   "status": "active",
+                                   "group": {"id": 2, "name": "Team", "platform": "openai",
+                                             "status": "active", "rate_multiplier": 0.05}}],
+                        "total": "not-a-number"}})
+                if url.endswith("/groups/available"):
+                    return response({"code": 0, "data": [
+                        {"id": 2, "name": "Team", "platform": "openai",
+                         "status": "active", "rate_multiplier": 0.05}]})
+                if url.endswith("/groups/rates"):
+                    return response({"code": 0, "data": {"2": 0.03}})
+                if url.endswith("/v1/models"):
+                    return response({"object": "list", "data": []})
+                raise AssertionError(url)
+
+        source = {"base_url": "https://upstream.test"}
+        session = {"access_token": "access-1", "refresh_token": "refresh-1"}
+        with self.assertRaises(PoolSyncError):
+            await adapter.fetch(BadTotalClient(), source, session)
+
     def test_sub2api_routing_capabilities_use_structured_group_fields(self):
         capabilities = Sub2APIAdapter.routing_capabilities({
             "platform": "antigravity",
             "allow_image_generation": True,
-            "supported_model_scopes": ["claude", "gemini_image"],
-            "models_list_config": {"enabled": True, "models": ["claude-*", "gemini-*"]},
+            "supported_model_scopes": ["claude", "gemini_image"],            "models_list_config": {"enabled": True, "models": ["claude-*", "gemini-*"]},
         })
 
         self.assertEqual(capabilities["platform"], "antigravity")

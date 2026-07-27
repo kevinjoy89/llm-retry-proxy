@@ -261,6 +261,7 @@ class Sub2APIAdapter(PoolSyncAdapter):
     async def _fetch_all_keys(self, client, source, session):
         items = []
         page = 1
+        previous_page_ids = None
         while True:
             session, data = await self._get(
                 client, source, session, "/api/v1/keys", {"page": page, "page_size": 100}
@@ -269,12 +270,25 @@ class Sub2APIAdapter(PoolSyncAdapter):
                 batch, total = data, len(data)
             elif isinstance(data, dict):
                 batch = data.get("items") or data.get("data") or data.get("list") or []
-                total = int(data.get("total", len(batch)))
+                try:
+                    total = int(data.get("total", len(batch)))
+                except (TypeError, ValueError):
+                    raise PoolSyncError("Key 列表 total 字段格式无法识别")
             else:
                 raise PoolSyncError("Key 列表响应格式无法识别")
+            page_ids = tuple(
+                str(item.get("id")) if isinstance(item, dict) and item.get("id") is not None
+                else repr(item)
+                for item in batch
+            )
+            if batch and page_ids == previous_page_ids:
+                raise PoolSyncError("Key 列表分页重复，上游可能不支持分页参数")
+            previous_page_ids = page_ids
             items.extend(batch)
             if not batch or len(items) >= total or len(batch) < 100:
                 return session, items
+            if page >= 1000:
+                raise PoolSyncError("Key 列表分页超过安全上限")
             page += 1
 
     async def fetch(self, client, source, session):

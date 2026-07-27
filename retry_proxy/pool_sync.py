@@ -920,109 +920,111 @@ class PoolSyncManager:
         return "request_rejected", False
 
     async def check_availability(self, source_id, model=None):
-        source = self.sources.get(source_id)
-        if source is None:
-            raise PoolSyncError("号池同步连接不存在")
-        pool = self.pools.get(self._pool_url(source))
-        if pool is None or not pool.entries:
-            raise PoolSyncError("号池没有可检测的 Key")
-        check_model = str(model or source.get("check_model") or "").strip()
-        if not check_model:
-            raise PoolSyncError("请先填写检测模型")
-        source["check_model"] = check_model
-        self._save_state()
-        adapter = self._adapter(source["adapter"])
-        request_spec = adapter.availability_request(source, check_model)
-        if not isinstance(request_spec, dict) or not request_spec.get("url"):
-            raise PoolSyncError("同步适配器未提供有效的可用性检测请求")
-        probe_url = request_spec["url"]
-        probe_payload = request_spec.get("json") or {}
-        probe_headers = request_spec.get("headers") or {}
-        groups = {}
-        for entry in pool.entries:
-            groups.setdefault(entry.group_id or entry.key, []).append(entry)
-        semaphore = asyncio.Semaphore(2)
+        async with self._lock:
+            source = self.sources.get(source_id)
+            if source is None:
+                raise PoolSyncError("号池同步连接不存在")
+            pool = self.pools.get(self._pool_url(source))
+            if pool is None or not pool.entries:
+                raise PoolSyncError("号池没有可检测的 Key")
+            check_model = str(model or source.get("check_model") or "").strip()
+            if not check_model:
+                raise PoolSyncError("请先填写检测模型")
+            source["check_model"] = check_model
+            self._save_state()
+            adapter = self._adapter(source["adapter"])
+            request_spec = adapter.availability_request(source, check_model)
+            if not isinstance(request_spec, dict) or not request_spec.get("url"):
+                raise PoolSyncError("同步适配器未提供有效的可用性检测请求")
+            probe_url = request_spec["url"]
+            probe_payload = request_spec.get("json") or {}
+            probe_headers = request_spec.get("headers") or {}
+            # Snapshot entries so probes don't race with replace_key_pool swaps.
+            groups = {}
+            for entry in list(pool.entries):
+                groups.setdefault(entry.group_id or entry.key, []).append(entry)
+            semaphore = asyncio.Semaphore(2)
 
-        async def probe(entry):
-            headers = dict(probe_headers)
-            headers[entry.auth_header] = (
-                f"{entry.auth_scheme} {entry.key}"
-                if entry.auth_scheme else entry.key
-            )
-            try:
-                async with semaphore:
-                    started = time.monotonic()
-                    response = await self.client.post(
-                        probe_url, json=probe_payload, headers=headers, timeout=30,
-                    )
-                    elapsed = time.monotonic() - started
-                available = self._probe_status(response.status_code)
-                if available:
-                    pool.record_probe(entry, elapsed)
-                reason, circuit_failure = (
-                    ("available", False) if available
-                    else self._probe_failure(response.status_code)
+            async def probe(entry):
+                headers = dict(probe_headers)
+                headers[entry.auth_header] = (
+                    f"{entry.auth_scheme} {entry.key}"
+                    if entry.auth_scheme else entry.key
                 )
-                return entry, response.status_code, available, elapsed, reason, circuit_failure
-            except httpx.RequestError:
-                return entry, 0, False, None, "transport_error", True
-
-        async def probe_group(entries):
-            attempts = []
-            for entry in entries:
-                result = await probe(entry)
-                attempts.append(result)
-                if result[2] or not result[5]:
-                    break
-            return attempts
-
-        group_results = await asyncio.gather(
-            *(probe_group(entries) for entries in groups.values())
-        )
-        by_group = dict(zip(groups, group_results))
-        summary = []
-        for group_id, attempts in by_group.items():
-            available = any(item[2] is True for item in attempts)
-            explicitly_failed = bool(attempts) and all(item[2] is False for item in attempts)
-            circuit_opened = (
-                explicitly_failed and all(item[5] is True for item in attempts)
-            )
-            if circuit_opened:
-                status = next(item[1] for item in attempts if item[2] is False)
-                for entry in groups[group_id]:
-                    pool.mark_cooldown(
-                        entry, self.config.key_cooldown_5xx,
-                        failure_kind="probe", status=status,
+                try:
+                    async with semaphore:
+                        started = time.monotonic()
+                        response = await self.client.post(
+                            probe_url, json=probe_payload, headers=headers, timeout=30,
+                        )
+                        elapsed = time.monotonic() - started
+                    available = self._probe_status(response.status_code)
+                    if available:
+                        pool.record_probe(entry, elapsed)
+                    reason, circuit_failure = (
+                        ("available", False) if available
+                        else self._probe_failure(response.status_code)
                     )
-            summary.append({
-                "group_id": group_id,
-                "group_name": groups[group_id][0].group_name or groups[group_id][0].label,
-                "available": True if available else False if explicitly_failed else None,
-                "circuit_opened": circuit_opened,
-                "reason": "available" if available else attempts[-1][4],
-                "statuses": [item[1] for item in attempts],
-                "response_s": min((item[3] for item in attempts if item[2] and item[3] is not None),
-                                  default=None),
-            })
-        unavailable = sum(item["available"] is False for item in summary)
-        rejected = sum(
-            item["available"] is False and not item["circuit_opened"] for item in summary
-        )
-        circuit_opened = sum(item["circuit_opened"] for item in summary)
-        status_counts = {}
-        for item in summary:
-            for status in item["statuses"]:
-                status_counts[status] = status_counts.get(status, 0) + 1
-        status_summary = ",".join(
-            f"{status}:{count}" for status, count in sorted(status_counts.items())
-        )
-        logger.info(
-            f"号池可用性检测完成: upstream={source['base_url']} model={check_model} "
-            f"groups={len(summary)} statuses={status_summary or '-'} "
-            f"unavailable={unavailable} request_rejected={rejected} "
-            f"circuit_opened={circuit_opened}"
-        )
-        return {"model": check_model, "checks": summary, "state": self.status()}
+                    return entry, response.status_code, available, elapsed, reason, circuit_failure
+                except httpx.RequestError:
+                    return entry, 0, False, None, "transport_error", True
+
+            async def probe_group(entries):
+                attempts = []
+                for entry in entries:
+                    result = await probe(entry)
+                    attempts.append(result)
+                    if result[2] or not result[5]:
+                        break
+                return attempts
+
+            group_results = await asyncio.gather(
+                *(probe_group(entries) for entries in groups.values())
+            )
+            by_group = dict(zip(groups, group_results))
+            summary = []
+            for group_id, attempts in by_group.items():
+                available = any(item[2] is True for item in attempts)
+                explicitly_failed = bool(attempts) and all(item[2] is False for item in attempts)
+                circuit_opened = (
+                    explicitly_failed and all(item[5] is True for item in attempts)
+                )
+                if circuit_opened:
+                    status = next(item[1] for item in attempts if item[2] is False)
+                    for entry in groups[group_id]:
+                        pool.mark_cooldown(
+                            entry, self.config.key_cooldown_5xx,
+                            failure_kind="probe", status=status,
+                        )
+                summary.append({
+                    "group_id": group_id,
+                    "group_name": groups[group_id][0].group_name or groups[group_id][0].label,
+                    "available": True if available else False if explicitly_failed else None,
+                    "circuit_opened": circuit_opened,
+                    "reason": "available" if available else attempts[-1][4],
+                    "statuses": [item[1] for item in attempts],
+                    "response_s": min((item[3] for item in attempts if item[2] and item[3] is not None),
+                                      default=None),
+                })
+            unavailable = sum(item["available"] is False for item in summary)
+            rejected = sum(
+                item["available"] is False and not item["circuit_opened"] for item in summary
+            )
+            circuit_opened = sum(item["circuit_opened"] for item in summary)
+            status_counts = {}
+            for item in summary:
+                for status in item["statuses"]:
+                    status_counts[status] = status_counts.get(status, 0) + 1
+            status_summary = ",".join(
+                f"{status}:{count}" for status, count in sorted(status_counts.items())
+            )
+            logger.info(
+                f"号池可用性检测完成: upstream={source['base_url']} model={check_model} "
+                f"groups={len(summary)} statuses={status_summary or '-'} "
+                f"unavailable={unavailable} request_rejected={rejected} "
+                f"circuit_opened={circuit_opened}"
+            )
+            return {"model": check_model, "checks": summary, "state": self.status()}
 
     async def reset_group(self, source_id, group_id):
         async with self._lock:
@@ -1246,8 +1248,10 @@ class PoolSyncManager:
                    for source in self.sources.values())
 
     async def start(self):
-        if self._task is None and self._has_connected_sources() and self.config.key_pool_sync_interval > 0:
-            self._task = asyncio.create_task(self._run(), name="key-pool-sync")
+        async with self._lock:
+            if (self._task is None and self._has_connected_sources()
+                    and self.config.key_pool_sync_interval > 0):
+                self._task = asyncio.create_task(self._run(), name="key-pool-sync")
 
     async def stop(self):
         if self._task is not None:
