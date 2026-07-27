@@ -1,9 +1,11 @@
 from .base import PoolSyncAdapter, PoolSyncError
+from .manual import ManualAdapter
 from .new_api import NewAPIAdapter
 from .sub2api import Sub2APIAdapter
 
 
 ADAPTERS = {
+    ManualAdapter.name: ManualAdapter(),
     Sub2APIAdapter.name: Sub2APIAdapter(),
     NewAPIAdapter.name: NewAPIAdapter(),
 }
