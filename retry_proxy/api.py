@@ -342,7 +342,8 @@ def _summary_view(summary):
                     "max_retries": b["max_retries"],
                     "prompt_tokens": b.get("prompt_tokens", 0),
                     "completion_tokens": b.get("completion_tokens", 0),
-                    "total_tokens": b.get("total_tokens", 0)})
+                    "total_tokens": b.get("total_tokens", 0),
+                    "cached_tokens": b.get("cached_tokens", 0)})
     return sorted(out, key=lambda x: x["requests"], reverse=True)
 
 
@@ -359,6 +360,7 @@ def _cumulative(summary):
             "total_prompt_tokens": summary.get("total_prompt_tokens", 0),
             "total_completion_tokens": summary.get("total_completion_tokens", 0),
             "total_tokens": summary.get("total_tokens", 0),
+            "total_cached_tokens": summary.get("total_cached_tokens", 0),
             "by_provider": _summary_view(summary["by_provider"]), "by_model": _summary_view({k: v for k, v in summary["by_model"].items() if not k.endswith("/(unknown)")}),
             "by_key": _summary_view(summary.get("by_key", {})),
             "by_status": [{"status": k, "count": v} for k, v in sorted(summary["by_status"].items(), key=lambda x: -x[1])],
@@ -684,7 +686,8 @@ def create_handlers(service, store, pool_sync=None):
                     if usage is not None:
                         usage_extra = {"prompt_tokens": usage[0],
                                        "completion_tokens": usage[1],
-                                       "total_tokens": usage[2]}
+                                       "total_tokens": usage[2],
+                                       "cached_tokens": usage[3]}
                     if responses_stream:
                         stream_status, stream_error_status, succeeded = _finish_responses_stream_state(
                             stream_state, content_type, bad_gateway_body, stream_override,

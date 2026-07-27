@@ -51,6 +51,13 @@ class UsageAccumulator:
         self.prompt = 0
         self.completion = 0
         self.total = 0
+        # Cache-read tokens — the prompt portion served from a prompt cache.
+        # Field shape differs per family and is extracted alongside usage:
+        #   chat/embeddings: usage.prompt_tokens_details.cached_tokens
+        #   responses:       response.usage.input_tokens_details.cached_tokens
+        #   messages:        usage.cache_read_input_tokens
+        #   gemini:          usageMetadata.cachedContentTokenCount
+        self.cached = 0
         self.seen = False
         # Cap the buffered body so a pathological non-stream JSON response can
         # not hold unbounded memory. OpenAI/Anthropic place ``usage`` near the
@@ -116,6 +123,7 @@ class UsageAccumulator:
                     usage.get("completion_tokens"),
                     usage.get("total_tokens"),
                 )
+                self._apply_cached(usage.get("prompt_tokens_details"))
         elif family == "responses":
             response = payload.get("response")
             if isinstance(response, dict):
@@ -126,6 +134,7 @@ class UsageAccumulator:
                         usage.get("output_tokens"),
                         usage.get("total_tokens"),
                     )
+                    self._apply_cached(usage.get("input_tokens_details"))
         elif family == "gemini":
             meta = payload.get("usageMetadata")
             if isinstance(meta, dict):
@@ -134,6 +143,7 @@ class UsageAccumulator:
                 completion = meta.get("candidatesTokenCount", meta.get("totalTokenCount"))
                 total = meta.get("totalTokenCount", self.total)
                 self._apply(prompt, completion, total)
+                self._apply_cached(meta.get("cachedContentTokenCount"))
         elif family == "messages":
             if event_type == "message_start":
                 message = payload.get("message")
@@ -145,6 +155,7 @@ class UsageAccumulator:
                             usage.get("output_tokens"),
                             usage.get("total_tokens") or (self.prompt + self.completion),
                         )
+                        self._apply_cached(usage.get("cache_read_input_tokens"))
             elif event_type == "message_delta":
                 usage = payload.get("usage")
                 if isinstance(usage, dict):
@@ -153,6 +164,20 @@ class UsageAccumulator:
                         self.completion = _as_int(output)
                         self.total = self.prompt + self.completion
                         self.seen = True
+
+    def _apply_cached(self, cached):
+        """Record cache-read tokens from either a *_details dict or a raw int.
+
+        OpenAI nests the value under ``prompt_tokens_details``/``input_tokens_details``
+        while Gemini/Anthropic expose it as a flat field, so callers pass whatever
+        shape they found; a missing value leaves ``cached`` untouched.
+        """
+        if isinstance(cached, dict):
+            cached = cached.get("cached_tokens")
+        if cached is None:
+            return
+        self.cached = _as_int(cached)
+        self.seen = True
 
     def _apply(self, prompt, completion, total):
         if prompt is not None:
@@ -167,7 +192,7 @@ class UsageAccumulator:
             self.seen = True
 
     def finalize(self):
-        """Return ``(prompt, completion, total)`` or ``None`` when no usage found."""
+        """Return ``(prompt, completion, total, cached)`` or ``None`` when no usage found."""
         if not self._supported:
             return None
         if not self.is_sse and self.buffer:
@@ -182,4 +207,4 @@ class UsageAccumulator:
             return None
         if not self.total and (self.prompt or self.completion):
             self.total = self.prompt + self.completion
-        return self.prompt, self.completion, self.total
+        return self.prompt, self.completion, self.total, self.cached

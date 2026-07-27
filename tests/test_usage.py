@@ -23,7 +23,7 @@ class UsageAccumulatorTests(unittest.TestCase):
             "usage": {"prompt_tokens": 12, "completion_tokens": 34, "total_tokens": 46},
         }
         acc.feed_chunk(json.dumps(body).encode("utf-8"))
-        self.assertEqual(acc.finalize(), (12, 34, 46))
+        self.assertEqual(acc.finalize(), (12, 34, 46, 0))
 
     def test_openai_chat_stream_usage_on_final_frame(self):
         acc = UsageAccumulator("chat", is_sse=True, content_type="text/event-stream")
@@ -33,7 +33,7 @@ class UsageAccumulatorTests(unittest.TestCase):
             "usage": {"prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16},
         }))
         acc.feed_chunk(b"data: [DONE]\n\n")
-        self.assertEqual(acc.finalize(), (7, 9, 16))
+        self.assertEqual(acc.finalize(), (7, 9, 16, 0))
 
     def test_openai_chat_stream_without_usage_returns_none(self):
         acc = UsageAccumulator("chat", is_sse=True, content_type="text/event-stream")
@@ -48,7 +48,7 @@ class UsageAccumulatorTests(unittest.TestCase):
             "type": "response.completed",
             "response": {"usage": {"input_tokens": 5, "output_tokens": 11, "total_tokens": 16}},
         }))
-        self.assertEqual(acc.finalize(), (5, 11, 16))
+        self.assertEqual(acc.finalize(), (5, 11, 16, 0))
 
     def test_gemini_stream_usage_takes_final_frame(self):
         acc = UsageAccumulator("gemini", is_sse=True, content_type="text/event-stream")
@@ -60,7 +60,7 @@ class UsageAccumulatorTests(unittest.TestCase):
             "candidates": [{"content": {"parts": [{"text": "llo"}]}}],
             "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 5, "totalTokenCount": 8},
         }))
-        self.assertEqual(acc.finalize(), (3, 5, 8))
+        self.assertEqual(acc.finalize(), (3, 5, 8, 0))
 
     def test_anthropic_messages_usage(self):
         acc = UsageAccumulator("messages", is_sse=True, content_type="text/event-stream")
@@ -73,7 +73,7 @@ class UsageAccumulatorTests(unittest.TestCase):
             "usage": {"output_tokens": 15},
         }))
         # total should be derived from prompt + completion when upstream omits it
-        self.assertEqual(acc.finalize(), (20, 15, 35))
+        self.assertEqual(acc.finalize(), (20, 15, 35, 0))
 
     def test_unsupported_family_returns_none(self):
         acc = UsageAccumulator("images", is_sse=False)
@@ -86,7 +86,7 @@ class UsageAccumulatorTests(unittest.TestCase):
         mid = len(frame) // 2
         acc.feed_chunk(frame[:mid])
         acc.feed_chunk(frame[mid:])
-        self.assertEqual(acc.finalize(), (2, 4, 6))
+        self.assertEqual(acc.finalize(), (2, 4, 6, 0))
 
     def test_non_stream_invalid_json_returns_none(self):
         acc = UsageAccumulator("chat", is_sse=False)
@@ -108,7 +108,73 @@ class UsageAccumulatorTests(unittest.TestCase):
         acc = UsageAccumulator("chat", is_sse=False)
         body = '{"choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}'
         acc.feed_chunk(body.encode("utf-8"))
-        self.assertEqual(acc.finalize(), (4, 6, 10))
+        self.assertEqual(acc.finalize(), (4, 6, 10, 0))
+
+    def test_openai_chat_cached_tokens(self):
+        # OpenAI Chat nests cache-read tokens under prompt_tokens_details.
+        acc = UsageAccumulator("chat", is_sse=False)
+        body = {
+            "choices": [{"message": {"content": "hi"}}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20,
+                      "prompt_tokens_details": {"cached_tokens": 9}},
+        }
+        acc.feed_chunk(json.dumps(body).encode("utf-8"))
+        self.assertEqual(acc.finalize(), (12, 8, 20, 9))
+
+    def test_openai_embeddings_cached_tokens(self):
+        acc = UsageAccumulator("embeddings", is_sse=False)
+        body = {
+            "data": [{"embedding": [0.1, 0.2]}],
+            "usage": {"prompt_tokens": 50, "total_tokens": 50,
+                      "prompt_tokens_details": {"cached_tokens": 50}},
+        }
+        acc.feed_chunk(json.dumps(body).encode("utf-8"))
+        self.assertEqual(acc.finalize(), (50, 0, 50, 50))
+
+    def test_responses_cached_tokens(self):
+        # OpenAI Responses API nests cache-read tokens under input_tokens_details.
+        acc = UsageAccumulator("responses", is_sse=True, content_type="text/event-stream")
+        acc.feed_chunk(_sse_frame({"type": "response.output_text.delta", "delta": "hi"}))
+        acc.feed_chunk(_sse_frame({
+            "type": "response.completed",
+            "response": {"usage": {"input_tokens": 15, "output_tokens": 10, "total_tokens": 25,
+                                   "input_tokens_details": {"cached_tokens": 15}}},
+        }))
+        self.assertEqual(acc.finalize(), (15, 10, 25, 15))
+
+    def test_gemini_cached_tokens(self):
+        # Gemini exposes cachedContentTokenCount as a flat field on usageMetadata.
+        acc = UsageAccumulator("gemini", is_sse=True, content_type="text/event-stream")
+        acc.feed_chunk(_sse_frame({
+            "candidates": [{"content": {"parts": [{"text": "hi"}]}}],
+            "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 20,
+                              "totalTokenCount": 120, "cachedContentTokenCount": 80},
+        }))
+        self.assertEqual(acc.finalize(), (100, 20, 120, 80))
+
+    def test_anthropic_cached_tokens(self):
+        # Anthropic exposes cache_read_input_tokens as a flat field on message_start.usage.
+        acc = UsageAccumulator("messages", is_sse=True, content_type="text/event-stream")
+        acc.feed_chunk(_sse_frame({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 30, "output_tokens": 1,
+                                  "cache_read_input_tokens": 25}},
+        }))
+        acc.feed_chunk(_sse_frame({
+            "type": "message_delta",
+            "usage": {"output_tokens": 10},
+        }))
+        self.assertEqual(acc.finalize(), (30, 10, 40, 25))
+
+    def test_no_cached_tokens_defaults_zero(self):
+        # When the upstream response omits any cache field, cached stays 0 but
+        # usage is still parsed (cached is the fourth element of the tuple).
+        acc = UsageAccumulator("chat", is_sse=True, content_type="text/event-stream")
+        acc.feed_chunk(_sse_frame({
+            "choices": [],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+        }))
+        self.assertEqual(acc.finalize(), (5, 5, 10, 0))
 
 
 class TokenAggregationTests(unittest.TestCase):
@@ -116,14 +182,17 @@ class TokenAggregationTests(unittest.TestCase):
         from retry_proxy.stats import _agg_by
         records = [
             {"model": "gpt-4", "retries": 0, "final_status": 200, "succeeded": True,
-             "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+             "prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30,
+             "cached_tokens": 8},
             {"model": "gpt-4", "retries": 1, "final_status": 200, "succeeded": True,
-             "prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12},
+             "prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12,
+             "cached_tokens": 3},
         ]
         row = _agg_by(records, "model", "model")[0]
         self.assertEqual(row["prompt_tokens"], 15)
         self.assertEqual(row["completion_tokens"], 27)
         self.assertEqual(row["total_tokens"], 42)
+        self.assertEqual(row["cached_tokens"], 11)
 
     def test_agg_by_handles_missing_token_fields(self):
         from retry_proxy.stats import _agg_by
@@ -167,15 +236,19 @@ class LogStoreTokenSummaryTests(unittest.IsolatedAsyncioTestCase):
             "final_status": 200, "succeeded": True, "retries": 0,
             "upstream_status": 200, "duration_s": 0.5,
             "prompt_tokens": 100, "completion_tokens": 200, "total_tokens": 300,
+            "cached_tokens": 80,
         })
         self.assertEqual(store.summary["total_tokens"], 300)
         self.assertEqual(store.summary["total_prompt_tokens"], 100)
+        self.assertEqual(store.summary["total_cached_tokens"], 80)
         self.assertEqual(store.summary["by_model"]["p/gpt-4"]["total_tokens"], 300)
+        self.assertEqual(store.summary["by_model"]["p/gpt-4"]["cached_tokens"], 80)
 
         # Reload from disk to verify persistence
         restored = RetryLogStore()
         restored.initialize()
         self.assertEqual(restored.summary["total_tokens"], 300)
+        self.assertEqual(restored.summary["total_cached_tokens"], 80)
         self.assertEqual(restored.summary["version"], 6)
 
     async def test_legacy_summary_without_tokens_is_backfilled(self):
@@ -336,6 +409,7 @@ class BodyGenLogWriteTimingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["prompt_tokens"], 8)
         self.assertEqual(record["completion_tokens"], 12)
         self.assertEqual(record["total_tokens"], 20)
+        self.assertEqual(record["cached_tokens"], 0)
 
     async def test_chat_stream_transport_error_marks_failed_in_finally(self):
         # The upstream stream raises a transport error mid-way. The early-write
@@ -383,6 +457,30 @@ class BodyGenLogWriteTimingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(record["succeeded"])
         self.assertEqual(record["total_tokens"], 8)
         self.assertEqual(record["prompt_tokens"], 3)
+
+    async def test_chat_stream_attaches_cached_tokens_from_final_frame(self):
+        # End-to-end: cache-read tokens from the final SSE frame's
+        # prompt_tokens_details propagate through usage_extra to the log record.
+        sse = (
+            b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+            b'data: {"choices":[],"usage":{"prompt_tokens":50,"completion_tokens":10,"total_tokens":60,'
+            b'"prompt_tokens_details":{"cached_tokens":40}}}\n\n'
+            b'data: [DONE]\n\n'
+        )
+        upstream_response = httpx.Response(
+            200, content=sse, headers={"content-type": "text/event-stream"},
+            request=httpx.Request("POST", "https://upstream.test/v1/chat/completions"),
+        )
+        store = SimpleNamespace(write=AsyncMock())
+        proxy, request, pool, entry, config, result = self._build_proxy(upstream_response, store)
+        _, body = await self._run(proxy, request, pool, config, result)
+
+        self.assertEqual(body, sse)
+        record = store.write.await_args.args[0]
+        self.assertTrue(record["succeeded"])
+        self.assertEqual(record["prompt_tokens"], 50)
+        self.assertEqual(record["total_tokens"], 60)
+        self.assertEqual(record["cached_tokens"], 40)
 
 
 if __name__ == "__main__":
