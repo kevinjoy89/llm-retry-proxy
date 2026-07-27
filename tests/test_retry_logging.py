@@ -76,6 +76,30 @@ class RetryLoggingTests(unittest.IsolatedAsyncioTestCase):
         messages = [call.args[0] for call in trace_logger.info.call_args_list]
         self.assertTrue(any("响应头已建立，等待Responses流结束" in message for message in messages))
 
+    async def test_deferred_stream_success_does_not_establish_key_sticky_state(self):
+        config = SimpleNamespace(hedge_mode="off", max_retries=1)
+        pool = KeyPool([("only", "only")])
+        entry = pool.entries[0]
+        proxy = RetryProxy(config=config, client=object())
+        response = httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            request=httpx.Request("POST", "https://upstream.test/responses"),
+        )
+        proxy._send = AsyncMock(return_value=response)
+
+        result = await proxy.request(
+            "POST", "https://upstream.test/responses", {},
+            b'{"model":"model","stream":true}',
+            "v1/responses", "test", "model", pool,
+            defer_stream_success=True,
+        )
+
+        self.assertIsNone(pool._current)
+        self.assertEqual(result.key_attempts, [{
+            "key_id": entry.key_id, "available": None,
+        }])
+
     async def test_responses_header_wait_has_a_hard_timeout(self):
         config = SimpleNamespace(
             responses_header_timeout=0.01, hedge_mode="off", max_retries=1,
@@ -155,6 +179,34 @@ class RetryLoggingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.response.status_code, 200)
         self.assertEqual(result.total_sent, 1)
+
+    async def test_deferred_stream_success_uses_bridge_timeout_instead_of_header_timeout(self):
+        config = SimpleNamespace(
+            responses_header_timeout=1, responses_attempt_header_timeout=0.001,
+            hedge_mode="off", max_retries=1,
+        )
+        pool = KeyPool([("only", "only")])
+        proxy = RetryProxy(config=config, client=object())
+
+        async def delayed_response(*_args):
+            await asyncio.sleep(0.01)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                request=httpx.Request("POST", "https://upstream.test/responses"),
+            )
+
+        proxy._send = delayed_response
+        result = await proxy.request(
+            "POST", "https://upstream.test/responses", {},
+            b'{"model":"model","stream":true}',
+            "responses", "test", "model", pool,
+            defer_stream_success=True,
+        )
+
+        self.assertEqual(result.response.status_code, 200)
+        self.assertEqual(result.total_sent, 1)
+        self.assertEqual(pool.entries[0].cooldown_until, 0)
 
     async def test_stagger_retries_are_spacing_gated_after_503(self):
         config = SimpleNamespace(

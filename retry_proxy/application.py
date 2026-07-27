@@ -19,6 +19,7 @@ from .key_pool import KEY_POOLS
 from .log_store import RetryLogStore
 from .retry import RetryProxy
 from .routes import ROUTES, route_registry
+from .sse2ws import create_sse2ws_handler
 
 if sys.platform == "win32":
     os.system("")
@@ -48,6 +49,13 @@ def _log_startup():
     logger.info(f"记录: provider={settings.provider}, 日志目录={settings.log_dir}, 保留{settings.log_retention_days}天")
     logger.info(f"DLP: 模式={settings.dlp_mode}, 规则={','.join(sorted(settings.dlp_rules)) if settings.dlp_rules else '无'}")
     logger.info(f"代理: trust_env={'是(跟随系统代理)' if settings.trust_env else '否(直连)'}")
+    if settings.sse2ws_mode == "bridge":
+        logger.info(
+            f"SSE2WS: 已开启 首事件={settings.sse2ws_first_event_timeout:.0f}s "
+            f"额外重试={settings.sse2ws_first_event_retries}次"
+        )
+    else:
+        logger.info("SSE2WS: 未开启")
     logger.info(f"管理端鉴权: {'已启用' if settings.admin_password else '未配置（统计与日志端点已禁用）'}")
     logger.info(f"号池访问鉴权: {'已启用' if settings.proxy_api_key else '未配置（兼容开放模式）'}")
     if KEY_POOLS:
@@ -70,6 +78,12 @@ async def lifespan(_app):
     global client
     if settings.dlp_mode not in ("off", "audit", "redact", "block"):
         raise ValueError(f"未知 DLP_MODE: {settings.dlp_mode!r}")
+    if settings.sse2ws_mode not in ("off", "bridge"):
+        raise ValueError(f"未知 SSE2WS_MODE: {settings.sse2ws_mode!r}")
+    if settings.sse2ws_mode == "bridge" and settings.sse2ws_first_event_timeout <= 0:
+        raise ValueError("SSE2WS_FIRST_EVENT_TIMEOUT 必须大于 0")
+    if settings.sse2ws_mode == "bridge" and settings.sse2ws_first_event_retries < 0:
+        raise ValueError("SSE2WS_FIRST_EVENT_RETRIES 不能小于 0")
     if settings.dlp_mode != "off":
         policy = load_policy(settings.dlp_rule_file)
         unknown_rules = settings.dlp_rules - (policy.rules.keys() | {"structured_secret"})
@@ -114,6 +128,7 @@ service = RetryProxy(client=None, pools=KEY_POOLS, log_store=store)
 health, stats_page, stats_api, logs_page, logs_history, logs_stream, proxy = create_handlers(
     service, store, pool_sync,
 )
+websocket_proxy = create_sse2ws_handler(service, store)
 
 
 def _login_page(next_path="/stats", failed=False):
@@ -381,4 +396,5 @@ app.add_api_route("/stats/api", stats_api, methods=["GET"], dependencies=admin_d
 app.add_api_route("/logs", logs_page, methods=["GET"], dependencies=admin_dependencies)
 app.add_api_route("/logs/history", logs_history, methods=["GET"], dependencies=admin_dependencies)
 app.add_api_route("/logs/stream", logs_stream, methods=["GET"], dependencies=admin_dependencies)
+app.add_api_websocket_route("/{path:path}", websocket_proxy)
 app.add_api_route("/{path:path}", proxy, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"])

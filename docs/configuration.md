@@ -39,6 +39,18 @@
 | `RESPONSES_HEADER_TIMEOUT` | `120` | Responses API 整笔请求从开始处理到收到响应头的硬上限（秒）；预算内正常重试，`0` = 不限制 |
 | `RESPONSES_ATTEMPT_HEADER_TIMEOUT` | `15` | 流式 Responses 号池请求中单个 key 等待响应头的上限（秒）；超时后取消该次请求、熔断并换 key，`0` = 不限制 |
 
+## Codex SSE→WebSocket 桥接
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `SSE2WS_MODE` | `off` | `off` = 握手返回 426 并由客户端回退 HTTP；`bridge` = 接收 Responses WebSocket 并转为上游 HTTP/SSE |
+| `SSE2WS_FIRST_EVENT_TIMEOUT` | `30` | 桥接模式单次上游从开始请求到首个有效 Responses 事件的超时（秒），同时覆盖响应头和 SSE 首事件 |
+| `SSE2WS_FIRST_EVENT_RETRIES` | `2` | 首事件超时或首事件前流损坏时，同一 key 的额外重试次数；耗尽后熔断并尝试号池下一 key |
+
+桥接模式只接受匹配到 Responses API 的 WebSocket 路径。客户端必须发送文本 JSON `response.create`；同一连接一次只允许一个生成请求。`generate=false` warmup 由代理本地完成，不产生上游请求或统计记录。
+
+该功能默认关闭。开启前需确保外层反向代理支持 WebSocket Upgrade，并在 Codex 自定义 provider 中设置 `supports_websockets = true`。
+
 ## 重试与退避
 
 | 变量 | 默认值 | 说明 |

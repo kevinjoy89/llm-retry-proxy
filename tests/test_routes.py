@@ -77,8 +77,11 @@ class RouteRegistryTests(unittest.TestCase):
 
 
 class ApplicationTransportRouteTests(unittest.TestCase):
-    def test_proxy_uses_http_fallback_without_websocket_route(self):
-        self.assertFalse(any(isinstance(route, WebSocketRoute) for route in app.routes))
+    def test_proxy_registers_websocket_and_http_catchalls(self):
+        self.assertTrue(any(
+            isinstance(route, WebSocketRoute) and route.path == "/{path:path}"
+            for route in app.routes
+        ))
         self.assertTrue(any(
             getattr(route, "path", "") == "/{path:path}"
             and "POST" in (getattr(route, "methods", None) or set())

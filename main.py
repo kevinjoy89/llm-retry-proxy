@@ -11,4 +11,11 @@ from retry_proxy.application import app, settings
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=settings.listen_host, port=settings.listen_port, log_config=None, access_log=False)
+    uvicorn.run(
+        app,
+        host=settings.listen_host,
+        port=settings.listen_port,
+        ws="wsproto",
+        log_config=None,
+        access_log=False,
+    )

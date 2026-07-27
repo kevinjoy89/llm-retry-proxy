@@ -495,7 +495,8 @@ class RetryProxy:
                 self.logger.info(f"{_tag(method, path, provider, model)}{key_tag} 补发#{total_sent}(在飞{len(in_flight)}) {now - t0:.1f}s")
         return RetryResult(winner, winner_attempt, total_sent, last_status, retry_codes, bool(winner and winner_attempt == 1), last_key_id, t0, key_attempts)
 
-    async def request(self, method, url, headers, body, path, provider, model, pool=None, session_id=""):
+    async def request(self, method, url, headers, body, path, provider, model, pool=None,
+                      session_id="", defer_stream_success=False):
         start = time.time()
         self.logger.debug(f"{_tag(method, path, provider, model)} 开始转发")
         spawned = set()
@@ -503,7 +504,10 @@ class RetryProxy:
         spawned_token = _spawned_tasks.set(spawned)
         progress_token = _request_progress.set(progress)
         try:
-            work = self._request(method, url, headers, body, path, provider, model, pool, start, session_id)
+            work = self._request(
+                method, url, headers, body, path, provider, model, pool, start,
+                session_id, defer_stream_success,
+            )
             timeout = getattr(self.config, "responses_header_timeout", 0)
             if timeout > 0 and _is_responses_path(path):
                 try:
@@ -528,7 +532,8 @@ class RetryProxy:
             _request_progress.reset(progress_token)
             _spawned_tasks.reset(spawned_token)
 
-    async def _request(self, method, url, headers, body, path, provider, model, pool, start, session_id=""):
+    async def _request(self, method, url, headers, body, path, provider, model, pool, start,
+                       session_id="", defer_stream_success=False):
         hedge_mode = self.hedge_mode_for(pool)
         if model and hedge_mode == "race":
             return await self._race(method, url, headers, body, path, start, provider, model, pool, session_id)
@@ -551,7 +556,7 @@ class RetryProxy:
                 attempt_timeout = getattr(
                     self.config, "responses_attempt_header_timeout", 0,
                 )
-                if (pool is not None and attempt_timeout > 0
+                if (not defer_stream_success and pool is not None and attempt_timeout > 0
                         and _is_responses_path(path) and _is_streaming_request(body)):
                     try:
                         response = await asyncio.wait_for(
@@ -640,8 +645,19 @@ class RetryProxy:
                 ); continue
             key_tag = f"[{last_key_id}]" if pool and last_key_id else ""
             self.logger.info(f"{_tag(method, path, provider, model)}{key_tag} {_response_status_log(response.status_code, path, body)} #{attempt} {time.time() - start:.2f}s")
-            _record_key_attempt(key_attempts, entry, _key_available_for_status(response.status_code))
-            _mark_key_outcome(pool, entry, self.config, response.status_code, session_id=session_id)
+            defer_success = (
+                defer_stream_success and response.status_code < 400
+                and _is_responses_path(path) and _is_streaming_request(body)
+            )
+            _record_key_attempt(
+                key_attempts, entry,
+                None if defer_success else _key_available_for_status(response.status_code),
+            )
+            if not defer_success:
+                _mark_key_outcome(
+                    pool, entry, self.config, response.status_code,
+                    session_id=session_id,
+                )
             return RetryResult(response, attempt, attempt, response.status_code, retry_codes,
                                attempt == 1, last_key_id, start, key_attempts,
                                key_entry=entry, response_started_at=cycle,
