@@ -134,6 +134,30 @@ class DlpApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"request_body_too_large", response.body)
         service.request.assert_not_awaited()
 
+    async def test_chunked_oversized_body_stops_reading_at_limit(self):
+        receive = AsyncMock(side_effect=[
+            {"type": "http.request", "body": b"x" * 60, "more_body": True},
+            {"type": "http.request", "body": b"y" * 60, "more_body": True},
+            {"type": "http.request", "body": b"z" * 10_000, "more_body": False},
+        ])
+        request = Request({
+            "type": "http", "method": "POST", "path": "/responses",
+            "headers": [(b"content-type", b"application/json")],
+            "query_string": b"", "server": ("test", 80), "client": ("127.0.0.1", 1),
+        }, receive=receive)
+        service = SimpleNamespace(request=AsyncMock())
+        proxy = create_handlers(service, SimpleNamespace())[-1]
+        with patch("retry_proxy.api.settings", _config(max_request_body=100)), \
+                patch("retry_proxy.config.settings", _config(max_request_body=100)), \
+                patch("retry_proxy.api.KEY_POOLS", {}), \
+                patch("retry_proxy.api.match_route",
+                      return_value=("https://upstream.test", "test", "responses")):
+            response = await proxy("responses", request)
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(receive.await_count, 2)
+        service.request.assert_not_awaited()
+
 
 if __name__ == "__main__":
     unittest.main()

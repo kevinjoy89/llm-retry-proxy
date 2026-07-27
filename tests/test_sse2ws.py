@@ -17,6 +17,7 @@ from retry_proxy.sse2ws import (
     TurnMetrics,
     _dlp_body,
     _open_with_retries,
+    _reject_oversized_websocket_message,
     create_sse2ws_handler,
 )
 from retry_proxy.key_pool import KeyPool
@@ -31,6 +32,7 @@ def _settings(**overrides):
         "proxy_api_key": "",
         "dlp_mode": "off",
         "dlp_max_body_bytes": 16_777_216,
+        "max_request_body": 64 * 1024 * 1024,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -134,6 +136,25 @@ class DlpBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.code, "sensitive_data_blocked")
 
+    async def test_bridge_body_obeys_global_request_limit_when_dlp_is_off(self):
+        with patch("retry_proxy.sse2ws.settings", _settings(max_request_body=8)), \
+                self.assertRaises(BridgeError) as raised:
+            await _dlp_body(b"123456789")
+
+        self.assertEqual(raised.exception.code, "request_body_too_large")
+
+    async def test_raw_websocket_message_limit_is_checked_before_parsing(self):
+        websocket = SimpleNamespace(send_text=AsyncMock())
+        with patch("retry_proxy.sse2ws.settings", _settings(max_request_body=8)):
+            rejected = await _reject_oversized_websocket_message(
+                websocket, {"text": "123456789"},
+            )
+
+        self.assertTrue(rejected)
+        payload = json.loads(websocket.send_text.await_args.args[0])
+        self.assertEqual(payload["status"], 413)
+        self.assertEqual(payload["error"]["code"], "request_body_too_large")
+
 
 class _BlockingStream(httpx.AsyncByteStream):
     def __init__(self):
@@ -173,6 +194,35 @@ def _streaming_response(stream, **headers):
 
 
 class FirstEventRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_request_level_400_is_not_reclassified_as_key_failure(self):
+        pool = KeyPool(["sk-test"])
+        entry = pool.entries[0]
+        response = httpx.Response(
+            400, json={"error": {"message": "bad request"}},
+            request=httpx.Request("POST", "https://upstream.test/v1/responses"),
+        )
+        result = _result(response)
+        result.key_id = entry.key_id
+        result.key_entry = entry
+        result.key_attempts = [{"key_id": entry.key_id, "available": True}]
+        service = SimpleNamespace(request=AsyncMock(return_value=result))
+        args = (
+            "POST", "https://upstream.test/v1/responses", {},
+            b'{"model":"gpt-test","stream":true}', "v1/responses",
+            "test", "gpt-test", pool, "session-1",
+        )
+
+        with patch("retry_proxy.sse2ws.settings", _settings(
+            sse2ws_first_event_retries=0,
+        )), self.assertRaises(BridgeError) as raised:
+            await _open_with_retries(
+                service, args, pool, "session-1", TurnMetrics(),
+            )
+
+        self.assertTrue(raised.exception.key_failure_recorded)
+        self.assertEqual(entry.total_fail, 0)
+        self.assertEqual(entry.cooldown_until, 0)
+
     async def test_first_event_timeout_closes_attempt_and_retries(self):
         blocked = _BlockingStream()
         stalled = httpx.Response(
@@ -326,6 +376,21 @@ class _SingleResponseService:
         return _result(self.response)
 
 
+class _PoolHttpErrorService:
+    async def request(self, _method, _url, _headers, _body, _path, _provider,
+                      _model, pool, _session_id, **_kwargs):
+        entry = pool.pick()
+        response = httpx.Response(
+            400, json={"error": {"message": "bad request"}},
+            request=httpx.Request("POST", "https://upstream.test/v1/responses"),
+        )
+        result = _result(response)
+        result.key_id = entry.key_id
+        result.key_entry = entry
+        result.key_attempts = [{"key_id": entry.key_id, "available": True}]
+        return result
+
+
 class WebSocketBridgeTests(unittest.TestCase):
     def _app(self, service, store):
         app = FastAPI()
@@ -386,7 +451,25 @@ class WebSocketBridgeTests(unittest.TestCase):
                     websocket.receive_json()["error"]["code"],
                     "unsupported_websocket_event",
                 )
+        service.request.assert_not_awaited()
 
+    def test_oversized_message_is_rejected_before_json_processing(self):
+        service = SimpleNamespace(request=AsyncMock())
+        app = self._app(service, SimpleNamespace(write=AsyncMock()))
+        config = _settings(max_request_body=32)
+
+        with patch("retry_proxy.sse2ws.settings", config), \
+                patch("retry_proxy.config.settings", config), \
+                patch("retry_proxy.sse2ws.KEY_POOLS", {}), \
+                patch("retry_proxy.sse2ws.match_route",
+                      return_value=("https://upstream.test/v1", "test", "responses")), \
+                TestClient(app) as client:
+            with client.websocket_connect("/v1/responses") as websocket:
+                websocket.send_text("{" + "x" * 64)
+                error = websocket.receive_json()
+
+        self.assertEqual(error["status"], 413)
+        self.assertEqual(error["error"]["code"], "request_body_too_large")
         service.request.assert_not_awaited()
 
     def test_warmup_and_tool_turns_replay_full_transcript(self):
@@ -537,6 +620,29 @@ class WebSocketBridgeTests(unittest.TestCase):
         self.assertEqual(error["type"], "error")
         self.assertEqual(error["error"]["code"], "overloaded")
         self.assertEqual(error["headers"], {"x-request-id": "req-safe"})
+
+    def test_request_level_400_does_not_cool_pool_key(self):
+        pool = KeyPool(["sk-test"])
+        app = self._app(_PoolHttpErrorService(), SimpleNamespace(write=AsyncMock()))
+        config = _settings(sse2ws_first_event_retries=0)
+
+        with patch("retry_proxy.sse2ws.settings", config), \
+                patch("retry_proxy.config.settings", config), \
+                patch("retry_proxy.sse2ws.KEY_POOLS", {
+                    "https://upstream.test/v1": pool,
+                }), \
+                patch("retry_proxy.sse2ws.match_route",
+                      return_value=("https://upstream.test/v1", "test", "responses")), \
+                TestClient(app) as client:
+            with client.websocket_connect("/v1/responses") as websocket:
+                websocket.send_json({
+                    "type": "response.create", "model": "gpt-test", "input": [],
+                })
+                error = websocket.receive_json()
+
+        self.assertEqual(error["status"], 400)
+        self.assertEqual(pool.entries[0].total_fail, 0)
+        self.assertEqual(pool.entries[0].cooldown_until, 0)
 
     def test_malformed_stream_after_first_event_is_not_retried(self):
         created = (

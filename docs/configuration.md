@@ -21,6 +21,7 @@
 | `ADMIN_COOKIE_SECURE` | `false` | HTTPS 部署时设为 `true`，限制登录 Cookie 仅通过 HTTPS 发送 |
 | `PROXY_API_KEY` | 空 | 下游使用号池的凭据；未携带或不匹配时仅作普通透传 |
 | `TRUSTED_PROXIES` | 空 | 信任的反向代理 IP（逗号分隔）；仅这些 IP 的请求才采用转发头中的客户端 IP，避免伪造 |
+| `PROVIDER_ALIASES` | 空 | 统计 provider 显示别名，格式为 `from:to,from:to`；不会改变实际路由 |
 
 ## 上游、路由与网络
 
@@ -109,7 +110,7 @@
 | `KEY_POOL_SYNC_INTERVAL` | `300` | 自动同步周期（秒）；`0` = 仅手动同步 |
 | `KEY_POOL_CREATE_DELAY` | `1.5` | 批量创建 key 时相邻请求的间隔（秒） |
 | `KEY_POOL_SYNC_STATE_FILE` | `LOG_DIR/.key_pool_sync.json` | 同步连接、刷新令牌与最近成功号池的持久化文件 |
-| `KEY_POOL_SYNC_SECRET` | `ADMIN_PASSWORD` | 状态文件凭据字段的加密主密钥；留空时回退到 `ADMIN_PASSWORD`，两者均未设置则不加密（明文落盘，向后兼容） |
+| `KEY_POOL_SYNC_SECRET` | `ADMIN_PASSWORD` | 状态文件登录凭据和同步得到的完整上游 Key 的加密主密钥；留空时回退到 `ADMIN_PASSWORD`，两者均未设置则不加密（明文落盘，向后兼容） |
 
 ## 上游兼容
 

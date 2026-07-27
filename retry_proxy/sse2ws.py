@@ -226,6 +226,25 @@ async def _send_error(websocket, error, headers=None):
     ))
 
 
+def _websocket_message_size(message):
+    raw_bytes = message.get("bytes")
+    if raw_bytes is not None:
+        return len(raw_bytes)
+    raw_text = message.get("text")
+    return len(raw_text.encode("utf-8")) if isinstance(raw_text, str) else 0
+
+
+async def _reject_oversized_websocket_message(websocket, message):
+    limit = getattr(settings, "max_request_body", 64 * 1024 * 1024)
+    if _websocket_message_size(message) <= limit:
+        return False
+    await _send_error(websocket, BridgeError(
+        "Request body exceeds the maximum allowed size", status=413,
+        code="request_body_too_large",
+    ))
+    return True
+
+
 async def _deny(websocket, status=426, message="Responses WebSocket bridge is unavailable"):
     response = Response(
         json.dumps({"error": {"type": "websocket_unavailable", "message": message}}),
@@ -239,6 +258,12 @@ async def _deny(websocket, status=426, message="Responses WebSocket bridge is un
 
 
 async def _dlp_body(body):
+    max_body = getattr(settings, "max_request_body", 64 * 1024 * 1024)
+    if len(body) > max_body:
+        raise BridgeError(
+            "Request body exceeds the maximum allowed size", status=413,
+            code="request_body_too_large",
+        )
     if settings.dlp_mode not in ("audit", "block", "redact"):
         return body
     if len(body) > settings.dlp_max_body_bytes:
@@ -319,10 +344,13 @@ async def _prime(service, method, url, headers, body, path, provider, model, poo
                 payload = json.loads(raw)
             except (ValueError, TypeError, UnicodeDecodeError):
                 payload = None
-            raise BridgeError(
+            error = BridgeError(
                 "upstream rejected the request", status=response.status_code,
                 code="upstream_http_error", payload=payload,
             )
+            # RetryProxy has already recorded this HTTP response's key outcome.
+            error.key_outcome_recorded = True
+            raise error
         if "text/event-stream" not in response.headers.get("content-type", "").lower():
             raise BridgeError("upstream did not return text/event-stream",
                               status=502, code="invalid_content_type")
@@ -386,6 +414,10 @@ def _mark_deferred_failure(pool, entry, session_id, metrics, status=0):
     _mark_key_failure(pool, entry, settings, status, session_id=session_id)
 
 
+def _is_key_failure_status(status):
+    return status == 0 or status >= 500 or status in (429, 401, 403)
+
+
 async def _wait_for_prime(websocket, awaitable, timeout):
     if websocket is None:
         return await asyncio.wait_for(awaitable, timeout=timeout)
@@ -410,6 +442,8 @@ async def _wait_for_prime(websocket, awaitable, timeout):
             message = await receive_task
             if message.get("type") == "websocket.disconnect":
                 raise ClientDisconnected
+            if await _reject_oversized_websocket_message(websocket, message):
+                continue
             raw = message.get("text")
             if raw is None and message.get("bytes") is not None:
                 await _send_error(websocket, BridgeError(
@@ -474,12 +508,13 @@ async def _open_with_retries(service, request_args, pool, session_id, metrics, w
             )
         except BridgeError as exc:
             last_error = exc
+            if getattr(exc, "key_outcome_recorded", False):
+                exc.key_failure_recorded = True
             result = getattr(exc, "result", None)
             if result is not None:
                 metrics.add_result(result)
             if (exc.code == "upstream_unavailable"
-                    or (not getattr(exc, "stream_event_error", False)
-                        and exc.status < 500 and not should_retry_status(exc.status))):
+                    or (exc.status < 500 and not should_retry_status(exc.status))):
                 raise
         except (TurnCancelled, ClientDisconnected):
             result = holder.get("result")
@@ -494,8 +529,9 @@ async def _open_with_retries(service, request_args, pool, session_id, metrics, w
         marker = getattr(entry, "key_id", "") or "__passthrough__"
         failures[marker] = failures.get(marker, 0) + 1
         if failures[marker] >= per_key_limit:
-            _mark_deferred_failure(pool, entry, session_id, metrics, last_error.status)
-            last_error.key_failure_recorded = True
+            if _is_key_failure_status(last_error.status):
+                _mark_deferred_failure(pool, entry, session_id, metrics, last_error.status)
+                last_error.key_failure_recorded = True
             if pool is None or not pool.has_fresh():
                 break
         logger.warning(
@@ -563,6 +599,8 @@ async def _relay(websocket, opened):
                     chunk_task.cancel()
                     await asyncio.gather(chunk_task, return_exceptions=True)
                     raise ClientDisconnected
+                if await _reject_oversized_websocket_message(websocket, value):
+                    continue
                 raw = value.get("text")
                 if raw is None and value.get("bytes") is not None:
                     await _send_error(websocket, BridgeError(
@@ -664,6 +702,8 @@ def create_sse2ws_handler(service, store):
                 message = await websocket.receive()
                 if message.get("type") == "websocket.disconnect":
                     return
+                if await _reject_oversized_websocket_message(websocket, message):
+                    continue
                 if message.get("bytes") is not None:
                     await _send_error(websocket, BridgeError(
                         "binary WebSocket messages are not supported", status=400,
@@ -796,7 +836,9 @@ def create_sse2ws_handler(service, store):
                     )
                     continue
                 except BridgeError as exc:
-                    if not exc.key_failure_recorded:
+                    if (not exc.key_failure_recorded
+                            and not getattr(exc, "key_outcome_recorded", False)
+                            and _is_key_failure_status(exc.status)):
                         _mark_deferred_failure(
                             request_pool, metrics.key_entry, session_id, metrics, exc.status,
                         )

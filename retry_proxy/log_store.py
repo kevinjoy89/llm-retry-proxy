@@ -22,10 +22,11 @@ class RetryLogStore:
         self._last_flush_at = 0.0
 
     def _new_summary(self):
-        return {"version": 6, "total_requests": 0, "total_retries": 0, "total_succeeded": 0,
+        return {"version": 7, "total_requests": 0, "total_retries": 0, "total_succeeded": 0,
                 "total_failed": 0, "total_cancelled": 0, "total_first_ok": 0,
                 "by_provider": {}, "by_model": {},
-                "by_key": {}, "by_status": {}, "first_ts": None, "last_ts": None}
+                "by_key": {}, "by_status": {}, "first_ts": None, "last_ts": None,
+                "log_offsets": {}}
 
     def _update(self, summary, r):
         summary["total_requests"] += 1
@@ -66,20 +67,111 @@ class RetryLogStore:
         try:
             with open(tmp, "w", encoding="utf-8") as f: json.dump(self.summary_cache, f, ensure_ascii=False)
             os.replace(tmp, settings.summary_file)
+            return True
         except Exception as e: logger.warning(f"写累计汇总失败: {e}")
+        return False
+
+    @staticmethod
+    def _log_files():
+        if not os.path.isdir(settings.log_dir):
+            return []
+        return sorted(
+            name for name in os.listdir(settings.log_dir)
+            if name.startswith("retry_") and name.endswith(".jsonl")
+        )
+
+    def _recover_summary_tail(self):
+        """Replay JSONL records appended after the last durable summary save."""
+        offsets = self.summary_cache.setdefault("log_offsets", {})
+        changed = False
+        for name in self._log_files():
+            path = os.path.join(settings.log_dir, name)
+            try:
+                size = os.path.getsize(path)
+                offset = int(offsets.get(name, 0))
+                if offset < 0 or offset > size:
+                    raise ValueError("日志文件已截断或偏移无效")
+                with open(path, "rb") as f:
+                    f.seek(offset)
+                    while True:
+                        line = f.readline()
+                        if not line:
+                            break
+                        if not line.endswith(b"\n"):
+                            break
+                        offset = f.tell()
+                        try:
+                            record = json.loads(line.decode("utf-8"))
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            continue
+                        if not is_excluded_path(record.get("path", "")) and record.get("model"):
+                            self._update(self.summary_cache, record)
+                            changed = True
+                if offsets.get(name) != offset:
+                    offsets[name] = offset
+                    changed = True
+            except (OSError, ValueError) as exc:
+                logger.warning(f"累计汇总无法增量恢复 {name}: {exc}，将从日志重建")
+                self.summary_cache = self._rebuild()
+                return True
+        return changed
+
+    def _legacy_log_offsets(self):
+        """Locate the durable tail of a version-6 summary without offsets."""
+        last_ts = self.summary_cache.get("last_ts")
+        files = []
+        found = None
+        for name in self._log_files():
+            path = os.path.join(settings.log_dir, name)
+            safe_offset = 0
+            try:
+                with open(path, "rb") as f:
+                    while True:
+                        line = f.readline()
+                        if not line or not line.endswith(b"\n"):
+                            break
+                        safe_offset = f.tell()
+                        try:
+                            record = json.loads(line.decode("utf-8"))
+                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            continue
+                        if last_ts and record.get("ts") == last_ts:
+                            found = (name, safe_offset)
+                files.append((name, safe_offset))
+            except OSError:
+                files.append((name, 0))
+        if found is None:
+            # Retention may already have removed the durable tail. Starting at
+            # EOF preserves historical totals without duplicating retained logs.
+            return dict(files)
+        found_name, found_offset = found
+        after_tail = False
+        offsets = {}
+        for name, eof in files:
+            if name == found_name:
+                offsets[name] = found_offset
+                after_tail = True
+            else:
+                offsets[name] = 0 if after_tail else eof
+        return offsets
 
     def _rebuild(self):
         summary = self._new_summary()
         if not os.path.isdir(settings.log_dir): return summary
-        for name in sorted(os.listdir(settings.log_dir)):
-            if not name.startswith("retry_") or not name.endswith(".jsonl"): continue
+        for name in self._log_files():
             try:
-                with open(os.path.join(settings.log_dir, name), encoding="utf-8") as f:
-                    for line in f:
+                with open(os.path.join(settings.log_dir, name), "rb") as f:
+                    safe_offset = 0
+                    while True:
+                        line = f.readline()
+                        if not line or not line.endswith(b"\n"):
+                            break
+                        safe_offset = f.tell()
                         try:
-                            record = json.loads(line)
+                            record = json.loads(line.decode("utf-8"))
                             if not is_excluded_path(record.get("path", "")) and record.get("model"): self._update(summary, record)
-                        except json.JSONDecodeError: pass
+                        except (UnicodeDecodeError, json.JSONDecodeError): pass
+                    summary["log_offsets"][name] = safe_offset
             except Exception: pass
         return summary
 
@@ -134,15 +226,18 @@ class RetryLogStore:
             logger.info("累计汇总格式过旧，从日志重建...")
             self.summary_cache = self._rebuild()
             if self.summary_cache.get("total_requests", 0) > 0: self._save()
-        self.summary_cache.setdefault("version", 6)
+        if self.summary_cache.get("version", 1) < 7:
+            self.summary_cache["log_offsets"] = self._legacy_log_offsets()
+        self.summary_cache["version"] = 7
         for key in ("total_requests", "total_retries", "total_succeeded", "total_failed",
                     "total_cancelled", "total_first_ok"): self.summary_cache.setdefault(key, 0)
         for key in ("by_provider", "by_model", "by_key", "by_status"): self.summary_cache.setdefault(key, {})
         self.summary_cache.setdefault("first_ts", None); self.summary_cache.setdefault("last_ts", None)
+        recovered = self._recover_summary_tail()
         self._cleanup()
         self._summary_dirty = False
         self._last_flush_at = time.monotonic()
-        if self.summary_cache.get("total_requests", 0): self._save()
+        if self.summary_cache.get("total_requests", 0) or recovered: self._save()
 
     async def write(self, record):
         if not record.get("model"): return
@@ -150,11 +245,16 @@ class RetryLogStore:
         async with self.lock:
             try:
                 os.makedirs(settings.log_dir, exist_ok=True)
-                with open(os.path.join(settings.log_dir, f"retry_{date_str}.jsonl"), "a", encoding="utf-8") as f:
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                filename = f"retry_{date_str}.jsonl"
+                payload = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+                with open(os.path.join(settings.log_dir, filename), "ab") as f:
+                    f.write(payload)
+                    offset = f.tell()
             except Exception as e: logger.warning(f"写重试日志失败: {e}")
             if self.summary_cache is not None:
                 self._update(self.summary_cache, record)
+                if "offset" in locals():
+                    self.summary_cache.setdefault("log_offsets", {})[filename] = offset
                 self._summary_dirty = True
                 self._maybe_flush()
 
@@ -164,16 +264,16 @@ class RetryLogStore:
         now = time.monotonic()
         if now - self._last_flush_at < SUMMARY_FLUSH_INTERVAL:
             return
-        self._save()
-        self._summary_dirty = False
-        self._last_flush_at = now
+        if self._save():
+            self._summary_dirty = False
+            self._last_flush_at = now
 
     def flush(self):
         """Force-write the in-memory summary if it has pending changes."""
         if self._summary_dirty and self.summary_cache is not None:
-            self._save()
-            self._summary_dirty = False
-            self._last_flush_at = time.monotonic()
+            if self._save():
+                self._summary_dirty = False
+                self._last_flush_at = time.monotonic()
 
     def load(self, days=1):
         records = []

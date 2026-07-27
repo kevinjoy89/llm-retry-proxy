@@ -353,6 +353,57 @@ class LogStoreFlushTests(unittest.IsolatedAsyncioTestCase):
                     persisted = json.load(f)
                 self.assertEqual(persisted["total_requests"], 5)
 
+    async def test_restart_replays_jsonl_tail_after_unflushed_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = SimpleNamespace(
+                log_dir=tmp, log_retention_days=30,
+                legacy_log_file=os.path.join(tmp, "retry_log.jsonl"),
+                summary_file=os.path.join(tmp, "_summary.json"),
+            )
+            with patch("retry_proxy.log_store.settings", config), \
+                    patch("retry_proxy.log_store.is_excluded_path", return_value=False):
+                store = RetryLogStore()
+                store.initialize()
+                await store.write(self._record())
+                store.flush()
+                await store.write({**self._record(), "ts": "2026-07-27T00:00:01.000"})
+
+                restored = RetryLogStore()
+                restored.initialize()
+
+                self.assertEqual(len(restored.load(0)), 2)
+                self.assertEqual(restored.summary["total_requests"], 2)
+                with open(config.summary_file, encoding="utf-8") as f:
+                    persisted = json.load(f)
+                self.assertEqual(persisted["total_requests"], 2)
+                self.assertEqual(persisted["version"], 7)
+
+    async def test_version_six_summary_migration_replays_unflushed_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = SimpleNamespace(
+                log_dir=tmp, log_retention_days=30,
+                legacy_log_file=os.path.join(tmp, "retry_log.jsonl"),
+                summary_file=os.path.join(tmp, "_summary.json"),
+            )
+            with patch("retry_proxy.log_store.settings", config), \
+                    patch("retry_proxy.log_store.is_excluded_path", return_value=False):
+                store = RetryLogStore()
+                store.initialize()
+                await store.write(self._record())
+                store.flush()
+                with open(config.summary_file, encoding="utf-8") as f:
+                    version_six = json.load(f)
+                version_six["version"] = 6
+                version_six.pop("log_offsets", None)
+                with open(config.summary_file, "w", encoding="utf-8") as f:
+                    json.dump(version_six, f)
+                await store.write({**self._record(), "ts": "2026-07-27T00:00:01.000"})
+
+                restored = RetryLogStore()
+                restored.initialize()
+
+                self.assertEqual(restored.summary["total_requests"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

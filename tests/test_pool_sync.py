@@ -461,6 +461,7 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("plaintext-pw", persisted)
         self.assertNotIn("refresh-1", persisted)
         self.assertNotIn("access-1", persisted)
+        self.assertNotIn("sk-secret-one", persisted)
         self.assertIn("__encrypted__", persisted)
 
         # A second manager with the same secret can restore and re-sync
@@ -469,6 +470,10 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
             {}, secret_config, restored_client, {"sub2api": Sub2APIAdapter()},
         )
         restored.load_state()
+        self.assertEqual(
+            restored.pools["https://upstream.test"].entries[0].key,
+            "sk-secret-one",
+        )
         restored_status = await restored.sync_now(source_id)
         self.assertEqual(len(restored_status["sources"]), 1)
 
@@ -492,6 +497,7 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
         # Wrong key cannot decrypt; session cleared, source not considered connected
         source = next(iter(restored.sources.values()))
         self.assertEqual(source["session"], {})
+        self.assertNotIn("https://upstream.test", restored.pools)
 
     async def test_group_model_cache_survives_restart(self):
         manager = PoolSyncManager(
@@ -1035,6 +1041,35 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
         checks = {item["group_id"]: item for item in result["checks"]}
         first_batch_min = min(checks[str(index)]["response_s"] for index in range(2))
         self.assertLess(checks["2"]["response_s"], first_batch_min / 2)
+
+    async def test_availability_network_probe_does_not_hold_manager_lock(self):
+        manager = PoolSyncManager({}, self.config, FakeClient(), {"sub2api": Sub2APIAdapter()})
+        status = await manager.connect("sub2api", "https://upstream.test", "test", {
+            "email": "user@example.com", "password": "secret",
+        })
+        source_id = status["sources"][0]["id"]
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_probe(*_args, **_kwargs):
+            started.set()
+            await release.wait()
+            return response({"choices": []}, 200)
+
+        manager.client.post = blocked_probe
+        check_task = asyncio.create_task(manager.check_availability(source_id, "test-model"))
+        await started.wait()
+
+        recorded = await asyncio.wait_for(
+            manager.mark_model_unsupported(
+                "https://upstream.test", "2", "other-model",
+            ),
+            timeout=0.2,
+        )
+        self.assertTrue(recorded)
+        release.set()
+        result = await check_task
+        self.assertTrue(result["checks"][0]["available"])
 
     async def test_catalog_and_one_click_create_only_missing_groups(self):
         client = FakeClient()

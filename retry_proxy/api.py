@@ -346,6 +346,18 @@ def _key_pool_secrets():
     return tuple(entry.key for pool in KEY_POOLS.values() for entry in pool.entries)
 
 
+async def _read_request_body_limited(request, limit):
+    """Read an ASGI request incrementally so chunked uploads obey the limit."""
+    chunks = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def create_handlers(service, store, pool_sync=None):
     async def health():
         return {"status": "ok"}
@@ -461,8 +473,8 @@ def create_handlers(service, store, pool_sync=None):
                         )
                 except ValueError:
                     pass
-            body = await request.body()
-            if len(body) > max_body:
+            body = await _read_request_body_limited(request, max_body)
+            if body is None:
                 return Response(
                     '{"error":{"type":"request_body_too_large",'
                     '"message":"Request body exceeds the maximum allowed size"}}',

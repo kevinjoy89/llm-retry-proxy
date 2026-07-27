@@ -204,6 +204,11 @@ class PoolSyncManager:
             adapter = self._adapter(item["adapter"])
             session = adapter.persistent_session(item.get("session") or {})
             item["session"] = encrypt_session(session, SENSITIVE_FIELDS, key) if key else session
+            entries = item.get("entries") or []
+            item["entries"] = (
+                encrypt_session({"entries": entries}, ("entries",), key)
+                if key else entries
+            )
             sources.append(item)
         return sources
 
@@ -217,6 +222,17 @@ class PoolSyncManager:
         except ValueError as exc:
             logger.warning(f"号池同步凭据解密失败，已清空该连接会话: {exc}")
             return {}
+
+    def _decrypt_entries(self, entries):
+        if not isinstance(entries, dict) or not entries.get("__encrypted__"):
+            return entries if isinstance(entries, list) else []
+        key = derive_key(getattr(self.config, "key_pool_sync_secret", "") or "")
+        try:
+            restored = decrypt_session(entries, key).get("entries")
+            return restored if isinstance(restored, list) else []
+        except ValueError as exc:
+            logger.warning(f"号池同步 Key 解密失败，已清空该连接快照: {exc}")
+            return None
 
     def load_state(self):
         if not self.state_file or not os.path.exists(self.state_file):
@@ -265,6 +281,12 @@ class PoolSyncManager:
                         source["pool_url"] = source["base_url"]
                         logger.warning(f"号池运行地址未绑定到环境路由: {exc}")
                     source["session"] = self._decrypt_session(source.get("session") or {})
+                    restored_entries = self._decrypt_entries(source.get("entries") or [])
+                    if restored_entries is None:
+                        source["entries"] = []
+                        source["last_sync_at"] = ""
+                    else:
+                        source["entries"] = restored_entries
                     self.sources[source["id"]] = source
                     if self.route_registry is not None and source.get("route_prefix"):
                         try:
@@ -907,45 +929,66 @@ class PoolSyncManager:
             groups = {}
             for entry in list(pool.entries):
                 groups.setdefault(entry.group_id or entry.key, []).append(entry)
-            semaphore = asyncio.Semaphore(2)
-
-            async def probe(entry):
-                headers = dict(probe_headers)
-                headers[entry.auth_header] = (
-                    f"{entry.auth_scheme} {entry.key}"
-                    if entry.auth_scheme else entry.key
-                )
-                try:
-                    async with semaphore:
-                        started = time.monotonic()
-                        response = await self.client.post(
-                            probe_url, json=probe_payload, headers=headers, timeout=30,
-                        )
-                        elapsed = time.monotonic() - started
-                    available = self._probe_status(response.status_code)
-                    if available:
-                        pool.record_probe(entry, elapsed)
-                    reason, circuit_failure = (
-                        ("available", False) if available
-                        else self._probe_failure(response.status_code)
-                    )
-                    return entry, response.status_code, available, elapsed, reason, circuit_failure
-                except httpx.RequestError:
-                    return entry, 0, False, None, "transport_error", True
-
-            async def probe_group(entries):
-                attempts = []
-                for entry in entries:
-                    result = await probe(entry)
-                    attempts.append(result)
-                    if result[2] or not result[5]:
-                        break
-                return attempts
-
-            group_results = await asyncio.gather(
-                *(probe_group(entries) for entries in groups.values())
+            pool_signature = tuple(
+                (id(entry), entry.group_id, entry.group_name,
+                 entry.auth_header, entry.auth_scheme)
+                for entry in pool.entries
             )
-            by_group = dict(zip(groups, group_results))
+
+        # Network probes deliberately run outside the manager lock. Runtime
+        # entries are stable snapshots; hot-replaced entries are marked retired.
+        semaphore = asyncio.Semaphore(2)
+
+        async def probe(entry):
+            headers = dict(probe_headers)
+            headers[entry.auth_header] = (
+                f"{entry.auth_scheme} {entry.key}"
+                if entry.auth_scheme else entry.key
+            )
+            try:
+                async with semaphore:
+                    started = time.monotonic()
+                    response = await self.client.post(
+                        probe_url, json=probe_payload, headers=headers, timeout=30,
+                    )
+                    elapsed = time.monotonic() - started
+                available = self._probe_status(response.status_code)
+                reason, circuit_failure = (
+                    ("available", False) if available
+                    else self._probe_failure(response.status_code)
+                )
+                return entry, response.status_code, available, elapsed, reason, circuit_failure
+            except httpx.RequestError:
+                return entry, 0, False, None, "transport_error", True
+
+        async def probe_group(entries):
+            attempts = []
+            for entry in entries:
+                result = await probe(entry)
+                attempts.append(result)
+                if result[2] or not result[5]:
+                    break
+            return attempts
+
+        group_results = await asyncio.gather(
+            *(probe_group(entries) for entries in groups.values())
+        )
+        by_group = dict(zip(groups, group_results))
+
+        async with self._lock:
+            current_source = self.sources.get(source_id)
+            if current_source is not source:
+                raise PoolSyncError("号池同步连接已在检测期间变更")
+            current_pool = self.pools.get(self._pool_url(source))
+            if current_pool is not pool:
+                raise PoolSyncError("号池已在检测期间被替换")
+            current_signature = tuple(
+                (id(entry), entry.group_id, entry.group_name,
+                 entry.auth_header, entry.auth_scheme)
+                for entry in pool.entries
+            )
+            if current_signature != pool_signature:
+                raise PoolSyncError("号池已在检测期间更新，请重试")
             summary = []
             for group_id, attempts in by_group.items():
                 available = any(item[2] is True for item in attempts)
@@ -953,6 +996,9 @@ class PoolSyncManager:
                 circuit_opened = (
                     explicitly_failed and all(item[5] is True for item in attempts)
                 )
+                for entry, _, item_available, elapsed, _, _ in attempts:
+                    if item_available:
+                        pool.record_probe(entry, elapsed)
                 if circuit_opened:
                     status = next(item[1] for item in attempts if item[2] is False)
                     for entry in groups[group_id]:

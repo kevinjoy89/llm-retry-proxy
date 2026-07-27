@@ -84,6 +84,8 @@ async def lifespan(_app):
         raise ValueError("SSE2WS_FIRST_EVENT_TIMEOUT 必须大于 0")
     if settings.sse2ws_mode == "bridge" and settings.sse2ws_first_event_retries < 0:
         raise ValueError("SSE2WS_FIRST_EVENT_RETRIES 不能小于 0")
+    if settings.max_request_body <= 0:
+        raise ValueError("MAX_REQUEST_BODY 必须大于 0")
     if settings.dlp_mode != "off":
         policy = load_policy(settings.dlp_rule_file)
         unknown_rules = settings.dlp_rules - (policy.rules.keys() | {"structured_secret"})
