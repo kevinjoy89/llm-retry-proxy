@@ -95,6 +95,21 @@ class KeyEntry:
 
 
 class KeyPool:
+    """号池选择与调度状态机。
+
+    调度状态字段（ttft/balanced 策略下使用，相互关联）：
+      _current            -- 当前粘性 key 的 KeyEntry（None 表示未选号）
+      _sticky_until       -- 粘性保持到期时间戳；未到期时优先复用 _current
+      _failover_floor     -- 故障转移下限 sort 值；仅 sort >= 此值的 key 可选
+      _balanced_group     -- balanced 策略当前选中的分组 key
+      _active_probe_group -- 正在执行恢复探针的分组（探针期间独占）
+      _probe_cursor_group -- 分组轮转探针的游标（记录上次探针的分组）
+      _next_probe_at      -- 下次允许发起探针的时间戳
+      _probe_reserved_until -- 探针预留窗口到期时间（探针期间阻止其它探针）
+
+    cost 策略仅使用 _current/_sticky_until/_failover_floor；其余字段在
+    ttft/balanced 策略下由 record_ttft/mark_cooldown 驱动状态转移。
+    """
     def __init__(self, keys, provider: str = ""):
         self.entries = [KeyEntry(k[0], k[1] if len(k) > 1 else "") if isinstance(k, tuple) else KeyEntry(k) for k in keys]
         self.provider, self._current, self._sticky_until = provider, None, 0.0
@@ -313,12 +328,11 @@ class KeyPool:
             self._sticky_until = now + settings.key_sticky
             return self._current
         if self.strategy == "cost":
-            selected_group = None
-        else:
-            selected_group = self._pick_group(available)
-            available = [entry for entry in available if self._group_key(entry) == selected_group]
-        entry = available[0]
-        return entry
+            # cost 策略直接按 sort 值选最便宜可用 key，无需按分组筛选
+            return available[0]
+        selected_group = self._pick_group(available)
+        available = [entry for entry in available if self._group_key(entry) == selected_group]
+        return available[0]
 
     @staticmethod
     def _group_key(entry):
