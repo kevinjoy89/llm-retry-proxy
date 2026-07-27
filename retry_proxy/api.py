@@ -441,23 +441,42 @@ def create_handlers(service, store, pool_sync=None):
         upstream, provider, remaining = match_route(path); url = f"{upstream}/{remaining}" if remaining else upstream
         if request.url.query: url += f"?{request.url.query}"
         logger.debug(f"{_tag(request.method, path, provider, '', client_ip)} 收到下游请求")
-        body = await request.body() if request.method not in ("GET", "HEAD") else b""
+        body = b""
+        if request.method not in ("GET", "HEAD"):
+            max_body = getattr(settings, "max_request_body", 64 * 1024 * 1024)
+            declared = request.headers.get("content-length")
+            if declared is not None:
+                try:
+                    if int(declared) > max_body:
+                        return Response(
+                            '{"error":{"type":"request_body_too_large",'
+                            '"message":"Request body exceeds the maximum allowed size"}}',
+                            status_code=413, media_type="application/json",
+                        )
+                except ValueError:
+                    pass
+            body = await request.body()
+            if len(body) > max_body:
+                return Response(
+                    '{"error":{"type":"request_body_too_large",'
+                    '"message":"Request body exceeds the maximum allowed size"}}',
+                    status_code=413, media_type="application/json",
+                )
         if settings.dlp_mode in ("audit", "block", "redact"):
             if len(body) > settings.dlp_max_body_bytes:
                 logger.warning(f"{_tag(request.method, path, provider, '', client_ip)} DLP请求体超限 bytes={len(body)}")
                 if settings.dlp_mode in ("block", "redact"):
                     return Response('{"error":{"type":"dlp_body_too_large","message":"Request body exceeds DLP inspection limit"}}', status_code=413, media_type="application/json")
             else:
-                dlp = inspect_json_body(body, settings.dlp_rules, settings.dlp_exempt_start,
-                                        settings.dlp_exempt_end, settings.dlp_strip_exempt_markers,
-                                        mode=settings.dlp_mode,
-                                        rule_file=settings.dlp_rule_file,
-                                        allow_exemptions=settings.dlp_allow_exemptions,
-                                        decode_depth=settings.dlp_decode_depth,
-                                        decode_max_candidates=settings.dlp_decode_max_candidates,
-                                        decode_max_bytes=settings.dlp_decode_max_bytes,
-                                        known_secrets=_key_pool_secrets(),
-                                        known_secret_min_length=settings.dlp_known_secret_min_length)
+                dlp = await asyncio.to_thread(
+                    inspect_json_body, body, settings.dlp_rules,
+                    settings.dlp_exempt_start, settings.dlp_exempt_end,
+                    settings.dlp_strip_exempt_markers, settings.dlp_mode,
+                    settings.dlp_rule_file, None, settings.dlp_allow_exemptions,
+                    settings.dlp_decode_depth, settings.dlp_decode_max_candidates,
+                    settings.dlp_decode_max_bytes, _key_pool_secrets(),
+                    settings.dlp_known_secret_min_length,
+                )
                 if dlp.uninspectable and settings.dlp_fail_closed and body:
                     logger.warning(f"{_tag(request.method, path, provider, '', client_ip)} DLP无法解析请求正文")
                     return Response(

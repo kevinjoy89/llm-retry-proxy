@@ -114,8 +114,8 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "previous_response_not_found")
 
 
-class DlpBridgeTests(unittest.TestCase):
-    def test_block_mode_rejects_sensitive_websocket_input(self):
+class DlpBridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_block_mode_rejects_sensitive_websocket_input(self):
         from dataclasses import replace
         from retry_proxy.config import settings
 
@@ -130,7 +130,7 @@ class DlpBridgeTests(unittest.TestCase):
 
         with patch("retry_proxy.sse2ws.settings", config), \
                 self.assertRaises(BridgeError) as raised:
-            _dlp_body(body)
+            await _dlp_body(body)
 
         self.assertEqual(raised.exception.code, "sensitive_data_blocked")
 

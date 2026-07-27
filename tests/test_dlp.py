@@ -107,6 +107,19 @@ class DlpTests(unittest.TestCase):
         self.assertIn("encoded_secret", result.blocked_rules)
         self.assertTrue(result.limit_exceeded)
 
+    def test_oversized_candidate_does_not_suppress_later_secrets(self):
+        # Regression: a huge encoded blob used to exhaust the decode budget via
+        # ``return``, suppressing detection of secrets hidden after it. Now the
+        # oversized candidate is skipped and later secrets are still scanned.
+        token = "sk-A1b2C3d4E5f6G7h8J9k0LmNoPqRsTuVx"
+        encoded_secret = base64.b64encode(token.encode()).decode()
+        huge_blob = base64.b64encode(b"\x00" * 4096).decode()
+        result = self.inspect(
+            {"input": f"{huge_blob} {encoded_secret}"},
+            mode="block", decode_depth=1, decode_max_bytes=1024,
+        )
+        self.assertIn("encoded_secret", result.blocked_rules)
+
     def test_disabled_exemptions_do_not_require_markers(self):
         token = "sk-A1b2C3d4E5f6G7h8J9k0LmNoPqRsTuVx"
         result = inspect_json_body(

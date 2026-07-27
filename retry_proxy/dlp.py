@@ -235,10 +235,11 @@ def _decode_candidates(value, budget):
             start, end, candidate = match.start(), match.end(), match.group(0)
             if kind == "base64" and _HEX_CANDIDATE.fullmatch(candidate):
                 continue
-            # Reject oversized candidates before allocating their decoded representation.
+            # Skip oversized candidates without exhausting the budget: an attacker
+            # could otherwise prepend one huge encoded blob to suppress scanning
+            # of secrets hidden later in the payload.
             if len(candidate) > budget.bytes * 3 + 8:
-                budget.exhausted = True
-                return
+                continue
             try:
                 if kind == "base64":
                     if len(candidate) % 4 == 1:

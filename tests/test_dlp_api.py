@@ -32,15 +32,19 @@ def _config(**overrides):
         "proxy_api_key": "",
         "image_upstream_user_agent": "",
         "image_upstream_originator": "",
+        "max_request_body": 64 * 1024 * 1024,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
 
 
-def _request(body):
+def _request(body, content_length=True):
+    headers = [(b"content-type", b"application/json")]
+    if content_length:
+        headers.append((b"content-length", str(len(body)).encode()))
     return Request({
         "type": "http", "method": "POST", "path": "/responses",
-        "headers": [(b"content-type", b"application/json")],
+        "headers": headers,
         "query_string": b"", "server": ("test", 80), "client": ("127.0.0.1", 1),
     }, receive=AsyncMock(return_value={
         "type": "http.request", "body": body, "more_body": False,
@@ -103,6 +107,31 @@ class DlpApiTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 422)
         self.assertIn(b"dlp_uninspectable_body", response.body)
+        service.request.assert_not_awaited()
+
+    async def test_oversized_body_is_rejected_before_upstream(self):
+        body = b'{"input":"' + b"x" * 200 + b'"}'
+        response, service = await self.call_proxy(
+            body, _config(max_request_body=100),
+        )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertIn(b"request_body_too_large", response.body)
+        service.request.assert_not_awaited()
+
+    async def test_oversized_body_without_content_length_is_rejected(self):
+        body = b'{"input":"' + b"x" * 200 + b'"}'
+        service = SimpleNamespace(request=AsyncMock())
+        proxy = create_handlers(service, SimpleNamespace())[-1]
+        with patch("retry_proxy.api.settings", _config(max_request_body=100)), \
+                patch("retry_proxy.config.settings", _config(max_request_body=100)), \
+                patch("retry_proxy.api.KEY_POOLS", {}), \
+                patch("retry_proxy.api.match_route",
+                      return_value=("https://upstream.test", "test", "responses")):
+            response = await proxy("responses", _request(body, content_length=False))
+
+        self.assertEqual(response.status_code, 413)
+        self.assertIn(b"request_body_too_large", response.body)
         service.request.assert_not_awaited()
 
 

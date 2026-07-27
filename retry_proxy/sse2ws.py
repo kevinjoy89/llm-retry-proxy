@@ -238,7 +238,7 @@ async def _deny(websocket, status=426, message="Responses WebSocket bridge is un
         await websocket.close(code=1008, reason=message[:123])
 
 
-def _dlp_body(body):
+async def _dlp_body(body):
     if settings.dlp_mode not in ("audit", "block", "redact"):
         return body
     if len(body) > settings.dlp_max_body_bytes:
@@ -249,16 +249,14 @@ def _dlp_body(body):
                 code="dlp_body_too_large",
             )
         return body
-    result = inspect_json_body(
+    result = await asyncio.to_thread(
+        inspect_json_body,
         body, settings.dlp_rules, settings.dlp_exempt_start, settings.dlp_exempt_end,
-        settings.dlp_strip_exempt_markers, mode=settings.dlp_mode,
-        rule_file=settings.dlp_rule_file,
-        allow_exemptions=settings.dlp_allow_exemptions,
-        decode_depth=settings.dlp_decode_depth,
-        decode_max_candidates=settings.dlp_decode_max_candidates,
-        decode_max_bytes=settings.dlp_decode_max_bytes,
-        known_secrets=_key_pool_secrets(),
-        known_secret_min_length=settings.dlp_known_secret_min_length,
+        settings.dlp_strip_exempt_markers, settings.dlp_mode,
+        settings.dlp_rule_file, None, settings.dlp_allow_exemptions,
+        settings.dlp_decode_depth, settings.dlp_decode_max_candidates,
+        settings.dlp_decode_max_bytes, _key_pool_secrets(),
+        settings.dlp_known_secret_min_length,
     )
     if result.uninspectable and settings.dlp_fail_closed and body:
         raise BridgeError("Request body cannot be inspected by DLP", status=422,
@@ -703,7 +701,7 @@ def create_sse2ws_handler(service, store):
                     http_payload["stream"] = True
                     body = json.dumps(http_payload, ensure_ascii=False,
                                       separators=(",", ":")).encode("utf-8")
-                    body = _dlp_body(body)
+                    body = await _dlp_body(body)
                     sanitized = json.loads(body)
                     merged_input = sanitized.get("input", merged_input)
                 except BridgeError as exc:

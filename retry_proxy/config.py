@@ -143,6 +143,7 @@ class Settings:
     retry_broad: bool = _bool("RETRY_BROAD", "false")
     timeout: float = float(os.getenv("TIMEOUT", "300"))
     connect_timeout: float = float(os.getenv("CONNECT_TIMEOUT", "10"))
+    max_request_body: int = int(os.getenv("MAX_REQUEST_BODY", str(64 * 1024 * 1024)))
     responses_header_timeout: float = float(os.getenv("RESPONSES_HEADER_TIMEOUT", "120"))
     responses_attempt_header_timeout: float = float(os.getenv("RESPONSES_ATTEMPT_HEADER_TIMEOUT", "15"))
     sse2ws_mode: str = os.getenv("SSE2WS_MODE", "off").strip().lower()
