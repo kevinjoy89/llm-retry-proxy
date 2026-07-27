@@ -136,6 +136,12 @@ class PoolSyncManager:
         self.operations = {}
         self._lock = asyncio.Lock()
         self._task = None
+        self._state_dirty = False
+        self._last_state_save_at = 0.0
+
+    # 状态文件节流落盘的最小间隔（秒）。mark_model_unsupported 等高频路径
+    # 只在内存中更新并标记 dirty，按此间隔落盘，避免每次拒绝都 fsync。
+    _STATE_SAVE_INTERVAL = 5.0
 
     @property
     def state_file(self):
@@ -343,6 +349,19 @@ class PoolSyncManager:
                 os.close(fd)
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
+        self._state_dirty = False
+        self._last_state_save_at = time.monotonic()
+
+    def _save_state_throttled(self):
+        """Mark state dirty and persist only if the throttle window has elapsed."""
+        self._state_dirty = True
+        if time.monotonic() - self._last_state_save_at >= self._STATE_SAVE_INTERVAL:
+            self._save_state()
+
+    def _flush_state(self):
+        """Force-persist pending state changes; called on shutdown."""
+        if self._state_dirty:
+            self._save_state()
 
     def _merge_local_rules(self, source, entries):
         rules = {}
@@ -738,7 +757,7 @@ class PoolSyncManager:
             models.append(model)
             models.sort()
             self._activate(source)
-            self._save_state()
+            self._save_state_throttled()
             logger.warning(
                 f"上游模型能力已由真实请求修正: upstream={source['base_url']} "
                 f"group={group_id} model={model}"
@@ -1258,6 +1277,7 @@ class PoolSyncManager:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
+        self._flush_state()
 
     async def _run(self):
         while True:

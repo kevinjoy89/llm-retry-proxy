@@ -119,8 +119,7 @@ async def lifespan(_app):
     finally:
         await pool_sync.stop()
         await client.aclose()
-        if store.summary_cache:
-            store._save()
+        store.flush()
 
 
 app = FastAPI(title="llm-retry-proxy", lifespan=lifespan)

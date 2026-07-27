@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -522,6 +523,9 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(manager.pools["https://upstream.test"].for_request(
             "gpt-5.4", "v1/chat/completions", "chat",
         ))
+        # mark_model_unsupported throttles persistence; flush pending state
+        # before simulating a restart (mirrors shutdown via stop()).
+        manager._flush_state()
 
         restored = PoolSyncManager(
             {}, self.config, FakeClient(), {"sub2api": Sub2APIAdapter()},
@@ -534,6 +538,38 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(restored.pools["https://upstream.test"].for_request(
             "gpt-5.4", "v1/chat/completions", "chat",
         ))
+
+    async def test_mark_model_unsupported_throttles_persistence(self):
+        manager = PoolSyncManager(
+            {}, self.config, FakeClient(), {"sub2api": Sub2APIAdapter()},
+        )
+        await manager.connect(
+            "sub2api", "https://upstream.test", "custom-provider",
+            {"email": "user@example.com", "password": "secret"},
+        )
+        save_count = [0]
+        original_save = manager._save_state
+
+        def counting_save():
+            save_count[0] += 1
+            original_save()
+
+        manager._save_state = counting_save
+        # connect already saved once; reset counter to isolate throttle behavior
+        save_count[0] = 0
+        manager._last_state_save_at = time.monotonic()
+
+        recorded = await manager.mark_model_unsupported(
+            "https://upstream.test", "2", "gpt-5.4",
+        )
+        self.assertTrue(recorded)
+        # Within the throttle window, _save_state should not have been called
+        self.assertEqual(save_count[0], 0)
+        self.assertTrue(manager._state_dirty)
+
+        manager._flush_state()
+        self.assertEqual(save_count[0], 1)
+        self.assertFalse(manager._state_dirty)
 
     async def test_managed_route_is_persisted_and_restored(self):
         route_config = SimpleNamespace(

@@ -1,4 +1,9 @@
+import json
+import os
+import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from retry_proxy.api import _cumulative
 from retry_proxy.log_store import RetryLogStore
@@ -236,6 +241,61 @@ class KeyAvailabilityStatsTests(unittest.TestCase):
         self.assertEqual(key["attempts"], 2)
         self.assertEqual(key["availability_pct"], 50)
         self.assertEqual(key["health_status"], "unavailable")
+
+
+class LogStoreFlushTests(unittest.IsolatedAsyncioTestCase):
+    def _record(self, succeeded=True):
+        return {
+            "ts": "2026-07-27T00:00:00.000",
+            "provider": "test", "model": "model", "key_id": "key",
+            "upstream_status": 200, "final_status": 200, "retries": 0,
+            "succeeded": succeeded, "first_ok": True,
+        }
+
+    async def test_summary_is_not_persisted_on_every_write_within_interval(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = SimpleNamespace(
+                log_dir=tmp, log_retention_days=30,
+                legacy_log_file=os.path.join(tmp, "retry_log.jsonl"),
+                summary_file=os.path.join(tmp, "_summary.json"),
+            )
+            store = RetryLogStore()
+            with patch("retry_proxy.log_store.settings", config), \
+                    patch("retry_proxy.log_store.is_excluded_path", return_value=False):
+                store.initialize()
+                save_count = [0]
+                original_save = store._save
+
+                def counting_save():
+                    save_count[0] += 1
+                    original_save()
+
+                store._save = counting_save
+                for _ in range(10):
+                    await store.write(self._record())
+                # Within the flush interval, _save should run at most once
+                self.assertLessEqual(save_count[0], 1)
+                # In-memory summary reflects all writes
+                self.assertEqual(store.summary_cache["total_requests"], 10)
+
+    async def test_flush_forces_persistence_of_pending_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = SimpleNamespace(
+                log_dir=tmp, log_retention_days=30,
+                legacy_log_file=os.path.join(tmp, "retry_log.jsonl"),
+                summary_file=os.path.join(tmp, "_summary.json"),
+            )
+            store = RetryLogStore()
+            with patch("retry_proxy.log_store.settings", config), \
+                    patch("retry_proxy.log_store.is_excluded_path", return_value=False):
+                store.initialize()
+                for _ in range(5):
+                    await store.write(self._record())
+                store.flush()
+                # After flush, the persisted file should contain the full count
+                with open(os.path.join(tmp, "_summary.json"), encoding="utf-8") as f:
+                    persisted = json.load(f)
+                self.assertEqual(persisted["total_requests"], 5)
 
 
 if __name__ == "__main__":

@@ -1,17 +1,24 @@
 import asyncio
 import json
 import os
+import time
 from datetime import datetime, timedelta
 
 from .config import logger, settings
 from .routes import is_excluded_path
 from .stats import _model_key, _normalize_provider, _req_cancelled, _req_succeeded
 
+# 汇总落盘的最小间隔（秒）。每条日志仍即时追加到 JSONL，但累计汇总
+# 按此间隔节流，避免高 QPS 下每请求全量序列化+fsync 成为瓶颈。
+SUMMARY_FLUSH_INTERVAL = 5.0
+
 
 class RetryLogStore:
     def __init__(self):
         self.lock = asyncio.Lock()
         self.summary_cache = None
+        self._summary_dirty = False
+        self._last_flush_at = 0.0
 
     def _new_summary(self):
         return {"version": 6, "total_requests": 0, "total_retries": 0, "total_succeeded": 0,
@@ -132,6 +139,8 @@ class RetryLogStore:
         for key in ("by_provider", "by_model", "by_key", "by_status"): self.summary_cache.setdefault(key, {})
         self.summary_cache.setdefault("first_ts", None); self.summary_cache.setdefault("last_ts", None)
         self._cleanup()
+        self._summary_dirty = False
+        self._last_flush_at = time.monotonic()
         if self.summary_cache.get("total_requests", 0): self._save()
 
     async def write(self, record):
@@ -144,7 +153,26 @@ class RetryLogStore:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
             except Exception as e: logger.warning(f"写重试日志失败: {e}")
             if self.summary_cache is not None:
-                self._update(self.summary_cache, record); self._save()
+                self._update(self.summary_cache, record)
+                self._summary_dirty = True
+                self._maybe_flush()
+
+    def _maybe_flush(self):
+        if not self._summary_dirty:
+            return
+        now = time.monotonic()
+        if now - self._last_flush_at < SUMMARY_FLUSH_INTERVAL:
+            return
+        self._save()
+        self._summary_dirty = False
+        self._last_flush_at = now
+
+    def flush(self):
+        """Force-write the in-memory summary if it has pending changes."""
+        if self._summary_dirty and self.summary_cache is not None:
+            self._save()
+            self._summary_dirty = False
+            self._last_flush_at = time.monotonic()
 
     def load(self, days=1):
         records = []
