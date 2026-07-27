@@ -5,6 +5,7 @@ import httpx
 
 from retry_proxy.pool_sync import PoolSyncManager
 from retry_proxy.sync_adapters import ADAPTERS, PoolSyncError
+from retry_proxy.sync_adapters.base import request_with_retry
 from retry_proxy.sync_adapters.new_api import NewAPIAdapter, _unwrap
 
 
@@ -404,6 +405,53 @@ class NewAPIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(created_bodies[0]["unlimited_quota"])
         self.assertEqual(deleted["requested"], 1)
         self.assertEqual(deleted_paths, ["/api/token/31"])
+
+
+class TransportRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_retries_transient_request_error(self):
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise httpx.ConnectError("transient", request=request)
+            return httpx.Response(200, json={"ok": True})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            response = await request_with_retry(client, "GET", "https://up.test/x")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(calls["n"], 3)
+
+    async def test_post_does_not_retry_by_default(self):
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            raise httpx.ConnectError("transient", request=request)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            with self.assertRaises(httpx.ConnectError):
+                await request_with_retry(client, "POST", "https://up.test/x", json={})
+
+        self.assertEqual(calls["n"], 1)
+
+    async def test_post_retries_when_explicitly_enabled(self):
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise httpx.ConnectError("transient", request=request)
+            return httpx.Response(200, json={"ok": True})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            response = await request_with_retry(
+                client, "POST", "https://up.test/x", json={}, retry_writes=True,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(calls["n"], 2)
 
 
 if __name__ == "__main__":

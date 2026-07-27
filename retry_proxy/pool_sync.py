@@ -860,7 +860,7 @@ class PoolSyncManager:
                 pool.apply_settings(
                     strategy, target, external_weight, prior_strength, affinity,
                 )
-                for view in pool._views.values():
+                for view in pool.views():
                     view.apply_settings(
                         strategy, target, external_weight, prior_strength, affinity,
                     )

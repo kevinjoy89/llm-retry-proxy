@@ -152,6 +152,10 @@ class KeyPool:
                 fingerprint = hashlib.sha256(entry.key.encode("utf-8")).hexdigest()[:8]
                 entry.key_id = f"{base}#{fingerprint}"
 
+    def views(self):
+        """Return the cached per-workload views (read-only access for callers)."""
+        return list(self._views.values())
+
     def apply_settings(self, strategy, target_ttft_s, external_retest_weight,
                        external_ttft_prior_strength, session_affinity):
         """Apply selection settings and reset scheduler state derived from them.

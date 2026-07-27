@@ -2,7 +2,7 @@ import asyncio
 import uuid
 
 from ..config import logger
-from .base import PoolSyncAdapter, PoolSyncError
+from .base import PoolSyncAdapter, PoolSyncError, request_with_retry
 
 
 def _response_error_message(response):
@@ -178,8 +178,8 @@ class Sub2APIAdapter(PoolSyncAdapter):
     async def _get(self, client, source, session, path, params=None, retry=True):
         if not session.get("access_token"):
             session = await self._refresh(client, source, session)
-        response = await client.get(
-            source["base_url"] + path, params=params,
+        response = await request_with_retry(
+            client, "GET", source["base_url"] + path, params=params,
             headers=self._headers(session["access_token"]), timeout=20,
         )
         if response.status_code == 401 and retry:
@@ -189,8 +189,8 @@ class Sub2APIAdapter(PoolSyncAdapter):
         return session, _unwrap(response)
 
     async def _get_group_models(self, client, source, api_key):
-        response = await client.get(
-            source["base_url"] + "/v1/models",
+        response = await request_with_retry(
+            client, "GET", source["base_url"] + "/v1/models",
             headers=self._headers(api_key), timeout=20,
         )
         return _model_ids(_unwrap(response))

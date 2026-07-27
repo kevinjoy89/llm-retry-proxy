@@ -1,6 +1,6 @@
 import asyncio
 
-from .base import PoolSyncAdapter, PoolSyncError
+from .base import PoolSyncAdapter, PoolSyncError, request_with_retry
 
 
 def _response_error_message(response):
@@ -200,8 +200,8 @@ class NewAPIAdapter(PoolSyncAdapter):
         if not session.get("access_token") and (session.get("cookies") or {}).get(
                 "new_api_refresh"):
             session = await self._refresh(client, source, session)
-        response = await client.request(
-            method, source["base_url"] + path, params=params, json=body,
+        response = await request_with_retry(
+            client, method, source["base_url"] + path, params=params, json=body,
             headers=self._headers(source, session), timeout=20,
         )
         self._merge_response_cookies(session, response)

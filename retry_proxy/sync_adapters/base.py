@@ -1,5 +1,46 @@
 from abc import ABC, abstractmethod
 
+import httpx
+
+# 瞬时传输错误重试参数：最多 2 次额外尝试，间隔递增。
+_TRANSPORT_RETRIES = 2
+_TRANSPORT_BACKOFFS = (0.5, 1.5)
+
+
+async def _do_request(client, method, url, **kwargs):
+    """Dispatch via client.request() (httpx); fall back to per-method handlers
+    for test doubles that only implement .get/.post/.delete."""
+    if hasattr(client, "request"):
+        return await client.request(method, url, **kwargs)
+    method_lower = method.lower()
+    handler = getattr(client, method_lower, None)
+    if handler is not None:
+        return await handler(url, **kwargs)
+    raise AttributeError(f"client has no .request() or .{method_lower}() method")
+
+
+async def request_with_retry(client, method, url, **kwargs):
+    """发起 HTTP 请求，遇到瞬时传输错误（连接重置/超时/DNS）时有界重试。
+
+    仅对幂等 GET 与写操作的重试保持保守：写操作（POST/DELETE）默认不重试，
+    避免重复提交；调用方可通过 ``retry_writes=True`` 显式启用。
+    """
+    import asyncio
+    retry_writes = kwargs.pop("retry_writes", False)
+    is_idempotent = method.upper() in ("GET", "HEAD") or retry_writes
+    attempts = _TRANSPORT_RETRIES + 1 if is_idempotent else 1
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            return await _do_request(client, method, url, **kwargs)
+        except httpx.RequestError as exc:
+            last_exc = exc
+            if attempt + 1 >= attempts:
+                break
+            backoff = _TRANSPORT_BACKOFFS[min(attempt, len(_TRANSPORT_BACKOFFS) - 1)]
+            await asyncio.sleep(backoff)
+    raise last_exc
+
 
 class PoolSyncError(RuntimeError):
     pass

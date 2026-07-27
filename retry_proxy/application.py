@@ -107,8 +107,11 @@ async def lifespan(_app):
     pool_sync.load_state()
     client = httpx.AsyncClient(timeout=httpx.Timeout(settings.timeout, connect=settings.connect_timeout),
                                limits=httpx.Limits(max_connections=200, max_keepalive_connections=50), trust_env=settings.trust_env)
+    # 同步适配器使用独立的客户端，避免长耗时 create_keys 等操作占用代理转发的连接池。
+    sync_client = httpx.AsyncClient(timeout=httpx.Timeout(60, connect=settings.connect_timeout),
+                                    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10), trust_env=settings.trust_env)
     service.client = client
-    pool_sync.client = client
+    pool_sync.client = sync_client
     app.state.retry_proxy = service
     app.state.pool_sync = pool_sync
     log_capture.set_loop(asyncio.get_event_loop())
@@ -118,6 +121,7 @@ async def lifespan(_app):
         yield
     finally:
         await pool_sync.stop()
+        await sync_client.aclose()
         await client.aclose()
         store.flush()
 
