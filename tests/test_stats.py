@@ -35,6 +35,42 @@ class KeyAvailabilityStatsTests(unittest.TestCase):
         self.assertEqual(stats["summary"]["success_rate"], 0.5)
         self.assertEqual(stats["summary"]["availability_pct"], 50)
 
+    def test_failure_streak_uses_chronological_order(self):
+        # Records arrive in non-chronological file order; streaks must be
+        # evaluated by timestamp. Here the later (by ts) record succeeds, so the
+        # true worst failure streak is 1, not 2.
+        records = [
+            {"ts": "2026-07-27T10:00:00", "provider": "test", "model": "m",
+             "final_status": 503, "upstream_status": 503, "succeeded": False,
+             "first_ok": False, "retries": 0},
+            {"ts": "2026-07-27T09:00:00", "provider": "test", "model": "m",
+             "final_status": 200, "upstream_status": 200, "succeeded": True,
+             "first_ok": True, "retries": 0},
+            {"ts": "2026-07-27T11:00:00", "provider": "test", "model": "m",
+             "final_status": 503, "upstream_status": 503, "succeeded": False,
+             "first_ok": False, "retries": 0},
+        ]
+        stats = compute_stats(records, "today", {})
+        # Chronological: 09:00 ok, 10:00 fail, 11:00 fail -> worst streak 2
+        self.assertEqual(stats["availability"]["worst_failure_streak"], 2)
+
+    def test_failure_streak_unsorted_records_stay_correct(self):
+        # Same records shuffled so that two failures are non-adjacent in file
+        # order but adjacent chronologically.
+        records = [
+            {"ts": "2026-07-27T10:00:00", "provider": "test", "model": "m",
+             "final_status": 503, "upstream_status": 503, "succeeded": False,
+             "first_ok": False, "retries": 0},
+            {"ts": "2026-07-27T09:00:00", "provider": "test", "model": "m",
+             "final_status": 200, "upstream_status": 200, "succeeded": True,
+             "first_ok": True, "retries": 0},
+            {"ts": "2026-07-27T11:00:00", "provider": "test", "model": "m",
+             "final_status": 503, "upstream_status": 503, "succeeded": False,
+             "first_ok": False, "retries": 0},
+        ]
+        stats = compute_stats(records, "today", {})
+        self.assertEqual(stats["availability"]["worst_failure_streak"], 2)
+
     def test_cumulative_summary_tracks_cancellation_as_neutral(self):
         store = RetryLogStore()
         summary = store._new_summary()

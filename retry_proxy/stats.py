@@ -515,7 +515,10 @@ def compute_stats(records: list, range_str: str, config: dict) -> dict:
     worst_streak = 0
     cur_streak = 0
     cur_type = None
-    for r in records:
+    # Streaks must be evaluated in chronological order; records arrive grouped by
+    # log file (date) then append order, which is not globally time-sorted across
+    # batched writes or multi-day ranges.
+    for r in sorted(records, key=lambda r: r.get("ts", "")):
         if _req_cancelled(r):
             continue
         ok = _req_succeeded(r)

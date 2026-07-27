@@ -281,46 +281,54 @@ class PoolSyncManager:
                 adapter = source.get("adapter", "")
                 if adapter not in self.adapters or not source.get("base_url"):
                     continue
-                source["base_url"] = source["base_url"].rstrip("/")
-                source.setdefault("route_prefix", "")
-                source.setdefault("group_rules", {})
-                source.setdefault("group_model_cache", {})
-                if not isinstance(source.get("group_model_rejections"), dict):
-                    source["group_model_rejections"] = {}
-                source.setdefault("strategy", "cost")
-                source.setdefault("target_ttft_s", 5.0)
-                source.setdefault("external_retest_weight", 0.5)
-                source.setdefault("external_ttft_prior_strength", 2.0)
-                source.setdefault("session_affinity", False)
-                source.setdefault("check_model", "")
-                source.setdefault("experience_source", {})
-                source.setdefault("experience_items", [])
-                source.setdefault("experience_mappings", {})
-                source.setdefault("experience_last_sync_at", "")
-                source.setdefault("experience_last_error", "")
-                source["disabled_key_ids"] = [
-                    str(value) for value in source.get("disabled_key_ids", [])
-                    if value not in (None, "")
-                ]
                 try:
-                    source["pool_url"] = self._resolve_pool_url(source)
-                except ValueError as exc:
-                    source["pool_url"] = source["base_url"]
-                    logger.warning(f"号池运行地址未绑定到环境路由: {exc}")
-                source["session"] = self._decrypt_session(source.get("session") or {})
-                self.sources[source["id"]] = source
-                if self.route_registry is not None and source.get("route_prefix"):
+                    source["base_url"] = source["base_url"].rstrip("/")
+                    source.setdefault("route_prefix", "")
+                    source.setdefault("group_rules", {})
+                    source.setdefault("group_model_cache", {})
+                    if not isinstance(source.get("group_model_rejections"), dict):
+                        source["group_model_rejections"] = {}
+                    source.setdefault("strategy", "cost")
+                    source.setdefault("target_ttft_s", 5.0)
+                    source.setdefault("external_retest_weight", 0.5)
+                    source.setdefault("external_ttft_prior_strength", 2.0)
+                    source.setdefault("session_affinity", False)
+                    source.setdefault("check_model", "")
+                    source.setdefault("experience_source", {})
+                    source.setdefault("experience_items", [])
+                    source.setdefault("experience_mappings", {})
+                    source.setdefault("experience_last_sync_at", "")
+                    source.setdefault("experience_last_error", "")
+                    source["disabled_key_ids"] = [
+                        str(value) for value in source.get("disabled_key_ids", [])
+                        if value not in (None, "")
+                    ]
                     try:
-                        self.route_registry.register(
-                            source["id"], source["route_prefix"], source["base_url"],
-                            source.get("provider", ""),
-                        )
+                        source["pool_url"] = self._resolve_pool_url(source)
                     except ValueError as exc:
-                        logger.warning(f"号池代理路由未恢复: {exc}")
-                # A successful sync with zero keys is authoritative too. Retain
-                # the entries check for state files written by older versions.
-                if source.get("entries") or source.get("last_sync_at"):
-                    self._activate(source)
+                        source["pool_url"] = source["base_url"]
+                        logger.warning(f"号池运行地址未绑定到环境路由: {exc}")
+                    source["session"] = self._decrypt_session(source.get("session") or {})
+                    self.sources[source["id"]] = source
+                    if self.route_registry is not None and source.get("route_prefix"):
+                        try:
+                            self.route_registry.register(
+                                source["id"], source["route_prefix"], source["base_url"],
+                                source.get("provider", ""),
+                            )
+                        except ValueError as exc:
+                            logger.warning(f"号池代理路由未恢复: {exc}")
+                    # A successful sync with zero keys is authoritative too. Retain
+                    # the entries check for state files written by older versions.
+                    if source.get("entries") or source.get("last_sync_at"):
+                        self._activate(source)
+                except (ValueError, KeyError, TypeError) as exc:
+                    # Skip a single malformed source instead of aborting all restores.
+                    source_id = source.get("id", source.get("base_url", "?"))
+                    self.sources.pop(source.get("id"), None)
+                    if self.route_registry is not None and source.get("route_prefix"):
+                        self.route_registry.unregister(source_id)
+                    logger.warning(f"号池同步状态条目恢复失败，已跳过 {source_id}: {exc}")
             if self.sources:
                 logger.info(f"号池同步状态已恢复: {len(self.sources)} 个上游连接")
         except (OSError, ValueError, KeyError, TypeError) as exc:

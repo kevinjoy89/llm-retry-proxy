@@ -781,6 +781,31 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(pools), {"https://one.test", "https://two.test"})
         self.assertEqual(len(manager.status()["sources"]), 2)
 
+    async def test_malformed_source_does_not_abort_other_restores(self):
+        # Regression: a single malformed source (entry missing "key") used to
+        # raise KeyError inside _activate and abort all source restores.
+        state = {"version": 2, "sources": [
+            {"id": "broken", "adapter": "sub2api", "base_url": "https://broken.test",
+             "provider": "broken", "session": {},
+             "entries": [{"label": "no-key", "sort": "0.1", "models": [], "paths": []}],
+             "last_sync_at": "2026-07-17T00:00:00+00:00"},
+            {"id": "good", "adapter": "sub2api", "base_url": "https://good.test",
+             "provider": "good", "session": {"refresh_token": "r"},
+             "entries": [{"key": "key-good", "label": "good", "sort": "0.1",
+                          "models": [], "paths": []}]},
+        ]}
+        with open(self.state_file, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        pools = {}
+        manager = PoolSyncManager(pools, self.config, FakeClient(), {"sub2api": Sub2APIAdapter()})
+
+        manager.load_state()
+
+        # The malformed source is skipped, but the good one still restores
+        self.assertIn("good", manager.sources)
+        self.assertNotIn("broken", manager.sources)
+        self.assertIn("https://good.test", pools)
+
     async def test_state_restores_authoritative_empty_pool(self):
         state = {"version": 2, "sources": [
             {"id": "empty", "adapter": "sub2api", "base_url": "https://upstream.test",
