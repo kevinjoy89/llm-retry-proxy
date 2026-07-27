@@ -20,6 +20,7 @@
 | `ADMIN_PASSWORD` | 空 | 管理页面密码；未配置时 `/stats*`、`/logs*` 和 `/key-pools` 禁用。兼容旧 `ADMIN_TOKEN` |
 | `ADMIN_COOKIE_SECURE` | `false` | HTTPS 部署时设为 `true`，限制登录 Cookie 仅通过 HTTPS 发送 |
 | `PROXY_API_KEY` | 空 | 下游使用号池的凭据；未携带或不匹配时仅作普通透传 |
+| `TRUSTED_PROXIES` | 空 | 信任的反向代理 IP（逗号分隔）；仅这些 IP 的请求才采用转发头中的客户端 IP，避免伪造 |
 
 ## 上游、路由与网络
 

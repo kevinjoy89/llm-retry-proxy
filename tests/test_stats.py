@@ -7,10 +7,30 @@ from unittest.mock import patch
 
 from retry_proxy.api import _cumulative
 from retry_proxy.log_store import RetryLogStore
-from retry_proxy.stats import _agg_by, _agg_by_key, compute_key_pool_stats, compute_stats
+from retry_proxy.pool_sync import _mask_key
+from retry_proxy.stats import (_normalize_provider, _agg_by, _agg_by_key,
+                               compute_key_pool_stats, compute_stats)
 
 
 class KeyAvailabilityStatsTests(unittest.TestCase):
+    def test_short_key_mask_does_not_leak_full_key(self):
+        # Regression: masking short keys with [:7]+"..."+[-4:] overlapped and
+        # revealed the whole key (e.g. "abc" -> "abc...abc").
+        self.assertEqual(_mask_key("abc"), "ab***")
+        self.assertEqual(_mask_key(""), "***")
+        self.assertEqual(_mask_key("sk-short"), "sk***")
+        # Normal-length keys keep the head/tail mask
+        self.assertEqual(_mask_key("sk-secret-one"), "sk-secr...-one")
+        self.assertNotIn("secret", _mask_key("sk-secret-one"))
+
+    def test_anthropic_provider_is_no_longer_relabelled(self):
+        # Regression: "anthropic" used to be hardcoded to "xfyun", silently
+        # relabelling Anthropic traffic. Now only the Chinese display-name
+        # alias remains by default.
+        self.assertEqual(_normalize_provider("anthropic"), "anthropic")
+        self.assertEqual(_normalize_provider("讯飞星辰 Coding Plan"), "xfyun")
+        self.assertEqual(_normalize_provider("custom"), "custom")
+
     def test_client_cancellation_is_excluded_from_failure_and_availability(self):
         records = [
             {"provider": "test", "model": "model", "final_status": 200,

@@ -375,6 +375,26 @@ class ExternalDataParserTests(unittest.TestCase):
         self.assertEqual(legacy["sample_param"], "limit")
         self.assertEqual(legacy["samples"], 50)
 
+    def test_private_or_loopback_experience_url_is_rejected(self):
+        # Regression: SSRF mitigation -- private/loopback IP literals must be
+        # blocked so an admin (or anyone reaching the admin API) cannot probe
+        # internal services via the experience-data fetch.
+        for blocked in (
+            "http://127.0.0.1/groups", "http://10.0.0.1/groups",
+            "http://169.254.169.254/latest/meta-data",
+            "http://localhost/groups", "http://[::1]/groups",
+        ):
+            with self.subTest(url=blocked):
+                with self.assertRaises(PoolSyncError) as raised:
+                    PoolSyncManager._normalize_experience_source(blocked)
+                self.assertIn("私有", str(raised.exception))
+
+    def test_public_experience_url_is_accepted(self):
+        config = PoolSyncManager._normalize_experience_source(
+            "https://metrics.test/groups", transform=self.TRANSFORM,
+        )
+        self.assertEqual(config["url"], "https://metrics.test/groups")
+
 
 class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

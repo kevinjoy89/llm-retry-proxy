@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -31,6 +32,36 @@ def _now_iso():
 def _source_id(adapter, base_url):
     value = f"{adapter}:{base_url.rstrip('/')}".encode("utf-8")
     return hashlib.sha256(value).hexdigest()[:16]
+
+
+def _mask_key(raw_key):
+    """Mask a key for display without leaking short keys in full."""
+    raw_key = str(raw_key or "")
+    if len(raw_key) <= 11:
+        return raw_key[:2] + "***" if len(raw_key) > 2 else "***"
+    return raw_key[:7] + "..." + raw_key[-4:]
+
+
+def _is_private_or_loopback_host(hostname):
+    """Block direct private/loopback/link-local IP literals to mitigate SSRF.
+
+    Only inspects IP literals; DNS-resolvable hostnames are not resolved here
+    (no blocking I/O on the validation path). Catches the common SSRF vectors
+    like 127.0.0.1, 10.x, 169.254.169.254, ::1.
+    """
+    if not hostname:
+        return False
+    host = hostname.strip().rstrip(".").lower()
+    if host in ("localhost",):
+        return True
+    # Strip IPv6 brackets for ipaddress parsing.
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved
 
 
 def _experience_timestamp(value):
@@ -504,6 +535,8 @@ class PoolSyncManager:
             raise PoolSyncError("外部数据 URL 必须是有效的 http:// 或 https:// 地址")
         if parsed.username or parsed.password or parsed.fragment:
             raise PoolSyncError("外部数据 URL 不能包含账号、密码或片段")
+        if _is_private_or_loopback_host(parsed.hostname):
+            raise PoolSyncError("外部数据 URL 不能指向私有、回环或链路本地地址")
         if len(url) > 2048:
             raise PoolSyncError("外部数据 URL 过长")
         normalized_params = None
@@ -1101,7 +1134,7 @@ class PoolSyncManager:
                 visible_entries.append({
                     "source_key_id": item.get("source_key_id"),
                     "enabled": str(item.get("source_key_id")) not in disabled_key_ids,
-                    "key_masked": raw_key[:7] + "..." + raw_key[-4:],
+                    "key_masked": _mask_key(raw_key),
                     "label": item.get("label", ""), "sort": item.get("sort", ""),
                     "group_id": str(item.get("group_id") or ""),
                     "key_name": item.get("key_name", ""), "group_name": item.get("group_name", ""),

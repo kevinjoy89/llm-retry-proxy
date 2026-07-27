@@ -329,11 +329,17 @@ def _cumulative(summary):
 
 
 def _request_ip(request):
-    for header in ("cf-connecting-ip", "x-forwarded-for", "x-real-ip"):
-        value = request.headers.get(header, "").strip()
-        if value:
-            return value.split(",", 1)[0].strip()
-    return request.client.host if request.client else ""
+    direct = request.client.host if request.client else ""
+    # Only honor forwarded IP headers when the request arrives from a trusted
+    # proxy; otherwise any client can spoof its origin via these headers.
+    if direct and getattr(settings, "trusted_proxies", frozenset()):
+        trusted = settings.trusted_proxies
+        if direct in trusted:
+            for header in ("cf-connecting-ip", "x-forwarded-for", "x-real-ip"):
+                value = request.headers.get(header, "").strip()
+                if value:
+                    return value.split(",", 1)[0].strip()
+    return direct
 
 
 def _key_pool_secrets():

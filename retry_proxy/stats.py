@@ -1,4 +1,5 @@
 from collections import Counter, defaultdict
+import os
 from datetime import datetime, timedelta
 
 
@@ -52,10 +53,31 @@ def _req_first_ok(r: dict) -> bool:
     return r.get("first_ok", r.get("retries", 0) == 0)
 
 
+# 默认别名仅归一化中文显示名；anthropic 等英文 provider 不再硬编码重映射，
+# 避免把 Anthropic 流量静默改标。可通过 PROVIDER_ALIASES 环境变量追加/覆盖，
+# 格式为 from:to,from:to。
 _PROVIDER_ALIASES = {
-    "anthropic": "xfyun",
     "讯飞星辰 Coding Plan": "xfyun",
 }
+
+
+def _load_extra_aliases():
+    raw = os.getenv("PROVIDER_ALIASES", "").strip()
+    if not raw:
+        return {}
+    extras = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        src, dst = entry.split(":", 1)
+        src, dst = src.strip(), dst.strip()
+        if src and dst:
+            extras[src] = dst
+    return extras
+
+
+_PROVIDER_ALIASES.update(_load_extra_aliases())
 
 
 def _normalize_provider(p: str) -> str:
