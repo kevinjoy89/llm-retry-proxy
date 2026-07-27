@@ -40,7 +40,7 @@ class KeyEntry:
                  "cooldown_until", "total_fail",
                  "last_fail_ts", "consecutive_failures", "last_failure_kind", "last_failure_status",
                  "last_cooldown_s", "ttft_ewma", "ttft_samples", "ttft_last_ts",
-                 "probe_latency_s", "probe_last_ts")
+                 "probe_latency_s", "probe_last_ts", "_retired")
     def __init__(self, key: str, label: str = "", models=(), paths=(), sort: str = "",
                  group_id: str = "", group_name: str = "", routing_capabilities=None, auth=None):
         self.key, self.label, self.sort = key, label, sort.strip()
@@ -88,6 +88,10 @@ class KeyEntry:
         self.ttft_last_ts = 0.0
         self.probe_latency_s = None
         self.probe_last_ts = 0.0
+        # 标记该 entry 是否已被 replace_key_pool 丢弃。调用方跨 await 持有
+        # 旧 entry 引用并回写结果时，mark_*/record_ttft 检查此标记后跳过，
+        # 避免对已失效的 entry 做无效（且可能误导调度器的）状态更新。
+        self._retired = False
 
 
 class KeyPool:
@@ -492,7 +496,7 @@ class KeyPool:
         return self._balanced_pick(groups)
 
     def record_ttft(self, entry, seconds, alpha=0.3):
-        if entry is None or seconds < 0:
+        if entry is None or seconds < 0 or getattr(entry, "_retired", False):
             return
         group_key = self._group_key(entry)
         now = time.time()
@@ -579,7 +583,7 @@ class KeyPool:
             candidate.ttft_last_ts = now
 
     def record_probe(self, entry, seconds):
-        if entry is None or seconds < 0:
+        if entry is None or seconds < 0 or getattr(entry, "_retired", False):
             return
         group_key = self._group_key(entry)
         now = time.time()
@@ -676,6 +680,8 @@ class KeyPool:
 
     def mark_cooldown(self, entry, seconds, ra_wait=None, failure_kind="upstream", backoff=False,
                       max_seconds=None, status=None, session_id=None):
+        if entry is None or getattr(entry, "_retired", False):
+            return
         now = time.time()
         group_key = self._group_key(entry)
         if group_key == self._active_probe_group:
@@ -731,6 +737,8 @@ class KeyPool:
         entry.last_fail_ts = now
 
     def mark_success(self, entry, session_id=None):
+        if entry is None or getattr(entry, "_retired", False):
+            return
         entry.cooldown_until = 0.0
         entry.consecutive_failures = 0
         entry.last_failure_kind = ""
@@ -913,11 +921,13 @@ def replace_key_pool(url: str, replacement: KeyPool, pools=None):
     old_entries = {entry.key: entry for entry in previous.entries}
     current_key = previous._current.key if previous._current is not None else None
     merged = []
+    retained_keys = set()
     for fresh in replacement.entries:
         entry = old_entries.get(fresh.key)
         if entry is None:
             merged.append(fresh)
             continue
+        retained_keys.add(fresh.key)
         entry.legacy_key_id = fresh.legacy_key_id
         entry.key_id = fresh.key_id
         entry.label = fresh.label
@@ -930,6 +940,12 @@ def replace_key_pool(url: str, replacement: KeyPool, pools=None):
         entry.auth_header = fresh.auth_header
         entry.auth_scheme = fresh.auth_scheme
         merged.append(entry)
+
+    # Mark entries that were dropped by the swap as retired so in-flight
+    # callers holding stale references skip mark_*/record_ttft updates.
+    for entry in previous.entries:
+        if entry.key not in retained_keys:
+            entry._retired = True
 
     previous.entries[:] = merged
     previous.provider = replacement.provider

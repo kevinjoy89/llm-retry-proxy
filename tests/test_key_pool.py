@@ -587,6 +587,34 @@ class KeyPoolStickyTests(unittest.TestCase):
         self.assertEqual(live_entry.last_failure_status, 429)
         self.assertGreater(live_entry.cooldown_until, 0)
 
+    def test_dropped_entry_is_retired_and_mark_updates_are_skipped(self):
+        # Regression: when replace_key_pool drops a key, in-flight callers may
+        # still hold a stale reference and call mark_success/mark_cooldown/
+        # record_ttft. Retired entries must be skipped to avoid misleading the
+        # scheduler with state for a key that no longer exists.
+        previous = KeyPool([("keep", "keep"), ("drop", "drop")])
+        drop_entry = previous.entries[1]
+        drop_entry.cooldown_until = 0.0
+        pools = {"https://upstream.test": previous}
+
+        replace_key_pool("https://upstream.test", KeyPool([("keep", "keep")]), pools)
+
+        self.assertTrue(drop_entry._retired)
+        # mark_success / mark_cooldown / record_ttft should be no-ops
+        previous.mark_success(drop_entry)
+        self.assertEqual(drop_entry.cooldown_until, 0.0)
+        previous.mark_cooldown(drop_entry, 60, failure_kind="rate_limit", status=429)
+        self.assertEqual(drop_entry.cooldown_until, 0.0)
+        self.assertEqual(drop_entry.last_failure_status, None)
+        previous.record_ttft(drop_entry, 1.5)
+        self.assertIsNone(drop_entry.ttft_ewma)
+
+        # The retained entry is NOT retired and updates still apply
+        keep_entry = pools["https://upstream.test"].entries[0]
+        self.assertFalse(getattr(keep_entry, "_retired", False))
+        previous.mark_cooldown(keep_entry, 30, status=503)
+        self.assertGreater(keep_entry.cooldown_until, 0)
+
     def test_sort_orders_entries_numerically_and_formats_log_id(self):
         pool = KeyPool([])
         pool.entries = [
