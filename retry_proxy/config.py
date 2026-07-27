@@ -186,6 +186,7 @@ class Settings:
     key_pool_sync_state_file: str = os.getenv("KEY_POOL_SYNC_STATE_FILE", "").strip() or os.path.join(
         os.getenv("LOG_DIR", "logs"), ".key_pool_sync.json"
     )
+    key_pool_sync_secret: str = (os.getenv("KEY_POOL_SYNC_SECRET") or os.getenv("ADMIN_PASSWORD") or os.getenv("ADMIN_TOKEN", "")).strip()
     dlp_mode: str = os.getenv("DLP_MODE", "off").lower()
     dlp_rules: frozenset = frozenset(x.strip() for x in os.getenv("DLP_RULES", "private_key,ai_tokens,code_tokens,cloud_tokens,saas_tokens,package_tokens,credentials,csv_credentials,jwt,connection_string,id_card,bank_card,structured_secret").split(",") if x.strip())
     dlp_rule_file: str = os.getenv("DLP_RULE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "dlp_rules.yaml"))

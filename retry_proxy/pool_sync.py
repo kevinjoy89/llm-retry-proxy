@@ -15,6 +15,8 @@ from .config import logger, settings
 from .key_pool import (KEY_POOLS, KEY_POOL_STRATEGIES, KeyEntry, KeyPool,
                        clone_key_pool, replace_key_pool)
 from .routes import normalize_route_prefix
+from .secrets_crypto import (SENSITIVE_FIELDS, decrypt_session, derive_key,
+                             encrypt_session)
 from .sync_adapters import ADAPTERS, PoolSyncError
 
 
@@ -233,13 +235,26 @@ class PoolSyncManager:
         replace_key_pool(base_url, clone_key_pool(static), self.pools)
 
     def _persistent_sources(self):
+        key = derive_key(getattr(self.config, "key_pool_sync_secret", "") or "")
         sources = []
         for source in self.sources.values():
             item = dict(source)
             adapter = self._adapter(item["adapter"])
-            item["session"] = adapter.persistent_session(item.get("session") or {})
+            session = adapter.persistent_session(item.get("session") or {})
+            item["session"] = encrypt_session(session, SENSITIVE_FIELDS, key) if key else session
             sources.append(item)
         return sources
+
+    def _decrypt_session(self, session):
+        """解密状态文件中的 session；失败则清空凭据，要求重新登录。"""
+        if not isinstance(session, dict) or not session.get("__encrypted__"):
+            return session
+        key = derive_key(getattr(self.config, "key_pool_sync_secret", "") or "")
+        try:
+            return decrypt_session(session, key)
+        except ValueError as exc:
+            logger.warning(f"号池同步凭据解密失败，已清空该连接会话: {exc}")
+            return {}
 
     def load_state(self):
         if not self.state_file or not os.path.exists(self.state_file):
@@ -286,6 +301,7 @@ class PoolSyncManager:
                 except ValueError as exc:
                     source["pool_url"] = source["base_url"]
                     logger.warning(f"号池运行地址未绑定到环境路由: {exc}")
+                source["session"] = self._decrypt_session(source.get("session") or {})
                 self.sources[source["id"]] = source
                 if self.route_registry is not None and source.get("route_prefix"):
                     try:
@@ -511,7 +527,7 @@ class PoolSyncManager:
                 raise
             except Exception as exc:
                 self._save_state()
-            raise PoolSyncError(f"读取分组失败: {exc}") from exc
+                raise PoolSyncError(f"读取分组失败: {exc}") from exc
 
     async def set_group_rules(self, source_id, rules):
         normalized = self._normalize_group_rules(rules)

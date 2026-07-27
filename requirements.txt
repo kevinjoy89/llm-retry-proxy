@@ -4,3 +4,4 @@ uvicorn[standard]>=0.29
 wsproto>=1.2
 python-dotenv>=1.0
 PyYAML>=6.0
+cryptography>=42.0

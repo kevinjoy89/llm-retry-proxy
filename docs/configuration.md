@@ -107,6 +107,7 @@
 | `KEY_POOL_SYNC_INTERVAL` | `300` | 自动同步周期（秒）；`0` = 仅手动同步 |
 | `KEY_POOL_CREATE_DELAY` | `1.5` | 批量创建 key 时相邻请求的间隔（秒） |
 | `KEY_POOL_SYNC_STATE_FILE` | `LOG_DIR/.key_pool_sync.json` | 同步连接、刷新令牌与最近成功号池的持久化文件 |
+| `KEY_POOL_SYNC_SECRET` | `ADMIN_PASSWORD` | 状态文件凭据字段的加密主密钥；留空时回退到 `ADMIN_PASSWORD`，两者均未设置则不加密（明文落盘，向后兼容） |
 
 ## 上游兼容
 

@@ -321,6 +321,7 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
             key_pool_sync_default_adapter="sub2api",
             key_pool_sync_default_url="https://upstream.test",
             key_pool_sync_interval=0,
+            key_pool_sync_secret="",
             provider="test-provider",
         )
 
@@ -357,6 +358,56 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("refresh-1", persisted)
         if os.name != "nt":
             self.assertEqual(os.stat(self.state_file).st_mode & 0o777, 0o600)
+
+    async def test_encrypted_state_file_hides_credentials_and_survives_restart(self):
+        secret_config = SimpleNamespace(**{**self.config.__dict__,
+                                           "key_pool_sync_secret": "master-secret"})
+        manager = PoolSyncManager(
+            {}, secret_config, FakeClient(), {"sub2api": Sub2APIAdapter()},
+        )
+        status = await manager.connect(
+            "sub2api", "https://upstream.test", "custom-provider",
+            {"email": "user@example.com", "password": "plaintext-pw"},
+        )
+        source_id = status["sources"][0]["id"]
+
+        with open(self.state_file, encoding="utf-8") as f:
+            persisted = f.read()
+        # Credentials must not appear in plaintext on disk
+        self.assertNotIn("plaintext-pw", persisted)
+        self.assertNotIn("refresh-1", persisted)
+        self.assertNotIn("access-1", persisted)
+        self.assertIn("__encrypted__", persisted)
+
+        # A second manager with the same secret can restore and re-sync
+        restored_client = FakeClient()
+        restored = PoolSyncManager(
+            {}, secret_config, restored_client, {"sub2api": Sub2APIAdapter()},
+        )
+        restored.load_state()
+        restored_status = await restored.sync_now(source_id)
+        self.assertEqual(len(restored_status["sources"]), 1)
+
+    async def test_encrypted_state_with_wrong_secret_clears_session(self):
+        secret_config = SimpleNamespace(**{**self.config.__dict__,
+                                           "key_pool_sync_secret": "right-secret"})
+        manager = PoolSyncManager(
+            {}, secret_config, FakeClient(), {"sub2api": Sub2APIAdapter()},
+        )
+        await manager.connect(
+            "sub2api", "https://upstream.test", "custom-provider",
+            {"email": "user@example.com", "password": "plaintext-pw"},
+        )
+
+        wrong_config = SimpleNamespace(**{**self.config.__dict__,
+                                          "key_pool_sync_secret": "wrong-secret"})
+        restored = PoolSyncManager(
+            {}, wrong_config, FakeClient(), {"sub2api": Sub2APIAdapter()},
+        )
+        restored.load_state()
+        # Wrong key cannot decrypt; session cleared, source not considered connected
+        source = next(iter(restored.sources.values()))
+        self.assertEqual(source["session"], {})
 
     async def test_group_model_cache_survives_restart(self):
         manager = PoolSyncManager(
@@ -863,6 +914,26 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
                            if call[0] == "POST" and call[1].endswith("/keys"))
         self.assertEqual(create_call[2]["name"], "Empty")
         self.assertTrue(create_call[3]["Idempotency-Key"].startswith("pool-sync-key-"))
+
+    async def test_catalog_wraps_unexpected_adapter_error_as_pool_sync_error(self):
+        manager = PoolSyncManager({}, self.config, FakeClient(), {"sub2api": Sub2APIAdapter()})
+        status = await manager.connect("sub2api", "https://upstream.test", "test", {
+            "email": "user@example.com", "password": "secret",
+        })
+        source_id = status["sources"][0]["id"]
+
+        stub = Sub2APIAdapter()
+        stub.catalog = AsyncMock(side_effect=RuntimeError("boom inside adapter"))
+        manager.adapters["sub2api"] = stub
+
+        with self.assertRaises(PoolSyncError) as raised:
+            await manager.catalog(source_id)
+
+        # Regression: the original error used to be masked by an
+        # UnboundLocalError because ``raise`` fell outside the except block.
+        self.assertNotIsInstance(raised.exception.__cause__, UnboundLocalError)
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+        self.assertIn("读取分组失败", str(raised.exception))
 
     async def test_group_rules_apply_to_synced_keys(self):
         client = FakeClient()
