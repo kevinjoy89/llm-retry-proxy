@@ -76,6 +76,12 @@ class KeyPoolPageTests(unittest.TestCase):
         self.assertIn('id="manualPaths"', self.html)
         self.assertIn("paths:paths||''", self.html)
         self.assertIn("$('manualEditModal').classList.remove('open')", self.html)
+        self.assertIn(
+            '@media(max-width:760px){.form-grid,.credentials,.manual-meta,'
+            '.manual-edit-body .form-grid,.experience-grid,.transform-grid{'
+            'grid-template-columns:1fr}',
+            self.html,
+        )
 
     def test_manual_source_hides_meta_and_capability_columns(self):
         # 手动号池展开时隐藏账号所在元信息行，并省略平台/自动能力/手工规则列
