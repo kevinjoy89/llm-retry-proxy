@@ -377,6 +377,57 @@ async def key_pools_key_state(request: Request):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+async def key_pools_manual_add(request: Request):
+    try:
+        body = await _json_object(request)
+        raw_base_url = body.get("base_url")
+        if not isinstance(raw_base_url, str):
+            raise HTTPException(status_code=400, detail="base_url 必须是字符串")
+        base_url = raw_base_url.strip()
+        if not base_url:
+            raise HTTPException(status_code=400, detail="base_url 不能为空")
+        keys = body.get("keys")
+        if not isinstance(keys, list) or not keys:
+            raise HTTPException(status_code=400, detail="keys 必须是非空数组")
+        return await pool_sync.add_manual_keys(
+            base_url, keys,
+            provider=body.get("provider", ""),
+            route_prefix=body.get("route_prefix"),
+        )
+    except PoolSyncError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+async def key_pools_manual_remove(request: Request):
+    try:
+        body = await _json_object(request)
+        source_id = body.get("source_id")
+        if not source_id:
+            raise HTTPException(status_code=400, detail="source_id 不能为空")
+        source_key_ids = body.get("source_key_ids")
+        if not isinstance(source_key_ids, list) or not source_key_ids:
+            raise HTTPException(status_code=400, detail="source_key_ids 必须是非空数组")
+        return await pool_sync.remove_manual_keys(source_id, source_key_ids)
+    except PoolSyncError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+async def key_pools_manual_update(request: Request):
+    try:
+        body = await _json_object(request)
+        source_id = body.get("source_id")
+        source_key_id = body.get("source_key_id")
+        if not source_id:
+            raise HTTPException(status_code=400, detail="source_id 不能为空")
+        if source_key_id in (None, ""):
+            raise HTTPException(status_code=400, detail="source_key_id 不能为空")
+        return await pool_sync.update_manual_key(
+            source_id, source_key_id, body,
+        )
+    except PoolSyncError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 app.add_api_route("/health", health, methods=["GET"])
 app.add_api_route("/admin/login", admin_login_page, methods=["GET"])
 app.add_api_route("/admin/login", admin_login, methods=["POST"])
@@ -402,6 +453,9 @@ app.add_api_route("/admin/key-pools/api/reset-group", key_pools_reset_group, met
 app.add_api_route("/admin/key-pools/api/reset-groups", key_pools_reset_groups, methods=["POST"], dependencies=admin_dependencies)
 app.add_api_route("/admin/key-pools/api/reset-key", key_pools_reset_key, methods=["POST"], dependencies=admin_dependencies)
 app.add_api_route("/admin/key-pools/api/key-state", key_pools_key_state, methods=["POST"], dependencies=admin_dependencies)
+app.add_api_route("/admin/key-pools/api/manual-add", key_pools_manual_add, methods=["POST"], dependencies=admin_dependencies)
+app.add_api_route("/admin/key-pools/api/manual-remove", key_pools_manual_remove, methods=["POST"], dependencies=admin_dependencies)
+app.add_api_route("/admin/key-pools/api/manual-update", key_pools_manual_update, methods=["POST"], dependencies=admin_dependencies)
 app.add_api_route("/stats", stats_page, methods=["GET"], dependencies=admin_dependencies)
 app.add_api_route("/stats/api", stats_api, methods=["GET"], dependencies=admin_dependencies)
 app.add_api_route("/logs", logs_page, methods=["GET"], dependencies=admin_dependencies)
