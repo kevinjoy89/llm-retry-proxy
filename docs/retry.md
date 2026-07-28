@@ -11,7 +11,7 @@
 - 对于流式请求：先读取上游响应头与状态码，若为 503 则丢弃 body 并重试；一旦上游开始返回 200 并流式输出，中途断流**不**重试（已向客户端发送部分数据，重试会导致内容错乱）。流式 Responses 请求收到 2xx 响应头时只记录“响应头已建立”，代理会继续检查 SSE 是否以 `response.completed` 或 `response.incomplete` 结束；缺少终止事件、出现错误事件、传输中断或返回非 SSE 内容时，最终日志和统计会标记为流失败。下游客户端在终止事件前结束连接时单独记为客户端取消，不作为 key 故障；若终止事件已经收到，则随后发生的连接取消不会覆盖已确认的流结果。
 - Responses API 整笔请求等待上游响应头有独立的硬上限 `RESPONSES_HEADER_TIMEOUT`（默认 120 秒），预算内照常重试或换 key；到期后取消所有在飞请求并返回 503，防止连接仍有底层活动但业务响应长期不返回。
 - 对正文明确指定 `stream=true` 的 Responses 号池请求，单个 key 等待上游响应头还受 `RESPONSES_ATTEMPT_HEADER_TIMEOUT`（默认 15 秒）限制；超时会取消该次请求、按传输故障熔断当前 key，并立即尝试其它可用 key。非流式请求不使用这个短上限，避免完整生成耗时被误判为故障。
-- `SSE2WS_MODE=bridge` 且实际使用 SSE 回退时，使用独立的首事件预算 `SSE2WS_FIRST_EVENT_TIMEOUT`，同时覆盖响应头和第一个合法 SSE 事件。桥接层在任何事件发给客户端之前，可按 `SSE2WS_FIRST_EVENT_RETRIES` 使用同一 key 重连；耗尽后才熔断换 key。内部 HTTP 重试、首事件重连和跨 Key 尝试共享 `MAX_RETRIES` 总预算；`MAX_RETRIES=0` 时不设总上限。桥接请求不再叠加 `RESPONSES_ATTEMPT_HEADER_TIMEOUT`，避免旧的响应头预算提前切换 key。原生上游 WebSocket 只在握手阶段按号池切换失败 key，建立连接后不透明重放消息。
+- `SSE2WS_MODE=bridge` 时使用独立的首事件预算 `SSE2WS_FIRST_EVENT_TIMEOUT`，同时覆盖响应头和第一个合法 SSE 事件。桥接层在任何事件发给客户端之前，可按 `SSE2WS_FIRST_EVENT_RETRIES` 使用同一 key 重连；耗尽后才熔断换 key。内部 HTTP 重试、首事件重连和跨 Key 尝试共享 `MAX_RETRIES` 总预算；`MAX_RETRIES=0` 时不设总上限。桥接请求不再叠加 `RESPONSES_ATTEMPT_HEADER_TIMEOUT`，避免旧的响应头预算提前切换 key。
 - 桥接层一旦向 WebSocket 客户端发送语义事件，就不会透明重放该轮请求。此后的畸形事件、断流或缺少 `response.completed` / `response.incomplete` 会发送结构化错误并结束连接，避免重复文本或重复执行工具。
 - 下游在等待或换 key 期间主动取消请求时，代理会停止后续重试，并取消 `race` / `stagger` 模式下所有仍在飞的上游请求。
 - 请求异常（连接超时、网络断开等）同样会重试。

@@ -50,14 +50,8 @@ def _log_startup():
     logger.info(f"DLP: 模式={settings.dlp_mode}, 规则={','.join(sorted(settings.dlp_rules)) if settings.dlp_rules else '无'}")
     logger.info(f"代理: trust_env={'是(跟随系统代理)' if settings.trust_env else '否(直连)'}")
     if settings.sse2ws_mode == "bridge":
-        transport_desc = {
-            "auto": "原生WS优先/SSE回退",
-            "websocket": "仅原生WS",
-            "sse": "仅SSE桥接",
-        }.get(settings.sse2ws_upstream_transport, settings.sse2ws_upstream_transport)
         logger.info(
-            f"SSE2WS: 已开启 上游={transport_desc} "
-            f"首事件={settings.sse2ws_first_event_timeout:.0f}s "
+            f"SSE2WS: 已开启 首事件={settings.sse2ws_first_event_timeout:.0f}s "
             f"额外重试={settings.sse2ws_first_event_retries}次"
         )
     else:
@@ -86,10 +80,6 @@ async def lifespan(_app):
         raise ValueError(f"未知 DLP_MODE: {settings.dlp_mode!r}")
     if settings.sse2ws_mode not in ("off", "bridge"):
         raise ValueError(f"未知 SSE2WS_MODE: {settings.sse2ws_mode!r}")
-    if settings.sse2ws_upstream_transport not in ("auto", "websocket", "sse"):
-        raise ValueError(
-            "SSE2WS_UPSTREAM_TRANSPORT 必须是 auto、websocket 或 sse"
-        )
     if settings.sse2ws_mode == "bridge" and settings.sse2ws_first_event_timeout <= 0:
         raise ValueError("SSE2WS_FIRST_EVENT_TIMEOUT 必须大于 0")
     if settings.sse2ws_mode == "bridge" and settings.sse2ws_first_event_retries < 0:

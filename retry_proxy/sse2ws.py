@@ -4,13 +4,10 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from urllib.parse import urlsplit, urlunsplit
 
 import httpx
-import websockets
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
-from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from .api import (
     _key_pool_secrets,
@@ -25,9 +22,9 @@ from .api import (
 )
 from .config import can_use_key_pool, logger, settings, should_retry_status
 from .dlp import inspect_json_body
-from .key_pool import KEY_POOLS, headers_with_key
-from .retry import (KeyPoolWaitTimeout, RequestAttemptBudget, _mark_key_failure,
-                    _pick_key, _tag, reset_client_ip, set_client_ip)
+from .key_pool import KEY_POOLS
+from .retry import (RequestAttemptBudget, _mark_key_failure, _tag, reset_client_ip,
+                    set_client_ip)
 from .routes import is_excluded_path, match_route
 
 
@@ -36,7 +33,6 @@ _TERMINAL_EVENT_TYPES = {"response.completed", "response.incomplete"}
 _SAFE_ERROR_HEADERS = {
     "openai-request-id", "request-id", "retry-after", "x-request-id",
 }
-_WS_UNSUPPORTED_STATUSES = {200, 404, 405, 426, 501}
 
 
 class BridgeError(Exception):
@@ -57,12 +53,6 @@ class ClientDisconnected(Exception):
 
 class TurnCancelled(Exception):
     pass
-
-
-class NativeWebSocketUnsupported(Exception):
-    def __init__(self, status):
-        self.status = status
-        super().__init__(f"upstream WebSocket unsupported (HTTP {status})")
 
 
 @dataclass
@@ -684,8 +674,7 @@ async def _relay(websocket, opened):
 
 
 async def _write_turn_log(store, path, provider, model, upstream, request_pool, client_ip,
-                          metrics, final_status, stream_status, succeeded,
-                          upstream_transport="sse"):
+                          metrics, final_status, stream_status, succeeded):
     await store.write({
         "ts": datetime.now().isoformat(timespec="milliseconds"),
         "method": "POST",
@@ -707,260 +696,16 @@ async def _write_turn_log(store, path, provider, model, upstream, request_pool, 
         "succeeded": succeeded,
         "stream_status": stream_status,
         "downstream_transport": "websocket",
-        "upstream_transport": upstream_transport,
+        "upstream_transport": "sse",
         "bridge_retries": max(metrics.bridge_attempts - 1, 0),
         "bridge_retry_reasons": metrics.bridge_retry_reasons,
         "first_event_s": round(metrics.first_event_s, 3) if metrics.first_event_s else None,
     })
 
 
-def _native_websocket_url(url):
-    parts = urlsplit(url)
-    scheme = {"http": "ws", "https": "wss"}.get(parts.scheme, parts.scheme)
-    return urlunsplit((scheme, parts.netloc, parts.path, parts.query, parts.fragment))
-
-
 def _key_tag(metrics):
     key_id = str(getattr(metrics, "key_id", "") or "").strip()
     return f" [{key_id}]" if key_id else ""
-
-
-def _native_websocket_headers(request_headers, path, model):
-    headers = outbound_request_headers(request_headers, path, model)
-    return {
-        name: value for name, value in headers.items()
-        if not name.lower().startswith("sec-websocket-")
-        and name.lower() not in {"accept", "accept-encoding", "content-type"}
-    }
-
-
-def _upstream_error_payload(response):
-    raw = getattr(response, "body", None)
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except (TypeError, ValueError, UnicodeDecodeError):
-        return None
-
-
-async def _open_native_websocket(url, headers, pool, session_id, metrics):
-    total_limit = max(getattr(settings, "max_retries", 1), 0)
-    while total_limit == 0 or metrics.total_sent < total_limit:
-        entry = None
-        try:
-            entry = await _pick_key(
-                pool, getattr(settings, "key_pool_wait_timeout", None), session_id,
-            )
-            send_headers = headers_with_key(
-                headers, entry.key, entry.auth_header, entry.auth_scheme,
-            ) if entry is not None else headers
-            metrics.total_sent += 1
-            metrics.bridge_attempts += 1
-            metrics.key_entry = entry
-            metrics.key_id = entry.key_id if entry is not None else ""
-            if entry is not None:
-                metrics.key_attempts.append({
-                    "key_id": entry.key_id, "available": None,
-                })
-            connection = await websockets.connect(
-                _native_websocket_url(url),
-                additional_headers=send_headers,
-                user_agent_header=None,
-                open_timeout=getattr(settings, "connect_timeout", 10),
-                close_timeout=getattr(settings, "connect_timeout", 10),
-                max_size=getattr(settings, "max_request_body", 64 * 1024 * 1024),
-                proxy=True if getattr(settings, "trust_env", False) else None,
-            )
-        except InvalidStatus as exc:
-            status = exc.response.status_code
-            metrics.last_status = status
-            if status in _WS_UNSUPPORTED_STATUSES:
-                raise NativeWebSocketUnsupported(status) from exc
-            if entry is not None:
-                metrics.key_attempts[-1]["available"] = not _is_key_failure_status(status)
-                if _is_key_failure_status(status):
-                    _mark_deferred_failure(pool, entry, session_id, metrics, status)
-                    if (should_retry_status(status) or status in (401, 403)) and pool.has_fresh():
-                        continue
-            raise BridgeError(
-                "upstream rejected the WebSocket handshake",
-                status=status, code="upstream_websocket_handshake_error",
-                payload=_upstream_error_payload(exc.response),
-                headers=getattr(exc.response, "headers", None),
-            ) from exc
-        except KeyPoolWaitTimeout as exc:
-            raise BridgeError(str(exc), status=503, code="key_pool_wait_timeout") from exc
-        except (asyncio.TimeoutError, TimeoutError) as exc:
-            raise BridgeError(
-                "upstream WebSocket handshake timed out", status=504,
-                code="upstream_websocket_timeout",
-            ) from exc
-        except (OSError, websockets.WebSocketException) as exc:
-            raise BridgeError(
-                "upstream WebSocket connection failed", status=502,
-                code="upstream_websocket_error",
-            ) from exc
-
-        metrics.last_status = 101
-        if entry is not None:
-            metrics.key_attempts[-1]["available"] = True
-            pool.mark_success(entry, session_id=session_id)
-        return connection
-    raise BridgeError(
-        "upstream WebSocket attempt budget exhausted", status=503,
-        code="upstream_attempt_limit",
-    )
-
-
-async def _native_client_message(websocket, upstream, message):
-    if await _reject_oversized_websocket_message(websocket, message):
-        return False
-    raw_bytes = message.get("bytes")
-    if raw_bytes is not None:
-        await upstream.send(raw_bytes)
-        return None
-    raw_text = message.get("text")
-    if raw_text is None:
-        return False
-    inspected = await _dlp_body(raw_text.encode("utf-8"))
-    inspected_text = inspected.decode("utf-8")
-    await upstream.send(inspected_text)
-    try:
-        payload = json.loads(inspected_text)
-    except (TypeError, ValueError):
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
-def _next_native_turn_metrics(connection_metrics):
-    return TurnMetrics(
-        total_sent=1, bridge_attempts=1, last_status=101,
-        key_id=connection_metrics.key_id, key_entry=connection_metrics.key_entry,
-        key_attempts=[dict(attempt) for attempt in connection_metrics.key_attempts[-1:]],
-    )
-
-
-async def _relay_native_websocket(websocket, upstream, first_message, store, path,
-                                  provider, upstream_url, request_pool, client_ip,
-                                  model, session_id, metrics):
-    upstream_task = None
-    client_task = None
-    active = False
-    try:
-        first_text = first_message.get("text") or ""
-        await upstream.send(first_text)
-        try:
-            first_payload = json.loads(first_text)
-        except (TypeError, ValueError):
-            first_payload = None
-        active = bool(
-            first_payload and first_payload.get("type") == "response.create"
-        )
-        logger.info(
-            f"{_tag('WS→WS', path, provider, model, client_ip)}{_key_tag(metrics)} "
-            "上游原生WebSocket已连接"
-        )
-        upstream_task = asyncio.create_task(upstream.recv())
-        client_task = asyncio.create_task(websocket.receive())
-        while True:
-            done, _ = await asyncio.wait(
-                (upstream_task, client_task), return_when=asyncio.FIRST_COMPLETED,
-            )
-            # When a terminal upstream event and the next response.create are
-            # ready together, close out the old turn before starting metrics
-            # for the new one. This keeps long-lived WS turn attribution exact.
-            if upstream_task in done:
-                data = await upstream_task
-                if not metrics.first_event_s:
-                    metrics.first_event_s = time.time() - metrics.started_at
-                if isinstance(data, bytes):
-                    await websocket.send_bytes(data)
-                else:
-                    await websocket.send_text(data)
-                    try:
-                        event = json.loads(data)
-                    except (TypeError, ValueError):
-                        event = None
-                    if isinstance(event, dict):
-                        event_type = str(event.get("type") or "")
-                        if event_type == "response.created":
-                            metrics.first_event_s = time.time() - metrics.started_at
-                        if active and event_type in _TERMINAL_EVENT_TYPES:
-                            succeeded = event_type == "response.completed"
-                            await _write_turn_log(
-                                store, path, provider, model, upstream_url, request_pool,
-                                client_ip, metrics, 101, event_type, succeeded, "websocket",
-                            )
-                            logger.info(
-                                f"{_tag('WS→WS', path, provider, model, client_ip)}"
-                                f"{_key_tag(metrics)} "
-                                f"Responses WS流结束 status={event_type} HTTP=101 "
-                                f"总{time.time() - metrics.started_at:.2f}s"
-                            )
-                            active = False
-                        elif active and event_type in _ERROR_EVENT_TYPES:
-                            status = _response_event_status(event) or 502
-                            await _write_turn_log(
-                                store, path, provider, model, upstream_url, request_pool,
-                                client_ip, metrics, status, event_type, False, "websocket",
-                            )
-                            logger.warning(
-                                f"{_tag('WS→WS', path, provider, model, client_ip)}"
-                                f"{_key_tag(metrics)} Responses WS流失败 "
-                                f"status={event_type} HTTP={status} "
-                                f"总{time.time() - metrics.started_at:.2f}s"
-                            )
-                            active = False
-                upstream_task = asyncio.create_task(upstream.recv())
-            if client_task in done:
-                message = await client_task
-                if message.get("type") == "websocket.disconnect":
-                    if active:
-                        await _write_turn_log(
-                            store, path, provider, model, upstream_url, request_pool,
-                            client_ip, metrics, 499, "cancelled", False, "websocket",
-                        )
-                        logger.info(
-                            f"{_tag('WS→WS', path, provider, model, client_ip)}"
-                            f"{_key_tag(metrics)} Responses WS客户端断开"
-                        )
-                    return
-                try:
-                    client_payload = await _native_client_message(websocket, upstream, message)
-                except BridgeError as exc:
-                    await _send_error(websocket, exc)
-                else:
-                    if (isinstance(client_payload, dict)
-                            and client_payload.get("type") == "response.create"
-                            and not active):
-                        metrics = _next_native_turn_metrics(metrics)
-                        active = True
-                client_task = asyncio.create_task(websocket.receive())
-    except ConnectionClosed as exc:
-        if active:
-            await _write_turn_log(
-                store, path, provider, model, upstream_url, request_pool, client_ip,
-                metrics, 502, "upstream_websocket_closed", False, "websocket",
-            )
-            logger.warning(
-                f"{_tag('WS→WS', path, provider, model, client_ip)}{_key_tag(metrics)} "
-                f"Responses WS异常断开 code={exc.code} "
-                f"总{time.time() - metrics.started_at:.2f}s"
-            )
-        try:
-            await websocket.close(code=exc.code, reason=exc.reason[:123])
-        except (RuntimeError, WebSocketDisconnect):
-            pass
-    finally:
-        for task in (upstream_task, client_task):
-            if task is not None and not task.done():
-                task.cancel()
-        await asyncio.gather(
-            *(task for task in (upstream_task, client_task) if task is not None),
-            return_exceptions=True,
-        )
-        await upstream.close()
 
 
 def create_sse2ws_handler(service, store):
@@ -981,7 +726,6 @@ def create_sse2ws_handler(service, store):
         transcript = Transcript()
         base_pool = KEY_POOLS.get(upstream)
         pool_credential_ok = can_use_key_pool(websocket.headers)
-        try_native_upstream = settings.sse2ws_upstream_transport != "sse"
         url = f"{upstream}/{remaining}" if remaining else upstream
         if websocket.url.query:
             url += f"?{websocket.url.query}"
@@ -1018,105 +762,6 @@ def create_sse2ws_handler(service, store):
                         code="unsupported_websocket_event",
                     ))
                     continue
-
-                if try_native_upstream:
-                    try:
-                        native_body = await _dlp_body(
-                            (message.get("text") or "").encode("utf-8"),
-                        )
-                        native_payload = json.loads(native_body)
-                    except BridgeError as exc:
-                        await _send_error(websocket, exc)
-                        continue
-                    model = parse_request_model(native_body, remaining)
-                    session_id = parse_request_session_id(native_body)
-                    model_scope = classify_model_scope(model, "responses")
-                    if settings.proxy_api_key and pool_credential_ok and base_pool is None:
-                        await _send_error(websocket, BridgeError(
-                            "Key pool is unavailable for this upstream", status=503,
-                            code="key_pool_unavailable",
-                        ))
-                        continue
-                    pool_access = bool(base_pool and pool_credential_ok)
-                    request_pool = base_pool.for_request(
-                        model, remaining, "responses", model_scope,
-                    ) if pool_access else None
-                    if pool_access and request_pool is None:
-                        await _send_error(websocket, BridgeError(
-                            "No compatible key pool route for this endpoint and model",
-                            status=403, code="key_pool_no_compatible_route",
-                        ))
-                        continue
-                    native_headers = _native_websocket_headers(
-                        websocket.headers, remaining, model,
-                    )
-                    native_metrics = TurnMetrics()
-                    ip_token = set_client_ip(client_ip)
-                    try:
-                        native_upstream = await _open_native_websocket(
-                            url, native_headers, request_pool, session_id, native_metrics,
-                        )
-                    except NativeWebSocketUnsupported as exc:
-                        if settings.sse2ws_upstream_transport == "websocket":
-                            error = BridgeError(
-                                "upstream does not support Responses WebSocket",
-                                status=exc.status, code="upstream_websocket_unsupported",
-                            )
-                            await _write_turn_log(
-                                store, path, provider, model, upstream, request_pool,
-                                client_ip, native_metrics, exc.status, error.code, False,
-                                "websocket",
-                            )
-                            logger.warning(
-                                f"{_tag('WS→WS', path, provider, model, client_ip)}"
-                                f"{_key_tag(native_metrics)} 上游不支持原生WebSocket "
-                                f"HTTP={exc.status}"
-                            )
-                            await _send_error(websocket, error)
-                            await websocket.close(code=1011, reason=error.code)
-                            return
-                        logger.info(
-                            f"{_tag('WS→WS', path, provider, model, client_ip)}"
-                            f"{_key_tag(native_metrics)} 上游不支持原生WebSocket "
-                            f"HTTP={exc.status}，回退SSE2WS"
-                        )
-                        # Keep transport stable for the lifetime of this
-                        # downstream WS. A fresh client connection probes again.
-                        try_native_upstream = False
-                    except BridgeError as exc:
-                        await _write_turn_log(
-                            store, path, provider, model, upstream, request_pool,
-                            client_ip, native_metrics, exc.status, exc.code, False,
-                            "websocket",
-                        )
-                        logger.warning(
-                            f"{_tag('WS→WS', path, provider, model, client_ip)}"
-                            f"{_key_tag(native_metrics)} Responses WS连接失败 "
-                            f"status={exc.code} HTTP={exc.status} "
-                            f"总{time.time() - native_metrics.started_at:.2f}s"
-                        )
-                        try:
-                            await _send_error(websocket, exc)
-                            await websocket.close(code=1011, reason=exc.code[:123])
-                        except (RuntimeError, WebSocketDisconnect):
-                            pass
-                        return
-                    else:
-                        first_message = {
-                            "type": message.get("type"),
-                            "text": json.dumps(
-                                native_payload, ensure_ascii=False, separators=(",", ":"),
-                            ),
-                        }
-                        await _relay_native_websocket(
-                            websocket, native_upstream, first_message, store, path,
-                            provider, upstream, request_pool, client_ip, model,
-                            session_id, native_metrics,
-                        )
-                        return
-                    finally:
-                        reset_client_ip(ip_token)
-                    payload = native_payload
 
                 try:
                     merged_input = transcript.merge(payload)
