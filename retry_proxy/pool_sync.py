@@ -1156,9 +1156,7 @@ class PoolSyncManager:
                        if (entry.group_id or entry.key) == str(group_id)] if pool else []
             if not entries:
                 raise PoolSyncError("分组不存在或尚未加载")
-            for entry in entries:
-                pool.mark_success(entry)
-            pool.reset_cache_circuit(str(group_id))
+            pool.reset_circuit(group_id=str(group_id))
             logger.info(
                 f"号池分组已手动解除熔断: upstream={source['base_url']} group={group_id}"
             )
@@ -1172,9 +1170,7 @@ class PoolSyncManager:
             pool = self.pools.get(self._pool_url(source))
             if pool is None:
                 raise PoolSyncError("号池尚未加载")
-            for entry in pool.entries:
-                pool.mark_success(entry)
-            pool.reset_cache_circuit()
+            pool.reset_circuit()
             logger.info(f"号池全部分组已手动解除熔断: upstream={source['base_url']}")
             return self.status()
 
@@ -1191,7 +1187,7 @@ class PoolSyncManager:
             runtime = next((entry for entry in pool.entries if entry.key == item.get("key")), None) if pool else None
             if runtime is None:
                 raise PoolSyncError("Key 尚未加载到运行时号池")
-            pool.mark_success(runtime)
+            pool.reset_circuit(entry_key=runtime.key)
             logger.info(
                 f"号池 Key 已手动解除熔断: upstream={source['base_url']} "
                 f"key={runtime.key_id}"

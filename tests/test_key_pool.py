@@ -70,6 +70,58 @@ class KeyPoolStickyTests(unittest.TestCase):
         self.assertEqual(pool.entries[0].last_failure_kind, "")
         self.assertFalse(pool._cache_metrics)
 
+    def test_manual_circuit_reset_clears_cached_view_failover_and_sticky_state(self):
+        pool = KeyPool([])
+        pool.entries = [
+            KeyEntry("cheap", "cheap", sort="0.02", group_id="cheap"),
+            KeyEntry("premium", "premium", sort="1", group_id="premium"),
+        ]
+        pool.finalize_entries()
+        view = pool.for_request("gpt-test", "v1/responses", "responses", "")
+        view.session_affinity = True
+        cheap, premium = pool.entries
+        future = 10**12
+        cheap.cooldown_until = future
+        cheap.consecutive_failures = 2
+        cheap.last_failure_kind = "upstream"
+        cheap.last_failure_status = 503
+        view._current = premium
+        view._sticky_until = future
+        view._failover_floor = view._sort_value(premium)
+        view._session_routes["session-1"] = {
+            "current": premium,
+            "sticky_until": future,
+            "failover_floor": view._sort_value(premium),
+            "last_used": 1,
+        }
+
+        reset = pool.reset_circuit(group_id="cheap")
+
+        self.assertEqual(reset, [cheap])
+        self.assertEqual(cheap.cooldown_until, 0)
+        self.assertEqual(cheap.consecutive_failures, 0)
+        self.assertEqual(cheap.last_failure_kind, "")
+        self.assertIsNone(view._failover_floor)
+        self.assertEqual(view._sticky_until, 0)
+        self.assertFalse(view._session_routes)
+        self.assertIs(view.pick(session_id="session-1"), cheap)
+
+    def test_resetting_all_circuits_does_not_pin_highest_multiplier(self):
+        pool = KeyPool([])
+        pool.entries = [
+            KeyEntry("cheap", "cheap", sort="0.02", group_id="cheap"),
+            KeyEntry("premium", "premium", sort="1", group_id="premium"),
+        ]
+        pool.finalize_entries()
+        pool._current = pool.entries[1]
+        pool._sticky_until = 10**12
+        for entry in pool.entries:
+            entry.cooldown_until = 10**12
+
+        pool.reset_circuit()
+
+        self.assertIs(pool.pick(), pool.entries[0])
+
     def test_cache_miss_ignores_short_inputs_and_never_cools_only_group(self):
         pool = KeyPool([])
         pool.entries = [KeyEntry("only", "only", group_id="only")]

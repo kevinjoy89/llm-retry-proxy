@@ -690,6 +690,47 @@ class KeyPool:
                     if key[0] == group_key:
                         target._cache_metrics.pop(key, None)
 
+    def reset_circuit(self, group_id=None, entry_key=None):
+        """Clear manual circuit state in the base pool and cached request views."""
+        group_key = str(group_id) if group_id is not None else None
+        selected = [
+            entry for entry in self.entries
+            if (group_key is None or self._group_key(entry) == group_key)
+            and (entry_key is None or entry.key == entry_key)
+        ]
+        for entry in selected:
+            entry.cooldown_until = 0.0
+            entry.consecutive_failures = 0
+            entry.last_failure_kind = ""
+            entry.last_failure_status = None
+            entry.last_cooldown_s = 0.0
+
+        reset_groups = {self._group_key(entry) for entry in selected}
+        reset_all = group_id is None and entry_key is None
+        targets = [self, *self._views.values()]
+        for target in targets:
+            if not reset_all and not any(entry in target.entries for entry in selected):
+                continue
+            target._sticky_until = 0.0
+            target._failover_floor = None
+            target._session_routes.clear()
+            if group_key is None or target._active_probe_group in reset_groups:
+                target._active_probe_group = None
+                target._probe_reserved_until = 0.0
+            if group_key is None or reset_groups:
+                target._next_probe_at = 0.0
+            for key in reset_groups:
+                metric = target._metrics.get(key)
+                if metric is not None:
+                    metric["next_probe_at"] = 0.0
+                    metric["probe_reserved_until"] = 0.0
+        if reset_all:
+            self.reset_cache_circuit()
+        else:
+            for key in reset_groups:
+                self.reset_cache_circuit(key)
+        return selected
+
     def scheduler_status(self, now=None):
         now = time.time() if now is None else now
         stale_after = max(float(self._setting("key_ttft_stale_after", 300)), 0.0)
