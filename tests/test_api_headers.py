@@ -76,6 +76,28 @@ class RequestIpTests(unittest.TestCase):
 
         self.assertEqual(client_ip, "2001:db8::20")
 
+    def test_docker_proxy_network_can_be_trusted_by_cidr(self):
+        request = self._request(
+            {"x-forwarded-for": "203.0.113.7, 172.20.0.2"}, "172.20.0.3",
+        )
+        config = SimpleNamespace(trusted_proxies=frozenset({"172.20.0.0/16"}))
+
+        with patch("retry_proxy.api.settings", config):
+            client_ip = _request_ip(request)
+
+        self.assertEqual(client_ip, "203.0.113.7")
+
+    def test_untrusted_docker_network_cannot_supply_forwarded_ip(self):
+        request = self._request(
+            {"x-forwarded-for": "203.0.113.7"}, "172.21.0.3",
+        )
+        config = SimpleNamespace(trusted_proxies=frozenset({"172.20.0.0/16"}))
+
+        with patch("retry_proxy.api.settings", config):
+            client_ip = _request_ip(request)
+
+        self.assertEqual(client_ip, "172.21.0.3")
+
 
 if __name__ == "__main__":
     unittest.main()

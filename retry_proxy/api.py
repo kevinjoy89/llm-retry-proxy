@@ -332,16 +332,21 @@ def _cumulative(summary):
 def _request_ip(request):
     direct = request.client.host if request.client else ""
     try:
-        direct_ip = str(ipaddress.ip_address(direct))
+        direct_ip = ipaddress.ip_address(direct)
     except ValueError:
         return direct
-    trusted = set()
+
+    trusted = []
     for value in getattr(settings, "trusted_proxies", frozenset()):
         try:
-            trusted.add(str(ipaddress.ip_address(value)))
+            trusted.append(ipaddress.ip_network(value, strict=False))
         except ValueError:
             continue
-    if direct_ip not in trusted:
+
+    def is_trusted(address):
+        return any(address in network for network in trusted)
+
+    if not is_trusted(direct_ip):
         return direct
 
     # Walk X-Forwarded-For from the trusted peer towards the client. Proxies
@@ -352,14 +357,14 @@ def _request_ip(request):
     for value in forwarded.split(","):
         value = value.strip()
         try:
-            chain.append(str(ipaddress.ip_address(value)))
+            chain.append(ipaddress.ip_address(value))
         except ValueError:
             continue
     for value in reversed(chain):
-        if value not in trusted:
-            return value
+        if not is_trusted(value):
+            return str(value)
     if chain:
-        return chain[0]
+        return str(chain[0])
 
     for header in ("cf-connecting-ip", "x-real-ip"):
         value = request.headers.get(header, "").strip()
@@ -367,7 +372,7 @@ def _request_ip(request):
             return str(ipaddress.ip_address(value))
         except ValueError:
             continue
-    return direct_ip
+    return str(direct_ip)
 
 
 def _key_pool_secrets():
