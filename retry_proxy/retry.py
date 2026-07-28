@@ -18,6 +18,7 @@ _spawned_tasks = contextvars.ContextVar("spawned_tasks", default=None)
 _request_progress = contextvars.ContextVar("request_progress", default=None)
 _request_max_attempts = contextvars.ContextVar("request_max_attempts", default=None)
 _request_attempt_budget = contextvars.ContextVar("request_attempt_budget", default=None)
+_request_log_method = contextvars.ContextVar("request_log_method", default="")
 
 
 class KeyPoolWaitTimeout(Exception):
@@ -227,6 +228,7 @@ async def _sleep_before_retry(wait, pool=None, pool_wait=0.0, wait_timeout=None)
 
 
 def _tag(method, path, provider, model, client_ip=""):
+    method = _request_log_method.get() or method
     name = f"{provider}/{model}" if model else (provider or "?")
     ip = client_ip or _client_ip.get()
     ip_tag = f"[{ip}] " if ip else ""
@@ -244,6 +246,8 @@ def _sc(status):
 def _response_status_log(status, path, body):
     value = f"-> {_sc(status)}"
     if status < 400 and _is_responses_path(path) and _is_streaming_request(body):
+        if _request_log_method.get() == "WS→SSE":
+            return value + " 上游SSE响应头已建立，等待首事件"
         return value + " 响应头已建立，等待Responses流结束"
     return value
 
@@ -524,11 +528,12 @@ class RetryProxy:
 
     async def request(self, method, url, headers, body, path, provider, model, pool=None,
                       session_id="", defer_stream_success=False, max_attempts=None,
-                      attempt_budget=None):
+                      attempt_budget=None, log_method=""):
         start = time.time()
-        self.logger.debug(f"{_tag(method, path, provider, model)} 开始转发")
         spawned = set()
         progress = {"sent": 0}
+        log_method_token = _request_log_method.set(log_method)
+        self.logger.debug(f"{_tag(method, path, provider, model)} 开始转发")
         spawned_token = _spawned_tasks.set(spawned)
         progress_token = _request_progress.set(progress)
         max_attempts_token = _request_max_attempts.set(max_attempts)
@@ -569,6 +574,7 @@ class RetryProxy:
             _request_max_attempts.reset(max_attempts_token)
             _request_progress.reset(progress_token)
             _spawned_tasks.reset(spawned_token)
+            _request_log_method.reset(log_method_token)
 
     async def _request(self, method, url, headers, body, path, provider, model, pool, start,
                        session_id="", defer_stream_success=False):

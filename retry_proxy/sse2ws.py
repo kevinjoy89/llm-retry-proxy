@@ -342,6 +342,7 @@ async def _prime(service, method, url, headers, body, path, provider, model, poo
             defer_stream_success=True,
             max_attempts=max_attempts,
             attempt_budget=attempt_budget,
+            log_method="WS→SSE",
         )
         if attempt_budget is not None:
             reported = max(int(getattr(result, "total_sent", 0) or 0), 0)
