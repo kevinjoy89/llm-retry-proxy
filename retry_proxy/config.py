@@ -205,6 +205,11 @@ class Settings:
     dlp_known_secret_min_length: int = int(os.getenv("DLP_KNOWN_SECRET_MIN_LENGTH", "8"))
     dlp_fail_closed: bool = _bool("DLP_FAIL_CLOSED", "false")
 
+    # Token 统计：对 OpenAI Chat 流式请求且未带 stream_options 的，自动注入
+    # stream_options={"include_usage":true} 以确保末帧返回 usage。关闭则保持
+    # 请求体原样透传，stream 场景的 token 统计可能缺失。默认关闭以保持透明代理。
+    token_stats_inject_usage: bool = _bool("TOKEN_STATS_INJECT_USAGE", "false")
+
     @property
     def stats_html_path(self):
         return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "stats.html")

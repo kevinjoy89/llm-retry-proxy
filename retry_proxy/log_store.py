@@ -24,6 +24,8 @@ class RetryLogStore:
     def _new_summary(self):
         return {"version": 7, "total_requests": 0, "total_retries": 0, "total_succeeded": 0,
                 "total_failed": 0, "total_cancelled": 0, "total_first_ok": 0,
+                "total_prompt_tokens": 0, "total_completion_tokens": 0, "total_tokens": 0,
+                "total_cached_tokens": 0,
                 "by_provider": {}, "by_model": {},
                 "by_key": {}, "by_status": {}, "first_ts": None, "last_ts": None,
                 "log_offsets": {}}
@@ -31,6 +33,14 @@ class RetryLogStore:
     def _update(self, summary, r):
         summary["total_requests"] += 1
         summary["total_retries"] += r.get("retries", 0)
+        prompt_tokens = r.get("prompt_tokens", 0) or 0
+        completion_tokens = r.get("completion_tokens", 0) or 0
+        total_tokens = r.get("total_tokens", 0) or 0
+        cached_tokens = r.get("cached_tokens", 0) or 0
+        summary["total_prompt_tokens"] += prompt_tokens
+        summary["total_completion_tokens"] += completion_tokens
+        summary["total_tokens"] += total_tokens
+        summary["total_cached_tokens"] += cached_tokens
         if _req_cancelled(r):
             summary["total_cancelled"] += 1
         elif _req_succeeded(r):
@@ -46,8 +56,14 @@ class RetryLogStore:
             b = summary[field].setdefault(key, {
                 "requests": 0, "retries": 0, "succeeded": 0, "first_ok": 0,
                 "failed": 0, "cancelled": 0, "max_retries": 0,
+                "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                "cached_tokens": 0,
             })
             b["requests"] += 1; b["retries"] += r.get("retries", 0)
+            b["prompt_tokens"] += prompt_tokens
+            b["completion_tokens"] += completion_tokens
+            b["total_tokens"] += total_tokens
+            b["cached_tokens"] += cached_tokens
             if _req_cancelled(r):
                 b["cancelled"] += 1
             elif _req_succeeded(r):
@@ -230,8 +246,18 @@ class RetryLogStore:
             self.summary_cache["log_offsets"] = self._legacy_log_offsets()
         self.summary_cache["version"] = 7
         for key in ("total_requests", "total_retries", "total_succeeded", "total_failed",
-                    "total_cancelled", "total_first_ok"): self.summary_cache.setdefault(key, 0)
+                    "total_cancelled", "total_first_ok",
+                    "total_prompt_tokens", "total_completion_tokens", "total_tokens",
+                    "total_cached_tokens"): self.summary_cache.setdefault(key, 0)
         for key in ("by_provider", "by_model", "by_key", "by_status"): self.summary_cache.setdefault(key, {})
+        # Backfill token fields on legacy per-bucket entries that predate version 6.
+        for field in ("by_provider", "by_model", "by_key"):
+            for bucket in self.summary_cache.get(field, {}).values():
+                if isinstance(bucket, dict):
+                    bucket.setdefault("prompt_tokens", 0)
+                    bucket.setdefault("completion_tokens", 0)
+                    bucket.setdefault("total_tokens", 0)
+                    bucket.setdefault("cached_tokens", 0)
         self.summary_cache.setdefault("first_ts", None); self.summary_cache.setdefault("last_ts", None)
         recovered = self._recover_summary_tail()
         self._cleanup()

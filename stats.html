@@ -76,6 +76,8 @@
   .stat-card .label{font-size:12px;color:var(--muted);margin-bottom:8px;font-weight:500;display:flex;align-items:center;gap:6px}
   .stat-card .label .ico{width:14px;height:14px;border-radius:4px;display:inline-flex;align-items:center;justify-content:center;font-size:9px}
   .stat-card .value{font-size:28px;font-weight:800;line-height:1.1;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+  .stat-card .value .token-unit{font-family:inherit;font-size:12px;color:var(--muted);font-weight:500;font-style:normal;letter-spacing:0}
+  .cache-value{white-space:nowrap}
   .stat-card .hint{font-size:11px;color:var(--muted-2);margin-top:5px;font-weight:500}
 
   .hero-overview .stat-card::before{opacity:1}
@@ -104,7 +106,7 @@
   .rate-pop .rate-plan-field.disabled{opacity:.35;pointer-events:none}
 
   .mini-cards{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:14px}
-  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}
   .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
   .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow);transition:box-shadow .2s}
   .card:hover{box-shadow:var(--shadow-md)}
@@ -119,6 +121,7 @@
   tbody tr{transition:background .12s}
   tbody tr:hover{background:var(--primary-l)}
   td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+  td.num{white-space:nowrap}
   tbody tr:last-child td{border-bottom:none}
 
   .pill{display:inline-flex;align-items:center;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600;letter-spacing:.01em}
@@ -164,8 +167,9 @@
   .section-wrap{animation:fadeIn .3s ease}
   @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
 
-  .scroll-table{max-height:400px;overflow:auto;border-radius:var(--radius-xs)}
+  .scroll-table{max-height:400px;overflow:auto;border-radius:var(--radius-xs);min-width:0}
   .scroll-table table{min-width:680px}
+  .rate-sub{font-size:11px;color:var(--muted);font-weight:400;line-height:1.3}
   .table-note{margin:-8px 0 12px;color:var(--muted);font-size:11px}
   .key-pool-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(560px,1fr));gap:14px;margin-top:14px}
   .kp-card{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow-xs);overflow:hidden;border:1px solid var(--border)}
@@ -302,6 +306,8 @@
       <div class="stat-card"><div class="label">下游可用率</div><div class="value" id="s_avail">-</div><div class="hint" id="s_avail_hint"></div><div class="cum-sub"><span class="prefix">累计</span><span id="c_avail_sub">-</span></div></div>
       <div class="stat-card"><div class="label">失败请求</div><div class="value" id="s_fail">-</div><div class="cum-sub"><span class="prefix">累计</span><span id="c_fail_sub">-</span></div></div>
       <div class="stat-card"><div class="label">P95 耗时</div><div class="value" id="s_p95">-</div><div class="hint">秒</div><div class="cum-sub"><span class="prefix">区间</span><span id="c_span_sub">-</span></div></div>
+      <div class="stat-card"><div class="label">Token 用量</div><div class="value" id="s_tokens">-</div><div class="hint" id="s_tokens_hint">区间合计</div><div class="cum-sub"><span class="prefix">累计</span><span id="c_tokens_sub">-</span></div></div>
+      <div class="stat-card"><div class="label">缓存命中</div><div class="value" id="s_cached">-</div><div class="hint" id="s_cached_hint">区间合计</div><div class="cum-sub"><span class="prefix">累计</span><span id="c_cached_sub">-</span></div></div>
     </div>
   </div>
 
@@ -315,7 +321,7 @@
     <div class="grid2" style="margin-bottom:14px;margin-top:14px">
       <div class="card" style="display:flex;flex-direction:column"><h2>累计状态码分布</h2><div id="cumStatusChart" style="flex:1;min-height:240px"></div></div>
       <div class="card" style="display:flex;flex-direction:column"><h2>累计各模型</h2>
-        <div class="scroll-table" style="flex:1;max-height:340px"><table><thead><tr><th>模型</th><th class="num">请求</th><th class="num">重试</th><th class="num">平均</th><th class="num">上游可用率</th><th class="num">下游可用率</th><th class="num">最大</th></tr></thead><tbody id="cumModelTbody"></tbody></table></div>
+        <div class="scroll-table" style="flex:1;max-height:340px"><table><thead><tr><th>模型</th><th class="num">请求</th><th class="num">重试</th><th class="num">平均</th><th class="num">上游可用率</th><th class="num">下游可用率</th><th class="num">Token</th><th class="num">缓存</th><th class="num">最大</th></tr></thead><tbody id="cumModelTbody"></tbody></table></div>
       </div>
     </div>
   </div>
@@ -395,10 +401,10 @@
     <div class="sec-title" id="details">明细</div>
     <div class="grid2">
       <div class="card"><h2>按供应商</h2>
-        <div class="scroll-table"><table><thead><tr><th>供应商</th><th class="num">请求</th><th class="num">重试</th><th class="num">平均</th><th class="num">最大</th><th class="num">上游可用率</th><th class="num">下游可用率</th><th class="num">P95(s)</th><th>主失败码</th></tr></thead><tbody id="providerTbody"></tbody></table></div>
+        <div class="scroll-table"><table><thead><tr><th>供应商</th><th class="num">请求</th><th class="num">重试</th><th class="num">平均</th><th class="num">最大</th><th class="num">上游可用率</th><th class="num">下游可用率</th><th class="num">Token</th><th class="num">缓存</th><th class="num">P95(s)</th><th>主失败码</th></tr></thead><tbody id="providerTbody"></tbody></table></div>
       </div>
       <div class="card"><h2>按模型</h2>
-        <div class="scroll-table"><table><thead><tr><th>模型</th><th class="num">请求</th><th class="num">重试</th><th class="num">平均</th><th class="num">最大</th><th class="num">上游可用率</th><th class="num">下游可用率</th><th class="num">P95(s)</th><th>主失败码</th></tr></thead><tbody id="modelTbody"></tbody></table></div>
+        <div class="scroll-table"><table><thead><tr><th>模型</th><th class="num">请求</th><th class="num">重试</th><th class="num">平均</th><th class="num">最大</th><th class="num">上游可用率</th><th class="num">下游可用率</th><th class="num">Token</th><th class="num">缓存</th><th class="num">P95(s)</th><th>主失败码</th></tr></thead><tbody id="modelTbody"></tbody></table></div>
       </div>
     </div>
     <div class="card" style="margin-top:14px"><h2>按路径 Top 10（按重试数）</h2>
@@ -453,6 +459,9 @@ function ratePill(r){const c=r>=0.95?'ok':r>=0.8?'warn':'danger';return `<span c
 function pctPill(p){const c=p>=95?'ok':p>=80?'warn':'danger';return `<span class="pill ${c}">${p.toFixed(1)}%</span>`}
 function statusTag(s,cat){return `<span class="tag" style="background:${CATCOL[cat]||COL.gray}1a;color:${CATCOL[cat]||COL.gray}">${s===0?'异常':s}</span>`}
 function esc(s){return String(s||'').replace(/[<>&"']/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]))}
+function fmtTok(n){const v=Number(n||0);if(v>=1e8)return(v/1e8).toFixed(2)+'<span class="token-unit">亿</span>';if(v>=1e4)return(v/1e4).toFixed(2)+'<span class="token-unit">万</span>';return v.toLocaleString()}
+function fmtTokFull(n){return Number(n||0).toLocaleString()}
+function cachedCell(cached,prompt){const c=Number(cached||0);if(!c)return '-';const pct=prompt>0?(c/prompt*100).toFixed(1)+'%':'';return `<span class="cache-value" title="${fmtTokFull(cached)}">${fmtTok(c)}${pct?`(${pct})`:''}</span>`}
 function fmtTs(ts){
   if(currentRange==='today')return ts.slice(11,16);
   if(currentRange==='7d'||currentRange==='30d')return ts.slice(5,13).replace('T',' ');
@@ -471,6 +480,12 @@ function renderOverview(s,d,c,rc){
   document.getElementById('s_avail_hint').textContent=`上游 ${ua.toFixed(1)}% · ${s.failed_requests} 次失败${cancelled?` · ${cancelled} 次客户端取消`:''}`;
   document.getElementById('s_fail').textContent=s.failed_requests;
   document.getElementById('s_p95').textContent=d.p95;
+  const st=document.getElementById('s_tokens');st.innerHTML=fmtTok(s.total_tokens);st.title=fmtTokFull(s.total_tokens);
+  const sth=document.getElementById('s_tokens_hint');
+  sth.innerHTML=`输入 ${fmtTok(s.total_prompt_tokens)} · 输出 ${fmtTok(s.total_completion_tokens)}`;
+  sth.title=`输入 ${fmtTokFull(s.total_prompt_tokens)} · 输出 ${fmtTokFull(s.total_completion_tokens)}`;
+  const sc=document.getElementById('s_cached');sc.innerHTML=fmtTok(s.total_cached_tokens);sc.title=fmtTokFull(s.total_cached_tokens);
+  document.getElementById('s_cached_hint').textContent=s.total_prompt_tokens?'命中率 '+(s.total_cached_tokens/s.total_prompt_tokens*100).toFixed(1)+'%':'区间合计';
   if(c){
     document.getElementById('c_total_sub').textContent=c.total_requests;
     document.getElementById('c_retries_sub').textContent=c.total_retries;
@@ -478,6 +493,8 @@ function renderOverview(s,d,c,rc){
     document.getElementById('c_upstream_sub').textContent=cua.toFixed(1)+'%';
     document.getElementById('c_avail_sub').textContent=c.availability_pct.toFixed(1)+'%';
     document.getElementById('c_fail_sub').textContent=c.failed;
+    const cts=document.getElementById('c_tokens_sub');cts.innerHTML=fmtTok(c.total_tokens);cts.title=fmtTokFull(c.total_tokens);
+    const ccs=document.getElementById('c_cached_sub');ccs.innerHTML=fmtTok(c.total_cached_tokens);ccs.title=fmtTokFull(c.total_cached_tokens);
     const span=c.first_ts&&c.last_ts?c.first_ts.slice(5,10)+' ~ '+c.last_ts.slice(5,10):'-';
     document.getElementById('c_span_sub').textContent=span;
     const rateEl=document.getElementById('s_rate');
@@ -637,6 +654,8 @@ function renderAggTable(id,data,key){
     <td class="num"><span class="badge">${d.max_retries}</span></td>
     <td class="num">${pctPill(d.upstream_availability_pct)}</td>
     <td class="num">${pctPill(d.availability_pct)}</td>
+    <td class="num" title="${fmtTokFull(d.total_tokens)}">${fmtTok(d.total_tokens)}</td>
+    <td class="num">${cachedCell(d.cached_tokens,d.prompt_tokens)}</td>
     <td class="num">${d.p95_duration}</td>
     <td>${d.dominant_fail_status!==null?`<span class="tag" style="background:${CATCOL[d.dominant_fail_status>=500?'5xx':d.dominant_fail_status>=400?'4xx':'2xx']}1a;color:${CATCOL[d.dominant_fail_status>=500?'5xx':d.dominant_fail_status>=400?'4xx':'2xx']}">${d.dominant_fail_status===0?'异常':d.dominant_fail_status}×${d.fail_status_count}</span>`:'-'}</td>
   </tr>`).join('');
@@ -830,7 +849,7 @@ function statusColorStr(s){s=parseInt(s);return s===0?COL.gray:s<300?COL.ok:s<40
 function renderCumulative(c){
   const cc=C('cumStatusChart');
   if(cc){if(c.by_status&&c.by_status.length){cc.setOption({tooltip:{trigger:'item',formatter:'{b}: {c} ({d}%)',backgroundColor:'rgba(15,23,42,.92)',borderColor:'transparent',textStyle:{color:'#fff',fontSize:12}},legend:{bottom:0,type:'scroll',textStyle:{fontSize:11,color:'#6b7280'},itemWidth:10,itemHeight:10,itemGap:12},series:[{type:'pie',radius:['38%','62%'],center:['50%','44%'],data:c.by_status.map(d=>({name:d.status==='0'?'异常':d.status,value:d.count,itemStyle:{color:statusColorStr(d.status),borderColor:'#fff',borderWidth:2}})),label:{formatter:'{b}\n{d}%',fontSize:11,color:'#334155'},emphasis:{scaleSize:6}}]});}else{cc.setOption({title:{text:'无数据',left:'center',top:'center',textStyle:{color:'#9ca3af',fontSize:13}}})}}
-  document.getElementById('cumModelTbody').innerHTML=(c.by_model||[]).map(m=>`<tr><td class="mono">${esc(m.name)}</td><td class="num">${m.requests}</td><td class="num">${m.retries}</td><td class="num">${m.avg_retries}</td><td class="num">${pctPill(m.upstream_availability_pct||0)}</td><td class="num">${pctPill(m.availability_pct)}</td><td class="num"><span class="badge">${m.max_retries}</span></td></tr>`).join('');
+  document.getElementById('cumModelTbody').innerHTML=(c.by_model||[]).map(m=>`<tr><td class="mono">${esc(m.name)}</td><td class="num">${m.requests}</td><td class="num">${m.retries}</td><td class="num">${m.avg_retries}</td><td class="num">${pctPill(m.upstream_availability_pct||0)}</td><td class="num">${pctPill(m.availability_pct)}</td><td class="num" title="${fmtTokFull(m.total_tokens)}">${fmtTok(m.total_tokens)}</td><td class="num">${cachedCell(m.cached_tokens,m.prompt_tokens)}</td><td class="num"><span class="badge">${m.max_retries}</span></td></tr>`).join('');
 }
 
 async function load(){

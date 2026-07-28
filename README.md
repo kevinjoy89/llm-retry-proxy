@@ -25,7 +25,7 @@
 - 默认有最大重试次数保护，可设置为无限重试
 - 响应头附带 `X-Forward-Attempts`，告知客户端本次请求尝试次数
 - 可选竞速模式、多上游路由和号池多 key 降级
-- 按天 JSONL 明细日志、累计汇总和内置可视化分析面板
+- 按天 JSONL 明细日志、Token/缓存累计汇总和内置可视化分析面板
 
 ## 快速开始
 
@@ -96,6 +96,7 @@ docker compose up -d --build
 | `KEY_POOL_FILE` | 空 | CSV 号池文件；优先于 `KEY_POOLS` |
 | `ADMIN_PASSWORD` | 空 | `/stats`、`/logs` 和号池管理页的密码 |
 | `LOG_DIR` | `logs` | 日志目录 |
+| `TOKEN_STATS_INJECT_USAGE` | `false` | 是否为 OpenAI Chat 流式请求注入 usage 选项 |
 
 完整配置表和默认值见[配置项](docs/configuration.md)。
 

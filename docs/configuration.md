@@ -121,6 +121,16 @@
 | `IMAGE_UPSTREAM_USER_AGENT` | 空 | 图片请求转发时覆盖上游 User-Agent |
 | `IMAGE_UPSTREAM_ORIGINATOR` | 空 | 图片请求转发时覆盖上游 Originator |
 
+## Token 统计
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `TOKEN_STATS_INJECT_USAGE` | `false` | 开启后，为未显式设置 `stream_options.include_usage` 的 OpenAI Chat 流式请求注入该选项；默认关闭以保持请求体透明透传，不支持 `stream_options` 的兼容上游应保持关闭 |
+
+代理会从 OpenAI Chat/Embeddings/Responses、Anthropic Messages 和 Gemini
+响应中提取输入、输出、总量及缓存读取 token。非流式响应直接读取 JSON；SSE
+响应在流结束后写入日志。上游未返回 usage 时，对应日志不写 token 字段。
+
 ## 日志
 
 | 变量 | 默认值 | 说明 |

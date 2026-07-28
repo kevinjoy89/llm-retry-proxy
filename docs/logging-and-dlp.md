@@ -70,9 +70,13 @@ python -m retry_proxy.dlp validate
 | `attempts` | 总尝试次数（含首次） |
 | `retries` | 重试次数 = `attempts - 1` |
 | `duration_s` | 总耗时（秒） |
-| `succeeded` | 请求是否完整成功。普通请求按 `final_status < 400` 判断；流式 Responses 请求还必须收到 `response.completed` 或 `response.incomplete` 终止事件。客户端取消时该字段仍为 `false`，但统计聚合会把它作为中性结果，不计入失败数和可用率分母 |
-| `stream_status` | 流式 Responses 请求的可选结果：`completed`、`incomplete`、`error`、`missing_terminal`、`invalid_content_type`、`transport_error` 或 `cancelled`。`cancelled` 表示下游客户端在终止事件前结束连接，不代表上游或客户端工具执行失败，也不会熔断对应 key |
+| `succeeded` | 请求是否完整成功。普通响应要求 `final_status < 400` 且响应体传输完整；流式 Responses 请求还必须收到 `response.completed` 或 `response.incomplete` 终止事件。客户端取消时该字段仍为 `false`，但统计聚合会把它作为中性结果，不计入失败数和可用率分母 |
+| `stream_status` | 可选流结果。Responses 流可能为 `completed`、`incomplete`、`error`、`missing_terminal`、`invalid_content_type`、`transport_error` 或 `cancelled`；其它响应在传输异常或客户端取消时分别记录 `transport_error`、`cancelled` |
 | `stream_error_status` | 流内错误事件或错误页面中识别出的可选 HTTP 状态码，例如 `502`；外层 HTTP 状态仍由 `upstream_status` / `final_status` 如实记录 |
+| `prompt_tokens` | 输入 token 总量；Anthropic 口径包含普通输入、缓存创建和缓存读取 |
+| `completion_tokens` | 输出 token 总量 |
+| `total_tokens` | 上游报告的总 token；上游省略时由输入与输出相加 |
+| `cached_tokens` | 输入中由缓存读取的 token；上游未提供缓存明细时为 `0` 或不写入 |
 | `retry_codes` | 重试过程中上游返回的错误码列表，如 `[503, 503, 429]`。无重试时为空数组 `[]` |
 | `key_id` | 号池模式下使用的 key 标识。配置 `sort` 时为 `label|sort`，否则为 `label`；未设 label 时使用 key 前 8 字符 |
 | `key_pool` | 号池模式下实际使用的号池标识（当前为对应上游 URL），未启用号池时为空字符串 |
