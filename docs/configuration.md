@@ -9,6 +9,8 @@
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `TZ` | `Asia/Shanghai` | 容器时区，影响日志时间 |
+| `DOCKER_REGISTRY` | `docker.io` | Docker 仓库域名；国内可改为镜像站域名，如 `docker.m.daocloud.io` |
+| `PYTHON_BASE_IMAGE` | `library/python:3.12-slim` | 基础镜像命名空间/镜像名:tag，与 `DOCKER_REGISTRY` 拼接为完整引用 |
 | `PIP_INDEX_URL` | 清华 PyPI 镜像 | Docker 构建使用的 Python 包索引 |
 
 ## 服务与访问控制
@@ -161,5 +163,7 @@
 ## Docker 部署补充
 
 `compose.yaml` 会将 `LOG_DIR` 映射到宿主机的 `./logs`，并在未设置 `KEY_POOL_FILE` 时将其默认指向容器内的 `/app/key_pool.csv`。部署前请准备 `.env`；需要静态号池时复制 `key_pool.csv.example` 为 `key_pool.csv`。
+
+`.env.example` 已为 `DOCKER_REGISTRY` 预置国内镜像站域名(实测可用)，复制后即可在无代理环境构建。`DOCKER_REGISTRY` 与 `PYTHON_BASE_IMAGE` 共同组成完整镜像地址, 不配置时默认为官方镜像地址。
 
 号池、在线同步调度和熔断状态是进程内状态，生产部署必须保持单 Uvicorn worker、单容器副本。当前不支持通过多 worker 或多副本横向扩容；多个进程会各自持有不同的号池，并竞争写入同步状态文件。
