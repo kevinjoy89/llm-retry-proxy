@@ -20,10 +20,7 @@
 | `ADMIN_PASSWORD` | 空 | 管理页面密码；未配置时 `/stats*`、`/logs*` 和 `/key-pools` 禁用。兼容旧 `ADMIN_TOKEN` |
 | `ADMIN_COOKIE_SECURE` | `false` | HTTPS 部署时设为 `true`，限制登录 Cookie 仅通过 HTTPS 发送 |
 | `PROXY_API_KEY` | 空 | 下游使用号池的凭据；未携带或不匹配时仅作普通透传 |
-| `TRUSTED_PROXIES` | 空 | 信任的反向代理 IP 或 CIDR 网段（逗号分隔）；仅这些地址的请求才采用转发头，并从 `X-Forwarded-For` 右侧跳过可信代理得到客户端 IP |
 | `PROVIDER_ALIASES` | 空 | 统计 provider 显示别名，格式为 `from:to,from:to`；不会改变实际路由 |
-
-Docker 中若 Nginx、Traefik 等反向代理通过容器网络访问本服务，直连地址通常是 `172.*`。此时应让反向代理覆盖写入 `X-Forwarded-For`，并将它所在的实际 Docker 网段加入信任列表，例如 `TRUSTED_PROXIES=172.20.0.0/16`。不要配置 `0.0.0.0/0`，否则客户端可伪造来源 IP。若客户端直接访问 Docker 映射端口且中间层没有添加转发头，应用层无法从 `172.*` 地址还原原始 IP。
 
 ## 上游、路由与网络
 

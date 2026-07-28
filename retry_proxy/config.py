@@ -160,9 +160,6 @@ class Settings:
     admin_password: str = (os.getenv("ADMIN_PASSWORD") or os.getenv("ADMIN_TOKEN", "")).strip()
     admin_cookie_secure: bool = _bool("ADMIN_COOKIE_SECURE", "false")
     proxy_api_key: str = os.getenv("PROXY_API_KEY", "").strip()
-    trusted_proxies: frozenset = frozenset(
-        ip.strip() for ip in os.getenv("TRUSTED_PROXIES", "").split(",") if ip.strip()
-    )
     key_pools_raw: str = os.getenv("KEY_POOLS", "").strip()
     key_pool_file: str = os.getenv("KEY_POOL_FILE", "").strip()
     key_cooldown: float = float(os.getenv("KEY_COOLDOWN", "30"))

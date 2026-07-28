@@ -1,5 +1,4 @@
 import asyncio
-import ipaddress
 import json
 import os
 import re
@@ -359,49 +358,11 @@ def _cumulative(summary):
 
 
 def _request_ip(request):
-    direct = request.client.host if request.client else ""
-    try:
-        direct_ip = ipaddress.ip_address(direct)
-    except ValueError:
-        return direct
-
-    trusted = []
-    for value in getattr(settings, "trusted_proxies", frozenset()):
-        try:
-            trusted.append(ipaddress.ip_network(value, strict=False))
-        except ValueError:
-            continue
-
-    def is_trusted(address):
-        return any(address in network for network in trusted)
-
-    if not is_trusted(direct_ip):
-        return direct
-
-    # Walk X-Forwarded-For from the trusted peer towards the client. Proxies
-    # commonly append to this header, so taking the left-most value would keep
-    # an attacker-supplied prefix instead of the actual client address.
-    forwarded = request.headers.get("x-forwarded-for", "")
-    chain = []
-    for value in forwarded.split(","):
-        value = value.strip()
-        try:
-            chain.append(ipaddress.ip_address(value))
-        except ValueError:
-            continue
-    for value in reversed(chain):
-        if not is_trusted(value):
-            return str(value)
-    if chain:
-        return str(chain[0])
-
-    for header in ("cf-connecting-ip", "x-real-ip"):
+    for header in ("cf-connecting-ip", "x-forwarded-for", "x-real-ip"):
         value = request.headers.get(header, "").strip()
-        try:
-            return str(ipaddress.ip_address(value))
-        except ValueError:
-            continue
-    return str(direct_ip)
+        if value:
+            return value.split(",", 1)[0].strip()
+    return request.client.host if request.client else ""
 
 
 def _key_pool_secrets():

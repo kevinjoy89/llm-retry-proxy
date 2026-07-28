@@ -1,6 +1,5 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from starlette.requests import Request
 
@@ -44,59 +43,27 @@ class RequestIpTests(unittest.TestCase):
             "client": (direct, 1234),
         })
 
-    def test_forwarded_chain_discards_attacker_prefix(self):
+    def test_forwarded_for_uses_first_address(self):
         request = self._request({
             "x-forwarded-for": "203.0.113.7, 198.51.100.20",
-            "x-real-ip": "198.51.100.20",
-        })
-        config = SimpleNamespace(trusted_proxies=frozenset({"127.0.0.1"}))
+            "x-real-ip": "192.0.2.10",
+        }, "172.20.0.3")
 
-        with patch("retry_proxy.api.settings", config):
-            client_ip = _request_ip(request)
+        self.assertEqual(_request_ip(request), "203.0.113.7")
 
-        self.assertEqual(client_ip, "198.51.100.20")
+    def test_cf_connecting_ip_takes_priority(self):
+        request = self._request({
+            "cf-connecting-ip": "198.51.100.8",
+            "x-forwarded-for": "203.0.113.7",
+            "x-real-ip": "192.0.2.10",
+        }, "172.20.0.3")
 
-    def test_untrusted_peer_cannot_supply_forwarded_ip(self):
-        request = self._request({"x-forwarded-for": "203.0.113.7"}, "198.51.100.20")
-        config = SimpleNamespace(trusted_proxies=frozenset({"127.0.0.1"}))
+        self.assertEqual(_request_ip(request), "198.51.100.8")
 
-        with patch("retry_proxy.api.settings", config):
-            client_ip = _request_ip(request)
+    def test_direct_ip_is_fallback(self):
+        request = self._request({}, "172.20.0.3")
 
-        self.assertEqual(client_ip, "198.51.100.20")
-
-    def test_trusted_proxy_addresses_are_compared_in_canonical_form(self):
-        request = self._request(
-            {"x-forwarded-for": "2001:db8::20"}, "2001:0db8:0:0:0:0:0:1",
-        )
-        config = SimpleNamespace(trusted_proxies=frozenset({"2001:db8::1"}))
-
-        with patch("retry_proxy.api.settings", config):
-            client_ip = _request_ip(request)
-
-        self.assertEqual(client_ip, "2001:db8::20")
-
-    def test_docker_proxy_network_can_be_trusted_by_cidr(self):
-        request = self._request(
-            {"x-forwarded-for": "203.0.113.7, 172.20.0.2"}, "172.20.0.3",
-        )
-        config = SimpleNamespace(trusted_proxies=frozenset({"172.20.0.0/16"}))
-
-        with patch("retry_proxy.api.settings", config):
-            client_ip = _request_ip(request)
-
-        self.assertEqual(client_ip, "203.0.113.7")
-
-    def test_untrusted_docker_network_cannot_supply_forwarded_ip(self):
-        request = self._request(
-            {"x-forwarded-for": "203.0.113.7"}, "172.21.0.3",
-        )
-        config = SimpleNamespace(trusted_proxies=frozenset({"172.20.0.0/16"}))
-
-        with patch("retry_proxy.api.settings", config):
-            client_ip = _request_ip(request)
-
-        self.assertEqual(client_ip, "172.21.0.3")
+        self.assertEqual(_request_ip(request), "172.20.0.3")
 
 
 if __name__ == "__main__":
