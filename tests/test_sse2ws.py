@@ -572,6 +572,7 @@ class WebSocketBridgeTests(unittest.TestCase):
                 patch("retry_proxy.sse2ws.KEY_POOLS", {}), \
                 patch("retry_proxy.sse2ws.match_route",
                       return_value=("https://upstream.test/v1", "test", "responses")), \
+                patch("retry_proxy.sse2ws.logger") as trace_logger, \
                 TestClient(app, backend_options=TEST_CLIENT_BACKEND_OPTIONS) as client:
             with client.websocket_connect("/v1/responses") as websocket:
                 websocket.send_json({
@@ -619,6 +620,11 @@ class WebSocketBridgeTests(unittest.TestCase):
         record = store.write.await_args_list[-1].args[0]
         self.assertEqual(record["downstream_transport"], "websocket")
         self.assertEqual(record["upstream_transport"], "sse")
+        completed_logs = [
+            call.args[0] for call in trace_logger.info.call_args_list
+            if "SSE2WS流结束 status=response.completed HTTP=200" in call.args[0]
+        ]
+        self.assertEqual(len(completed_logs), 2)
 
     def test_cancel_before_first_event_closes_upstream_without_closing_websocket(self):
         service = _StallingService()

@@ -849,6 +849,11 @@ def create_sse2ws_handler(service, store):
                     )
                     if status == "response.completed":
                         transcript.remember(response_id, merged_input, output_items)
+                        logger.info(
+                            f"{_tag('WS', path, provider, model, client_ip)} "
+                            f"SSE2WS流结束 status={status} HTTP=200 "
+                            f"总{time.time() - metrics.started_at:.2f}s"
+                        )
                     if status == "cancelled":
                         logger.info(f"{_tag('WS', path, provider, model, client_ip)} SSE2WS客户端取消")
                 except ClientDisconnected:
