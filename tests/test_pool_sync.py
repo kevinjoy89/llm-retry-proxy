@@ -1685,6 +1685,30 @@ class ManualAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pools["https://manual.test"].entries[0].label, "Updated")
         self.assertEqual(pools["https://manual.test"].entries[0].sort, "2")
 
+    async def test_update_manual_key_group_and_patterns(self):
+        from retry_proxy.sync_adapters.manual import ManualAdapter
+        pools = {}
+        manager = PoolSyncManager(pools, self.config, None, {"manual": ManualAdapter()})
+
+        status = await manager.add_manual_keys(
+            "https://manual.test",
+            [{"key": "sk-key-1", "label": "Original"}],
+        )
+        source_id = status["sources"][0]["id"]
+        source_key_id = status["sources"][0]["keys"][0]["source_key_id"]
+
+        await manager.update_manual_key(source_id, source_key_id, {
+            "group_id": "vip", "group_name": "vip",
+            "models": "gpt-4*;claude*", "paths": "v1/images/*;v1/chat/*",
+        })
+        entry = pools["https://manual.test"].entries[0]
+        self.assertEqual(entry.group_name, "vip")
+        self.assertEqual(entry.group_id, "vip")
+        self.assertEqual(entry.models, ("gpt-4*", "claude*"))
+        self.assertEqual(entry.paths, ("v1/images/*", "v1/chat/*"))
+        # 未传字段保持不变（部分更新语义）
+        self.assertEqual(entry.label, "Original")
+
     async def test_manual_source_persistence(self):
         from retry_proxy.sync_adapters.manual import ManualAdapter
         pools = {}
