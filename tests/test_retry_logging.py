@@ -231,6 +231,68 @@ class RetryLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cancelled.is_set())
         self.assertGreater(pool.entries[0].cooldown_until, time.time())
 
+    async def test_html_400_switches_pool_key(self):
+        config = SimpleNamespace(
+            responses_header_timeout=1, responses_attempt_header_timeout=1,
+            hedge_mode="off", max_retries=2, retry_interval=0,
+            retry_interval_429=0, retry_backoff=False, retry_backoff_max=0,
+            retry_backoff_429=False, retry_backoff_max_429=0,
+            key_cooldown=30, key_cooldown_5xx=30,
+            key_cooldown_backoff=False, key_cooldown_max=60,
+            key_pool_wait_timeout=1,
+        )
+        pool = KeyPool([])
+        pool.entries = [KeyEntry("html-error", "html-error"), KeyEntry("good", "good")]
+        pool.finalize_entries()
+        responses = [
+            httpx.Response(
+                400, text="<html><title>400 Bad Request</title></html>",
+                headers={"content-type": "text/html; charset=utf-8"},
+                request=httpx.Request("POST", "https://upstream.test/responses"),
+            ),
+            httpx.Response(
+                200, request=httpx.Request("POST", "https://upstream.test/responses"),
+            ),
+        ]
+        proxy = RetryProxy(config=config, client=object())
+        proxy._send = AsyncMock(side_effect=responses)
+
+        result = await proxy.request(
+            "POST", "https://upstream.test/responses", {},
+            b'{"model":"model","stream":true}',
+            "aihub/responses", "test", "model", pool,
+        )
+
+        self.assertEqual(result.response.status_code, 200)
+        self.assertEqual(result.total_sent, 2)
+        self.assertEqual(result.key_id, "good")
+        self.assertEqual(result.retry_codes, [400])
+        self.assertEqual(pool.entries[0].last_failure_status, 400)
+
+    async def test_json_400_is_still_returned_without_switching_pool_key(self):
+        config = SimpleNamespace(
+            responses_header_timeout=1, responses_attempt_header_timeout=1,
+            hedge_mode="off", max_retries=2,
+        )
+        pool = KeyPool(["first", "second"])
+        response = httpx.Response(
+            400, json={"error": {"message": "invalid request"}},
+            request=httpx.Request("POST", "https://upstream.test/responses"),
+        )
+        proxy = RetryProxy(config=config, client=object())
+        proxy._send = AsyncMock(return_value=response)
+
+        result = await proxy.request(
+            "POST", "https://upstream.test/responses", {},
+            b'{"model":"model","stream":true}',
+            "aihub/responses", "test", "model", pool,
+        )
+
+        self.assertIs(result.response, response)
+        self.assertEqual(result.total_sent, 1)
+        self.assertEqual(result.retry_codes, [])
+        self.assertEqual(proxy._send.await_count, 1)
+
     async def test_non_streaming_responses_does_not_use_attempt_timeout(self):
         config = SimpleNamespace(
             responses_header_timeout=1, responses_attempt_header_timeout=0.001,

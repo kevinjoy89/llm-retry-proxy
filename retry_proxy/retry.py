@@ -133,6 +133,14 @@ def _should_retry(status):
     return status >= 500 or status in (429, 401, 403) if settings.retry_broad else status in settings.retry_status_codes
 
 
+def _is_html_bad_request(response):
+    """Treat a gateway/CDN HTML 400 as an upstream failure, not an API error."""
+    if response.status_code != 400:
+        return False
+    content_type = response.headers.get("content-type", "").lower()
+    return "text/html" in content_type or "application/xhtml+xml" in content_type
+
+
 def _max_attempts(config):
     override = _request_max_attempts.get()
     return config.max_retries if override is None else override
@@ -667,7 +675,8 @@ class RetryProxy:
                 await _sleep_before_retry(
                     sleep_for, pool, pool_wait, getattr(self.config, "key_pool_wait_timeout", None),
                 ); continue
-            if model and _should_retry(response.status_code):
+            html_bad_request = pool is not None and _is_html_bad_request(response)
+            if model and (_should_retry(response.status_code) or html_bad_request):
                 _record_key_attempt(key_attempts, entry, False)
                 last_status = response.status_code; retry_codes.append(response.status_code)
                 ra = parse_retry_after(response.headers.get("retry-after")) if response.status_code == 429 else None
