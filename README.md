@@ -87,7 +87,7 @@ docker compose up -d --build
 | `UPSTREAM_URL` | `https://maas-coding-api.cn-huabei-1.xf-yun.com/v2` | 上游地址，不要带尾斜杠 |
 | `LISTEN_HOST` | `0.0.0.0` | 监听地址 |
 | `LISTEN_PORT` | `8080` | 监听端口 |
-| `MAX_RETRIES` | `60` | 最大重试次数；`0` 表示无限重试 |
+| `MAX_RETRIES` | `60` | 单个请求的实际上游尝试总上限；`0` 表示无限重试 |
 | `RETRY_INTERVAL` | `1.0` | 非 429 错误的重试间隔/退避基数 |
 | `RETRY_INTERVAL_429` | `5.0` | 429 专用重试间隔/退避基数 |
 | `RETRY_BROAD` | `off` | 是否把鉴权和网络错误也纳入重试/换 key |

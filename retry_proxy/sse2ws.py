@@ -22,7 +22,8 @@ from .api import (
 from .config import can_use_key_pool, logger, settings, should_retry_status
 from .dlp import inspect_json_body
 from .key_pool import KEY_POOLS
-from .retry import _mark_key_failure, _tag, reset_client_ip, set_client_ip
+from .retry import (RequestAttemptBudget, _mark_key_failure, _tag, reset_client_ip,
+                    set_client_ip)
 from .routes import is_excluded_path, match_route
 
 
@@ -330,14 +331,20 @@ def _event_error(event):
 
 
 async def _prime(service, method, url, headers, body, path, provider, model, pool, session_id,
-                 result_holder=None):
+                 result_holder=None, max_attempts=None, attempt_budget=None):
     response = None
     result = None
+    budget_before = attempt_budget.sent if attempt_budget is not None else 0
     try:
         result = await service.request(
             method, url, headers, body, path, provider, model, pool, session_id,
             defer_stream_success=True,
+            max_attempts=max_attempts,
+            attempt_budget=attempt_budget,
         )
+        if attempt_budget is not None:
+            reported = max(int(getattr(result, "total_sent", 0) or 0), 0)
+            attempt_budget.sent = max(attempt_budget.sent, budget_before + reported)
         if result_holder is not None:
             result_holder["result"] = result
         response = result.response
@@ -480,27 +487,31 @@ async def _wait_for_prime(websocket, awaitable, timeout):
 async def _open_with_retries(service, request_args, pool, session_id, metrics, websocket=None):
     retries = max(settings.sse2ws_first_event_retries, 0)
     per_key_limit = retries + 1
-    key_count = max(len(getattr(pool, "entries", ())), 1)
-    total_limit = per_key_limit * key_count
-    if settings.max_retries > 0:
-        total_limit = min(total_limit, max(settings.max_retries, per_key_limit))
+    total_limit = settings.max_retries
+    attempt_budget = RequestAttemptBudget(total_limit)
     failures = {}
     last_error = BridgeError("upstream did not produce a first event", status=504,
                              code="first_event_timeout")
 
-    for _ in range(total_limit):
+    while total_limit == 0 or attempt_budget.sent < total_limit:
         metrics.bridge_attempts += 1
         opened = None
         result = None
         holder = {}
+        remaining = total_limit - attempt_budget.sent if total_limit > 0 else None
         try:
             opened = await _wait_for_prime(
                 websocket,
-                _prime(service, *request_args, result_holder=holder),
+                _prime(
+                    service, *request_args, result_holder=holder,
+                    max_attempts=remaining,
+                    attempt_budget=attempt_budget,
+                ),
                 settings.sse2ws_first_event_timeout,
             )
             result = opened.result
             metrics.add_result(result)
+            metrics.total_sent = max(metrics.total_sent, attempt_budget.sent)
             metrics.first_event_s = time.time() - metrics.started_at
             _confirm_key_success(opened, pool, session_id, metrics)
             return opened
@@ -509,7 +520,7 @@ async def _open_with_retries(service, request_args, pool, session_id, metrics, w
             if result is not None:
                 metrics.add_result(result)
             else:
-                metrics.total_sent += 1
+                metrics.total_sent = max(metrics.total_sent, attempt_budget.sent)
             last_error = BridgeError(
                 f"upstream did not produce a first event within {settings.sse2ws_first_event_timeout:.1f}s",
                 status=504,
@@ -522,6 +533,7 @@ async def _open_with_retries(service, request_args, pool, session_id, metrics, w
             result = getattr(exc, "result", None)
             if result is not None:
                 metrics.add_result(result)
+            metrics.total_sent = max(metrics.total_sent, attempt_budget.sent)
             if (exc.code == "upstream_unavailable"
                     or (exc.status < 500 and not should_retry_status(exc.status))):
                 raise
@@ -530,7 +542,7 @@ async def _open_with_retries(service, request_args, pool, session_id, metrics, w
             if result is not None:
                 metrics.add_result(result)
             else:
-                metrics.total_sent += 1
+                metrics.total_sent = max(metrics.total_sent, attempt_budget.sent)
             raise
 
         metrics.bridge_retry_reasons.append(last_error.code)
@@ -541,10 +553,11 @@ async def _open_with_retries(service, request_args, pool, session_id, metrics, w
             if _is_key_failure_status(last_error.status):
                 _mark_deferred_failure(pool, entry, session_id, metrics, last_error.status)
                 last_error.key_failure_recorded = True
-            if pool is None or not pool.has_fresh():
+            if total_limit > 0 and (pool is None or not pool.has_fresh()):
                 break
         logger.warning(
-            f"SSE2WS首事件失败 attempt={metrics.bridge_attempts}/{total_limit} "
+            f"SSE2WS首事件失败 attempt={metrics.bridge_attempts}/"
+            f"{total_limit or '∞'} "
             f"key={marker} code={last_error.code}"
         )
     raise last_error

@@ -16,6 +16,8 @@ from .key_pool import headers_with_key
 _client_ip = contextvars.ContextVar("client_ip", default="")
 _spawned_tasks = contextvars.ContextVar("spawned_tasks", default=None)
 _request_progress = contextvars.ContextVar("request_progress", default=None)
+_request_max_attempts = contextvars.ContextVar("request_max_attempts", default=None)
+_request_attempt_budget = contextvars.ContextVar("request_attempt_budget", default=None)
 
 
 class KeyPoolWaitTimeout(Exception):
@@ -32,6 +34,21 @@ class KeyPoolWaitTimeout(Exception):
 
 class ResponsesAttemptHeaderTimeout(Exception):
     """Raised when one streaming Responses key stalls before response headers."""
+
+
+class RequestAttemptLimit(Exception):
+    """Raised before a send when a shared upstream-attempt budget is exhausted."""
+
+
+@dataclass
+class RequestAttemptBudget:
+    limit: int
+    sent: int = 0
+
+    def claim(self):
+        if self.limit > 0 and self.sent >= self.limit:
+            raise RequestAttemptLimit
+        self.sent += 1
 
 
 def set_client_ip(value):
@@ -113,6 +130,11 @@ def calc_backoff_wait(consecutive, base, cap, enabled, ra_wait=None):
 
 def _should_retry(status):
     return status >= 500 or status in (429, 401, 403) if settings.retry_broad else status in settings.retry_status_codes
+
+
+def _max_attempts(config):
+    override = _request_max_attempts.get()
+    return config.max_retries if override is None else override
 
 
 def _key_available_for_status(status):
@@ -287,6 +309,9 @@ class RetryProxy:
         return await self.client.send(req, stream=True)
 
     async def _send_upstream(self, method, url, headers, body):
+        budget = _request_attempt_budget.get()
+        if budget is not None:
+            budget.claim()
         progress = _request_progress.get()
         if progress is not None:
             progress["sent"] += 1
@@ -294,9 +319,10 @@ class RetryProxy:
 
     async def _race(self, method, url, req_headers, body, path, t0, provider, model, pool, session_id=""):
         total_sent = last_status = round_num = 0; retry_codes = []; key_attempts = []; c429 = cother = 0; last_key_id = ""
+        max_attempts = _max_attempts(self.config)
         while True:
             round_num += 1
-            to_fire = min(self.config.max_concurrent, self.config.max_retries - total_sent) if self.config.max_retries > 0 else self.config.max_concurrent
+            to_fire = min(self.config.max_concurrent, max_attempts - total_sent) if max_attempts > 0 else self.config.max_concurrent
             if to_fire <= 0: break
             self.logger.debug(f"{_tag(method, path, provider, model)} R{round_num} 选号 总{time.time() - t0:.2f}s")
             entry = await _pick_key(pool, getattr(self.config, "key_pool_wait_timeout", None), session_id)
@@ -364,7 +390,7 @@ class RetryProxy:
                 _mark_key_outcome(pool, entry, self.config, winner.status_code, session_id=session_id)
                 self.logger.info(f"{_tag(method, path, provider, model)}{key_tag} {_response_status_log(winner.status_code, path, body)} #{winner_attempt}胜出(R{round_num},{total_sent}发) {time.time() - t0:.2f}s")
                 return RetryResult(winner, winner_attempt, total_sent, last_status, retry_codes, round_num == 1, last_key_id, t0, key_attempts)
-            exhausted = self.config.max_retries > 0 and total_sent >= self.config.max_retries
+            exhausted = max_attempts > 0 and total_sent >= max_attempts
             key_failure_status = _select_key_failure_status(key_failure_statuses)
             if pool and entry and key_failure_status is not None:
                 _mark_key_failure(pool, entry, self.config, key_failure_status,
@@ -389,6 +415,7 @@ class RetryProxy:
 
     async def _stagger(self, method, url, req_headers, body, path, t0, provider, model, pool, session_id=""):
         total_sent = last_status = 0; retry_codes = []; key_attempts = []; in_flight = {}; winner = None; winner_attempt = 0
+        max_attempts = _max_attempts(self.config)
         next_allowed = 0.0; c429 = cother = 0; last_key_id = ""; all_tasks = set()
         async def send(n):
             self.logger.debug(f"{_tag(method, path, provider, model)} #{n} 选号 总{time.time() - t0:.2f}s")
@@ -405,7 +432,7 @@ class RetryProxy:
             except asyncio.CancelledError: raise
             except KeyPoolWaitTimeout: raise
             except Exception as exc: return "error", exc, n, entry
-        def can_fire(now): return winner is None and (self.config.max_retries == 0 or total_sent < self.config.max_retries) and len(in_flight) < self.config.max_concurrent and now >= next_allowed
+        def can_fire(now): return winner is None and (max_attempts == 0 or total_sent < max_attempts) and len(in_flight) < self.config.max_concurrent and now >= next_allowed
         def launch(now):
             nonlocal total_sent, next_allowed
             total_sent += 1
@@ -416,7 +443,7 @@ class RetryProxy:
         while True:
             key_tag = f"[{last_key_id}]" if pool and last_key_id else ""
             if not in_flight:
-                if self.config.max_retries > 0 and total_sent >= self.config.max_retries: break
+                if max_attempts > 0 and total_sent >= max_attempts: break
                 wait = max(next_allowed - time.time(), 0)
                 if wait > 0: self.logger.info(f"{_tag(method, path, provider, model)}{key_tag} 退避 {wait:.1f}s {time.time() - t0:.1f}s")
                 pool_wait = pool.next_available_in() if pool and not pool.has_fresh() else 0.0
@@ -496,13 +523,16 @@ class RetryProxy:
         return RetryResult(winner, winner_attempt, total_sent, last_status, retry_codes, bool(winner and winner_attempt == 1), last_key_id, t0, key_attempts)
 
     async def request(self, method, url, headers, body, path, provider, model, pool=None,
-                      session_id="", defer_stream_success=False):
+                      session_id="", defer_stream_success=False, max_attempts=None,
+                      attempt_budget=None):
         start = time.time()
         self.logger.debug(f"{_tag(method, path, provider, model)} 开始转发")
         spawned = set()
         progress = {"sent": 0}
         spawned_token = _spawned_tasks.set(spawned)
         progress_token = _request_progress.set(progress)
+        max_attempts_token = _request_max_attempts.set(max_attempts)
+        attempt_budget_token = _request_attempt_budget.set(attempt_budget)
         try:
             work = self._request(
                 method, url, headers, body, path, provider, model, pool, start,
@@ -524,11 +554,19 @@ class RetryProxy:
                 f"{_tag(method, path, provider, model)} 号池等待超时: {exc}"
             )
             return RetryResult(None, 0, progress["sent"], 0, [], False, "", start, [], str(exc))
+        except RequestAttemptLimit:
+            await _cancel_spawned(spawned)
+            reason = "upstream attempt budget exhausted"
+            return RetryResult(
+                None, 0, progress["sent"], 0, [], False, "", start, [], reason,
+            )
         except asyncio.CancelledError:
             await _cancel_spawned(spawned)
             self.logger.info(f"{_tag(method, path, provider, model)} 下游已断开，停止重试")
             raise
         finally:
+            _request_attempt_budget.reset(attempt_budget_token)
+            _request_max_attempts.reset(max_attempts_token)
             _request_progress.reset(progress_token)
             _spawned_tasks.reset(spawned_token)
 
@@ -539,6 +577,7 @@ class RetryProxy:
             return await self._race(method, url, headers, body, path, start, provider, model, pool, session_id)
         if model and hedge_mode == "stagger":
             return await self._stagger(method, url, headers, body, path, start, provider, model, pool, session_id)
+        max_attempts = _max_attempts(self.config)
         attempt = 0; last_status = 0; retry_codes = []; key_attempts = []; c429 = cother = 0; last_key_id = ""
         while True:
             attempt += 1
@@ -546,8 +585,8 @@ class RetryProxy:
             entry = await _pick_key(pool, getattr(self.config, "key_pool_wait_timeout", None), session_id); send_headers = headers_with_key(headers, entry.key, entry.auth_header, entry.auth_scheme) if entry else headers
             if entry: last_key_id = entry.key_id
             key_tag = f"[{last_key_id}]" if pool and last_key_id else ""
-            if self.config.max_retries > 0 and attempt > self.config.max_retries:
-                self.logger.error(f"{_tag(method, path, provider, model)}{key_tag} 放弃({self.config.max_retries}次) {time.time() - start:.1f}s")
+            if max_attempts > 0 and attempt > max_attempts:
+                self.logger.error(f"{_tag(method, path, provider, model)}{key_tag} 放弃({max_attempts}次) {time.time() - start:.1f}s")
                 break
             cycle = time.time()
             cycle_mono = time.monotonic()

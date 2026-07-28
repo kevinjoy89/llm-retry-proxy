@@ -6,11 +6,13 @@ import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from urllib.parse import urlsplit
 
 import httpx
 
 from retry_proxy.key_pool import KeyEntry, KeyPool
-from retry_proxy.pool_sync import PoolSyncManager, _parse_experience_payload
+from retry_proxy.pool_sync import (PoolSyncManager, _get_pinned_public_url,
+                                   _parse_experience_payload)
 from retry_proxy.routes import RouteRegistry
 from retry_proxy.sync_adapters import PoolSyncError
 from retry_proxy.sync_adapters.sub2api import Sub2APIAdapter, _model_ids, _unwrap
@@ -415,6 +417,55 @@ class ExternalDataNetworkSafetyTests(unittest.IsolatedAsyncioTestCase):
 
         client.get.assert_not_awaited()
 
+    async def test_validated_address_is_pinned_for_the_actual_https_request(self):
+        session = SimpleNamespace(get=AsyncMock(return_value=response({"ok": True})))
+
+        class ClientContext:
+            async def __aenter__(self):
+                return session
+
+            async def __aexit__(self, *_args):
+                return False
+
+        loop = SimpleNamespace(getaddrinfo=AsyncMock(return_value=[
+            (2, 1, 6, "", ("93.184.216.34", 443)),
+        ]))
+        with patch("retry_proxy.pool_sync.asyncio.get_running_loop", return_value=loop), \
+                patch("retry_proxy.pool_sync.httpx.AsyncClient",
+                      return_value=ClientContext()):
+            await _get_pinned_public_url(
+                "https://metrics.test/groups?scope=public",
+                params={"limit": "50"}, headers={"Accept": "application/json"},
+            )
+
+        call = session.get.await_args
+        self.assertEqual(call.args[0], "https://93.184.216.34/groups?scope=public")
+        self.assertEqual(call.kwargs["headers"]["Host"], "metrics.test")
+        self.assertEqual(call.kwargs["extensions"]["sni_hostname"], "metrics.test")
+
+    async def test_pinned_ipv6_request_preserves_original_host_and_port(self):
+        session = SimpleNamespace(get=AsyncMock(return_value=response({"ok": True})))
+
+        class ClientContext:
+            async def __aenter__(self):
+                return session
+
+            async def __aexit__(self, *_args):
+                return False
+
+        loop = SimpleNamespace(getaddrinfo=AsyncMock(return_value=[
+            (10, 1, 6, "", ("2001:4860:4860::8888", 8443, 0, 0)),
+        ]))
+        with patch("retry_proxy.pool_sync.asyncio.get_running_loop", return_value=loop), \
+                patch("retry_proxy.pool_sync.httpx.AsyncClient",
+                      return_value=ClientContext()):
+            await _get_pinned_public_url("https://[2001:4860:4860::8844]:8443/groups")
+
+        call = session.get.await_args
+        self.assertEqual(call.args[0], "https://[2001:4860:4860::8888]:8443/groups")
+        self.assertEqual(call.kwargs["headers"]["Host"], "[2001:4860:4860::8844]:8443")
+        self.assertEqual(call.kwargs["extensions"]["sni_hostname"], "2001:4860:4860::8844")
+
 
 class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -429,8 +480,9 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
             provider="test-provider",
         )
         self.destination_check = patch(
-            "retry_proxy.pool_sync._ensure_public_url_destination",
+            "retry_proxy.pool_sync._resolve_public_url_destination",
             new_callable=AsyncMock,
+            side_effect=lambda url: (urlsplit(url), ("93.184.216.34",)),
         )
         self.destination_check.start()
         self.addCleanup(self.destination_check.stop)

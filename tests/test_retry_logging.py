@@ -9,10 +9,33 @@ import httpx
 
 from retry_proxy.config import LogCaptureHandler, log_capture, logger
 from retry_proxy.key_pool import KeyEntry, KeyPool
-from retry_proxy.retry import RetryProxy
+from retry_proxy.retry import RequestAttemptBudget, RetryProxy
 
 
 class RetryLoggingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shared_attempt_budget_caps_internal_retries(self):
+        config = SimpleNamespace(
+            hedge_mode="off", max_retries=10, retry_interval=0,
+            retry_interval_429=0, retry_backoff=False,
+            retry_backoff_429=False, retry_backoff_max=0,
+            retry_backoff_max_429=0,
+        )
+        proxy = RetryProxy(config=config, client=object())
+        proxy._send = AsyncMock(side_effect=lambda *_args: httpx.Response(
+            503, request=httpx.Request("POST", "https://upstream.test/responses"),
+        ))
+
+        result = await proxy.request(
+            "POST", "https://upstream.test/responses", {},
+            b'{"model":"model","stream":true}',
+            "v1/responses", "test", "model",
+            max_attempts=10, attempt_budget=RequestAttemptBudget(1),
+        )
+
+        self.assertEqual(proxy._send.await_count, 1)
+        self.assertEqual(result.total_sent, 1)
+        self.assertEqual(result.failure_reason, "upstream attempt budget exhausted")
+
     def test_log_capture_keeps_all_entries_for_process_lifetime(self):
         capture = LogCaptureHandler()
 

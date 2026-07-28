@@ -9,7 +9,7 @@ import socket
 import tempfile
 import time
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -60,8 +60,8 @@ def _is_private_or_loopback_host(hostname):
     return not addr.is_global
 
 
-async def _ensure_public_url_destination(url):
-    """Resolve a URL immediately before use and reject non-public addresses."""
+async def _resolve_public_url_destination(url):
+    """Resolve a URL and return only globally routable destination addresses."""
     parsed = urlsplit(url)
     try:
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -73,11 +73,51 @@ async def _ensure_public_url_destination(url):
         )
     except OSError as exc:
         raise PoolSyncError(f"外部数据 URL 域名解析失败: {exc}") from exc
-    resolved = {item[4][0] for item in addresses if item[4]}
+    resolved = tuple(dict.fromkeys(item[4][0] for item in addresses if item[4]))
     if not resolved:
         raise PoolSyncError("外部数据 URL 域名未解析到地址")
     if any(_is_private_or_loopback_host(address) for address in resolved):
         raise PoolSyncError("外部数据 URL 域名解析到私有、回环或非公网地址")
+    return parsed, resolved
+
+
+def _pinned_url(parsed, address):
+    """Replace only the connection host while preserving path and query."""
+    host = f"[{address}]" if ipaddress.ip_address(address).version == 6 else address
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    return urlunsplit((parsed.scheme, host, parsed.path, parsed.query, ""))
+
+
+def _original_host_header(parsed):
+    host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    return host
+
+
+async def _get_pinned_public_url(url, *, params=None, headers=None, timeout=20):
+    """Fetch a validated URL without allowing a second DNS lookup to change its target.
+
+    The TCP connection uses a validated IP literal. HTTPS still authenticates the
+    original hostname through SNI, and the HTTP Host header is preserved.
+    """
+    parsed, addresses = await _resolve_public_url_destination(url)
+    request_headers = dict(headers or {})
+    request_headers["Host"] = _original_host_header(parsed)
+    last_error = None
+    for address in addresses:
+        try:
+            async with httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
+                return await client.get(
+                    _pinned_url(parsed, address), params=params, headers=request_headers,
+                    timeout=timeout, extensions={"sni_hostname": parsed.hostname},
+                )
+        except httpx.RequestError as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise PoolSyncError("外部数据 URL 域名未解析到地址")
 
 
 def _experience_timestamp(value):
@@ -634,16 +674,23 @@ class PoolSyncManager:
         return config
 
     async def _fetch_experience_items(self, config):
-        await _ensure_public_url_destination(config["url"])
         if "query_params" in config:
             params = config.get("query_params") or None
         else:
             params = ({config["sample_param"]: config["samples"]}
                       if config.get("sample_param") else None)
-        response = await self.client.get(
-            config["url"], params=params,
-            headers={"Accept": "application/json"}, timeout=20,
-        )
+        if isinstance(self.client, httpx.AsyncClient):
+            response = await _get_pinned_public_url(
+                config["url"], params=params,
+                headers={"Accept": "application/json"}, timeout=20,
+            )
+        else:
+            # Test doubles do not open sockets; retain their simple get() contract.
+            await _resolve_public_url_destination(config["url"])
+            response = await self.client.get(
+                config["url"], params=params,
+                headers={"Accept": "application/json"}, timeout=20,
+            )
         if response.status_code >= 400:
             raise PoolSyncError(f"外部数据接口请求失败 (HTTP {response.status_code})")
         try:

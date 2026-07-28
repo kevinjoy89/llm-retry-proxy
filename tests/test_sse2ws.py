@@ -21,6 +21,9 @@ from retry_proxy.sse2ws import (
     create_sse2ws_handler,
 )
 from retry_proxy.key_pool import KeyPool
+from retry_proxy.retry import RequestAttemptBudget, RequestAttemptLimit
+from tests.asyncio_compat import (TEST_CLIENT_BACKEND_OPTIONS,
+                                  ThreadedAsyncTestCase)
 
 
 def _settings(**overrides):
@@ -29,6 +32,8 @@ def _settings(**overrides):
         "sse2ws_first_event_timeout": 0.1,
         "sse2ws_first_event_retries": 1,
         "max_retries": 10,
+        "retry_broad": False,
+        "retry_status_codes": frozenset({429, 502, 503, 504, 524, 529}),
         "proxy_api_key": "",
         "dlp_mode": "off",
         "dlp_max_body_bytes": 16_777_216,
@@ -138,7 +143,7 @@ class TranscriptTests(unittest.TestCase):
         ])
 
 
-class DlpBridgeTests(unittest.IsolatedAsyncioTestCase):
+class DlpBridgeTests(ThreadedAsyncTestCase):
     async def test_block_mode_rejects_sensitive_websocket_input(self):
         from dataclasses import replace
         from retry_proxy.config import settings
@@ -216,6 +221,67 @@ def _streaming_response(stream, **headers):
 
 
 class FirstEventRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_global_attempt_limit_caps_bridge_reconnects(self):
+        stream = _BlockingStream()
+        service = SimpleNamespace(request=AsyncMock(return_value=_result(
+            _streaming_response(stream),
+        )))
+        args = (
+            "POST", "https://upstream.test/v1/responses", {},
+            b'{"model":"gpt-test","stream":true}', "v1/responses",
+            "test", "gpt-test", None, "session-1",
+        )
+        config = _settings(
+            max_retries=1, sse2ws_first_event_timeout=0.01,
+            sse2ws_first_event_retries=3,
+        )
+
+        with patch("retry_proxy.sse2ws.settings", config), \
+                self.assertRaises(BridgeError):
+            await _open_with_retries(
+                service, args, None, "session-1", TurnMetrics(),
+            )
+
+        self.assertEqual(service.request.await_count, 1)
+
+    async def test_zero_global_attempt_limit_allows_bridge_reconnect(self):
+        blocked = _BlockingStream()
+        service = SimpleNamespace(request=AsyncMock(side_effect=[
+            _result(_streaming_response(blocked)),
+            _result(_sse_response([
+                {"type": "response.created", "response": {"id": "resp-ok"}},
+                {"type": "response.completed", "response": {
+                    "id": "resp-ok", "output": [],
+                }},
+            ])),
+        ]))
+        args = (
+            "POST", "https://upstream.test/v1/responses", {},
+            b'{"model":"gpt-test","stream":true}', "v1/responses",
+            "test", "gpt-test", None, "session-1",
+        )
+        config = _settings(
+            max_retries=0, sse2ws_first_event_timeout=0.01,
+            sse2ws_first_event_retries=0,
+        )
+
+        with patch("retry_proxy.sse2ws.settings", config):
+            opened = await _open_with_retries(
+                service, args, None, "session-1", TurnMetrics(),
+            )
+
+        self.assertEqual(service.request.await_count, 2)
+        self.assertTrue(blocked.closed.is_set())
+        await opened.result.response.aclose()
+
+    async def test_request_attempt_budget_rejects_claim_past_limit(self):
+        budget = RequestAttemptBudget(2)
+        budget.claim()
+        budget.claim()
+
+        with self.assertRaises(RequestAttemptLimit):
+            budget.claim()
+
     async def test_request_level_400_is_not_reclassified_as_key_failure(self):
         pool = KeyPool(["sk-test"])
         entry = pool.entries[0]
@@ -425,7 +491,8 @@ class WebSocketBridgeTests(unittest.TestCase):
         app = self._app(SimpleNamespace(), SimpleNamespace())
         config = _settings(sse2ws_mode="off")
 
-        with patch("retry_proxy.sse2ws.settings", config), TestClient(app) as client:
+        with patch("retry_proxy.sse2ws.settings", config), TestClient(
+                app, backend_options=TEST_CLIENT_BACKEND_OPTIONS) as client:
             with self.assertRaises(WebSocketDenialResponse) as raised:
                 with client.websocket_connect("/v1/responses"):
                     pass
@@ -438,7 +505,7 @@ class WebSocketBridgeTests(unittest.TestCase):
         with patch("retry_proxy.sse2ws.settings", _settings()), \
                 patch("retry_proxy.sse2ws.match_route",
                       return_value=("https://upstream.test/v1", "test", "models")), \
-                TestClient(app) as client:
+                TestClient(app, backend_options=TEST_CLIENT_BACKEND_OPTIONS) as client:
             with self.assertRaises(WebSocketDenialResponse) as raised:
                 with client.websocket_connect("/v1/models"):
                     pass
@@ -454,7 +521,7 @@ class WebSocketBridgeTests(unittest.TestCase):
                 patch("retry_proxy.sse2ws.KEY_POOLS", {}), \
                 patch("retry_proxy.sse2ws.match_route",
                       return_value=("https://upstream.test/v1", "test", "responses")), \
-                TestClient(app) as client:
+                TestClient(app, backend_options=TEST_CLIENT_BACKEND_OPTIONS) as client:
             with client.websocket_connect("/v1/responses") as websocket:
                 websocket.send_text("{")
                 self.assertEqual(websocket.receive_json()["error"]["code"], "invalid_json")
@@ -485,7 +552,7 @@ class WebSocketBridgeTests(unittest.TestCase):
                 patch("retry_proxy.sse2ws.KEY_POOLS", {}), \
                 patch("retry_proxy.sse2ws.match_route",
                       return_value=("https://upstream.test/v1", "test", "responses")), \
-                TestClient(app) as client:
+                TestClient(app, backend_options=TEST_CLIENT_BACKEND_OPTIONS) as client:
             with client.websocket_connect("/v1/responses") as websocket:
                 websocket.send_text("{" + "x" * 64)
                 error = websocket.receive_json()
@@ -505,7 +572,7 @@ class WebSocketBridgeTests(unittest.TestCase):
                 patch("retry_proxy.sse2ws.KEY_POOLS", {}), \
                 patch("retry_proxy.sse2ws.match_route",
                       return_value=("https://upstream.test/v1", "test", "responses")), \
-                TestClient(app) as client:
+                TestClient(app, backend_options=TEST_CLIENT_BACKEND_OPTIONS) as client:
             with client.websocket_connect("/v1/responses") as websocket:
                 websocket.send_json({
                     "type": "response.create",
@@ -564,7 +631,7 @@ class WebSocketBridgeTests(unittest.TestCase):
                 patch("retry_proxy.sse2ws.KEY_POOLS", {}), \
                 patch("retry_proxy.sse2ws.match_route",
                       return_value=("https://upstream.test/v1", "test", "responses")), \
-                TestClient(app) as client:
+                TestClient(app, backend_options=TEST_CLIENT_BACKEND_OPTIONS) as client:
             with client.websocket_connect("/v1/responses") as websocket:
                 websocket.send_json({
                     "type": "response.create", "model": "gpt-test", "input": [],
@@ -597,7 +664,7 @@ class WebSocketBridgeTests(unittest.TestCase):
                 patch("retry_proxy.sse2ws.KEY_POOLS", {}), \
                 patch("retry_proxy.sse2ws.match_route",
                       return_value=("https://upstream.test/v1", "test", "responses")), \
-                TestClient(app) as client:
+                TestClient(app, backend_options=TEST_CLIENT_BACKEND_OPTIONS) as client:
             with client.websocket_connect("/v1/responses") as websocket:
                 websocket.send_json({
                     "type": "response.create", "model": "gpt-test", "input": [],
@@ -632,7 +699,7 @@ class WebSocketBridgeTests(unittest.TestCase):
                 patch("retry_proxy.sse2ws.KEY_POOLS", {}), \
                 patch("retry_proxy.sse2ws.match_route",
                       return_value=("https://upstream.test/v1", "test", "responses")), \
-                TestClient(app) as client:
+                TestClient(app, backend_options=TEST_CLIENT_BACKEND_OPTIONS) as client:
             with client.websocket_connect("/v1/responses") as websocket:
                 websocket.send_json({
                     "type": "response.create", "model": "gpt-test", "input": [],
@@ -655,7 +722,7 @@ class WebSocketBridgeTests(unittest.TestCase):
                 }), \
                 patch("retry_proxy.sse2ws.match_route",
                       return_value=("https://upstream.test/v1", "test", "responses")), \
-                TestClient(app) as client:
+                TestClient(app, backend_options=TEST_CLIENT_BACKEND_OPTIONS) as client:
             with client.websocket_connect("/v1/responses") as websocket:
                 websocket.send_json({
                     "type": "response.create", "model": "gpt-test", "input": [],
@@ -682,7 +749,7 @@ class WebSocketBridgeTests(unittest.TestCase):
                 patch("retry_proxy.sse2ws.KEY_POOLS", {}), \
                 patch("retry_proxy.sse2ws.match_route",
                       return_value=("https://upstream.test/v1", "test", "responses")), \
-                TestClient(app) as client:
+                TestClient(app, backend_options=TEST_CLIENT_BACKEND_OPTIONS) as client:
             with client.websocket_connect("/v1/responses") as websocket:
                 websocket.send_json({
                     "type": "response.create", "model": "gpt-test", "input": [],
@@ -712,7 +779,7 @@ class WebSocketBridgeTests(unittest.TestCase):
                 patch("retry_proxy.sse2ws.KEY_POOLS", {}), \
                 patch("retry_proxy.sse2ws.match_route",
                       return_value=("https://upstream.test/v1", "test", "responses")), \
-                TestClient(app) as client:
+                TestClient(app, backend_options=TEST_CLIENT_BACKEND_OPTIONS) as client:
             with client.websocket_connect("/v1/responses") as websocket:
                 websocket.send_json({
                     "type": "response.create", "model": "gpt-test", "input": [],

@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 from starlette.requests import Request
 
 from retry_proxy.api import create_handlers
+from tests.asyncio_compat import ThreadedAsyncTestCase
 
 
 RULE_FILE = os.path.join(
@@ -51,7 +52,7 @@ def _request(body, content_length=True):
     }))
 
 
-class DlpApiTests(unittest.IsolatedAsyncioTestCase):
+class DlpApiTests(ThreadedAsyncTestCase):
     async def call_proxy(self, body, config, pools=None):
         service = SimpleNamespace(request=AsyncMock())
         proxy = create_handlers(service, SimpleNamespace())[-1]
