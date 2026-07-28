@@ -20,7 +20,7 @@
 | `ADMIN_PASSWORD` | 空 | 管理页面密码；未配置时 `/stats*`、`/logs*` 和 `/key-pools` 禁用。兼容旧 `ADMIN_TOKEN` |
 | `ADMIN_COOKIE_SECURE` | `false` | HTTPS 部署时设为 `true`，限制登录 Cookie 仅通过 HTTPS 发送 |
 | `PROXY_API_KEY` | 空 | 下游使用号池的凭据；未携带或不匹配时仅作普通透传 |
-| `TRUSTED_PROXIES` | 空 | 信任的反向代理 IP（逗号分隔）；仅这些 IP 的请求才采用转发头中的客户端 IP，避免伪造 |
+| `TRUSTED_PROXIES` | 空 | 信任的反向代理 IP（逗号分隔）；仅这些 IP 的请求才采用转发头，并从 `X-Forwarded-For` 右侧跳过可信代理得到客户端 IP |
 | `PROVIDER_ALIASES` | 空 | 统计 provider 显示别名，格式为 `from:to,from:to`；不会改变实际路由 |
 
 ## 上游、路由与网络

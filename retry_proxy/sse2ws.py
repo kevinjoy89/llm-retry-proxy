@@ -134,7 +134,7 @@ class Transcript:
     def merge(self, payload):
         previous_id = str(payload.get("previous_response_id") or "").strip()
         incoming = payload.get("input", [])
-        if not isinstance(incoming, list):
+        if isinstance(incoming, str):
             if previous_id:
                 raise BridgeError(
                     "incremental WebSocket input must be an array",
@@ -142,6 +142,12 @@ class Transcript:
                     code="invalid_request_error",
                 )
             return incoming
+        if not isinstance(incoming, list):
+            raise BridgeError(
+                "WebSocket input must be a string or an array",
+                status=400,
+                code="invalid_request_error",
+            )
         if not previous_id:
             return list(incoming)
         if previous_id != self.response_id:
@@ -154,7 +160,10 @@ class Transcript:
 
     def remember(self, response_id, input_items, output_items):
         self.response_id = response_id
-        self.input_items = list(input_items) if isinstance(input_items, list) else []
+        if isinstance(input_items, str):
+            self.input_items = [{"role": "user", "content": input_items}]
+        else:
+            self.input_items = list(input_items) if isinstance(input_items, list) else []
         self.output_items = list(output_items) if isinstance(output_items, list) else []
 
 

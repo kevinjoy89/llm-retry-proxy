@@ -509,7 +509,7 @@ class RetryProxy:
                 session_id, defer_stream_success,
             )
             timeout = getattr(self.config, "responses_header_timeout", 0)
-            if timeout > 0 and _is_responses_path(path):
+            if not defer_stream_success and timeout > 0 and _is_responses_path(path):
                 try:
                     return await asyncio.wait_for(work, timeout=timeout)
                 except asyncio.TimeoutError:

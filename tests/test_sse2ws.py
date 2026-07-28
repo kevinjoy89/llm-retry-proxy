@@ -115,6 +115,28 @@ class TranscriptTests(unittest.TestCase):
             Transcript().merge({"previous_response_id": "missing", "input": []})
         self.assertEqual(raised.exception.code, "previous_response_not_found")
 
+    def test_string_input_is_preserved_for_incremental_replay(self):
+        state = Transcript()
+        state.remember(
+            "resp-1", "original prompt",
+            [{"type": "function_call", "call_id": "call-1"}],
+        )
+
+        merged = state.merge({
+            "previous_response_id": "resp-1",
+            "input": [{
+                "type": "function_call_output", "call_id": "call-1",
+                "output": "done",
+            }],
+        })
+
+        self.assertEqual(merged[0], {
+            "role": "user", "content": "original prompt",
+        })
+        self.assertEqual([item.get("type") for item in merged[1:]], [
+            "function_call", "function_call_output",
+        ])
+
 
 class DlpBridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_block_mode_rejects_sensitive_websocket_input(self):

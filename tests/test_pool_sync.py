@@ -5,7 +5,7 @@ import tempfile
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -396,6 +396,26 @@ class ExternalDataParserTests(unittest.TestCase):
         self.assertEqual(config["url"], "https://metrics.test/groups")
 
 
+class ExternalDataNetworkSafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dns_resolving_to_private_address_is_rejected_before_fetch(self):
+        client = SimpleNamespace(get=AsyncMock())
+        manager = PoolSyncManager({}, SimpleNamespace(), client, {})
+        loop = SimpleNamespace(getaddrinfo=AsyncMock(return_value=[
+            (2, 1, 6, "", ("127.0.0.1", 443)),
+        ]))
+        config = {
+            "url": "https://metrics.test/groups",
+            "query_params": {},
+            "transform": ExternalDataParserTests.TRANSFORM,
+        }
+
+        with patch("retry_proxy.pool_sync.asyncio.get_running_loop", return_value=loop), \
+                self.assertRaisesRegex(PoolSyncError, "非公网"):
+            await manager._fetch_experience_items(config)
+
+        client.get.assert_not_awaited()
+
+
 class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -408,6 +428,12 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
             key_pool_sync_secret="",
             provider="test-provider",
         )
+        self.destination_check = patch(
+            "retry_proxy.pool_sync._ensure_public_url_destination",
+            new_callable=AsyncMock,
+        )
+        self.destination_check.start()
+        self.addCleanup(self.destination_check.stop)
 
     def tearDown(self):
         self.tempdir.cleanup()

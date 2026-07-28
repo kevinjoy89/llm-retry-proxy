@@ -1,7 +1,10 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from retry_proxy.api import outbound_request_headers
+from starlette.requests import Request
+
+from retry_proxy.api import _request_ip, outbound_request_headers
 
 
 class OutboundRequestHeadersTests(unittest.TestCase):
@@ -29,6 +32,49 @@ class OutboundRequestHeadersTests(unittest.TestCase):
         self.assertEqual(headers["user-agent"], "client/1.0")
         self.assertEqual(headers["accept-encoding"], "gzip, deflate")
         self.assertNotIn("originator", headers)
+
+
+class RequestIpTests(unittest.TestCase):
+    @staticmethod
+    def _request(headers, direct="127.0.0.1"):
+        return Request({
+            "type": "http", "method": "GET", "path": "/",
+            "headers": [(name.encode(), value.encode()) for name, value in headers.items()],
+            "query_string": b"", "server": ("test", 80),
+            "client": (direct, 1234),
+        })
+
+    def test_forwarded_chain_discards_attacker_prefix(self):
+        request = self._request({
+            "x-forwarded-for": "203.0.113.7, 198.51.100.20",
+            "x-real-ip": "198.51.100.20",
+        })
+        config = SimpleNamespace(trusted_proxies=frozenset({"127.0.0.1"}))
+
+        with patch("retry_proxy.api.settings", config):
+            client_ip = _request_ip(request)
+
+        self.assertEqual(client_ip, "198.51.100.20")
+
+    def test_untrusted_peer_cannot_supply_forwarded_ip(self):
+        request = self._request({"x-forwarded-for": "203.0.113.7"}, "198.51.100.20")
+        config = SimpleNamespace(trusted_proxies=frozenset({"127.0.0.1"}))
+
+        with patch("retry_proxy.api.settings", config):
+            client_ip = _request_ip(request)
+
+        self.assertEqual(client_ip, "198.51.100.20")
+
+    def test_trusted_proxy_addresses_are_compared_in_canonical_form(self):
+        request = self._request(
+            {"x-forwarded-for": "2001:db8::20"}, "2001:0db8:0:0:0:0:0:1",
+        )
+        config = SimpleNamespace(trusted_proxies=frozenset({"2001:db8::1"}))
+
+        with patch("retry_proxy.api.settings", config):
+            client_ip = _request_ip(request)
+
+        self.assertEqual(client_ip, "2001:db8::20")
 
 
 if __name__ == "__main__":

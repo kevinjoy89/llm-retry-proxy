@@ -182,7 +182,7 @@ class RetryLoggingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_deferred_stream_success_uses_bridge_timeout_instead_of_header_timeout(self):
         config = SimpleNamespace(
-            responses_header_timeout=1, responses_attempt_header_timeout=0.001,
+            responses_header_timeout=0.001, responses_attempt_header_timeout=0.001,
             hedge_mode="off", max_retries=1,
         )
         pool = KeyPool([("only", "only")])

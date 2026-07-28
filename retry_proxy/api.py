@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import json
 import os
 import re
@@ -330,16 +331,43 @@ def _cumulative(summary):
 
 def _request_ip(request):
     direct = request.client.host if request.client else ""
-    # Only honor forwarded IP headers when the request arrives from a trusted
-    # proxy; otherwise any client can spoof its origin via these headers.
-    if direct and getattr(settings, "trusted_proxies", frozenset()):
-        trusted = settings.trusted_proxies
-        if direct in trusted:
-            for header in ("cf-connecting-ip", "x-forwarded-for", "x-real-ip"):
-                value = request.headers.get(header, "").strip()
-                if value:
-                    return value.split(",", 1)[0].strip()
-    return direct
+    try:
+        direct_ip = str(ipaddress.ip_address(direct))
+    except ValueError:
+        return direct
+    trusted = set()
+    for value in getattr(settings, "trusted_proxies", frozenset()):
+        try:
+            trusted.add(str(ipaddress.ip_address(value)))
+        except ValueError:
+            continue
+    if direct_ip not in trusted:
+        return direct
+
+    # Walk X-Forwarded-For from the trusted peer towards the client. Proxies
+    # commonly append to this header, so taking the left-most value would keep
+    # an attacker-supplied prefix instead of the actual client address.
+    forwarded = request.headers.get("x-forwarded-for", "")
+    chain = []
+    for value in forwarded.split(","):
+        value = value.strip()
+        try:
+            chain.append(str(ipaddress.ip_address(value)))
+        except ValueError:
+            continue
+    for value in reversed(chain):
+        if value not in trusted:
+            return value
+    if chain:
+        return chain[0]
+
+    for header in ("cf-connecting-ip", "x-real-ip"):
+        value = request.headers.get(header, "").strip()
+        try:
+            return str(ipaddress.ip_address(value))
+        except ValueError:
+            continue
+    return direct_ip
 
 
 def _key_pool_secrets():

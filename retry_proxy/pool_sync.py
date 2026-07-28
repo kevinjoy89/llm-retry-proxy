@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import socket
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -43,12 +44,7 @@ def _mask_key(raw_key):
 
 
 def _is_private_or_loopback_host(hostname):
-    """Block direct private/loopback/link-local IP literals to mitigate SSRF.
-
-    Only inspects IP literals; DNS-resolvable hostnames are not resolved here
-    (no blocking I/O on the validation path). Catches the common SSRF vectors
-    like 127.0.0.1, 10.x, 169.254.169.254, ::1.
-    """
+    """Return whether an IP literal is not globally routable."""
     if not hostname:
         return False
     host = hostname.strip().rstrip(".").lower()
@@ -61,7 +57,27 @@ def _is_private_or_loopback_host(hostname):
         addr = ipaddress.ip_address(host)
     except ValueError:
         return False
-    return addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved
+    return not addr.is_global
+
+
+async def _ensure_public_url_destination(url):
+    """Resolve a URL immediately before use and reject non-public addresses."""
+    parsed = urlsplit(url)
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise PoolSyncError("外部数据 URL 端口无效") from exc
+    try:
+        addresses = await asyncio.get_running_loop().getaddrinfo(
+            parsed.hostname, port, type=socket.SOCK_STREAM,
+        )
+    except OSError as exc:
+        raise PoolSyncError(f"外部数据 URL 域名解析失败: {exc}") from exc
+    resolved = {item[4][0] for item in addresses if item[4]}
+    if not resolved:
+        raise PoolSyncError("外部数据 URL 域名未解析到地址")
+    if any(_is_private_or_loopback_host(address) for address in resolved):
+        raise PoolSyncError("外部数据 URL 域名解析到私有、回环或非公网地址")
 
 
 def _experience_timestamp(value):
@@ -618,6 +634,7 @@ class PoolSyncManager:
         return config
 
     async def _fetch_experience_items(self, config):
+        await _ensure_public_url_destination(config["url"])
         if "query_params" in config:
             params = config.get("query_params") or None
         else:
