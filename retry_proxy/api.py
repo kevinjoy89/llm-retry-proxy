@@ -646,6 +646,7 @@ def create_handlers(service, store, pool_sync=None):
         retry_codes = result.retry_codes
         first_ok = result.first_ok
         key_id = result.key_id
+        key_tag = f" [{key_id}]" if key_id else ""
         key_attempts = getattr(result, "key_attempts", None) or []
         start = result.started_at
         log_record = {"method": request.method, "path": "/" + path,
@@ -667,7 +668,10 @@ def create_handlers(service, store, pool_sync=None):
 
         if response is None:
             await write_log(503, False)
-            logger.error(f"{_tag(request.method, path, provider, model_name, client_ip)} 放弃({total_sent}发) {time.time() - start:.1f}s")
+            logger.error(
+                f"{_tag(request.method, path, provider, model_name, client_ip)}"
+                f"{key_tag} 放弃({total_sent}发) {time.time() - start:.1f}s"
+            )
             reason = getattr(result, "failure_reason", "")
             message = reason or f"upstream overloaded after {total_sent} attempts"
             payload = json.dumps({"error": {"message": message, "type": "upstream_error", "code": "503"}}, ensure_ascii=False)
@@ -740,7 +744,11 @@ def create_handlers(service, store, pool_sync=None):
                     yield chunk
             except httpx.TransportError as e:
                 stream_override = "transport_error"
-                logger.warning(f"{_tag(request.method, path, provider, model_name, client_ip)} 流式中断 #{winner_attempt} {e!r} 总{time.time() - start:.2f}s")
+                logger.warning(
+                    f"{_tag(request.method, path, provider, model_name, client_ip)}"
+                    f"{key_tag} 流式中断 #{winner_attempt} {e!r} "
+                    f"总{time.time() - start:.2f}s"
+                )
             except asyncio.CancelledError:
                 stream_override = "cancelled"
                 raise
@@ -779,19 +787,22 @@ def create_handlers(service, store, pool_sync=None):
                                     entry, *stream_state["cache_usage"], session_id,
                                 )
                             logger.info(
-                                f"{_tag(request.method, path, provider, model_name, client_ip)} "
+                                f"{_tag(request.method, path, provider, model_name, client_ip)}"
+                                f"{key_tag} "
                                 f"Responses流结束 status={stream_status} HTTP={response.status_code} "
                                 f"总{time.time() - start:.2f}s"
                             )
                         elif stream_status == "cancelled":
                             logger.info(
-                                f"{_tag(request.method, path, provider, model_name, client_ip)} "
+                                f"{_tag(request.method, path, provider, model_name, client_ip)}"
+                                f"{key_tag} "
                                 f"Responses流客户端已结束 HTTP={response.status_code} "
                                 f"总{time.time() - start:.2f}s"
                             )
                         else:
                             logger.warning(
-                                f"{_tag(request.method, path, provider, model_name, client_ip)} "
+                                f"{_tag(request.method, path, provider, model_name, client_ip)}"
+                                f"{key_tag} "
                                 f"Responses流失败 status={stream_status} HTTP={response.status_code}"
                                 f"{error_tag} 总{time.time() - start:.2f}s"
                             )

@@ -336,7 +336,7 @@ class RetryProxy:
             if entry: last_key_id = entry.key_id
             async def send(n):
                 sent_at = time.time()
-                key_tag = f"[{entry.key_id}]" if pool and entry else ""
+                key_tag = f" [{entry.key_id}]" if pool and entry else ""
                 self.logger.debug(f"{_tag(method, path, provider, model)}{key_tag} #{n} 发出上游 总{sent_at - t0:.2f}s")
                 try:
                     response = await self._send_upstream(method, url, hdrs, body)
@@ -351,7 +351,7 @@ class RetryProxy:
             start = total_sent; tasks = set()
             for _ in range(to_fire):
                 total_sent += 1; tasks.add(_spawn(send(total_sent)))
-            key_tag = f"[{last_key_id}]" if pool and last_key_id else ""
+            key_tag = f" [{last_key_id}]" if pool and last_key_id else ""
             self.logger.info(f"{_tag(method, path, provider, model)}{key_tag} R{round_num} {to_fire}发(#{start + 1}-#{total_sent}) {time.time() - t0:.1f}s")
             winner = None; winner_attempt = 0; close = []; ra_max = 0.0
             key_failure_statuses = []; remaining = tasks
@@ -426,7 +426,7 @@ class RetryProxy:
             entry = await _pick_key(pool, getattr(self.config, "key_pool_wait_timeout", None), session_id); hdrs = headers_with_key(req_headers, entry.key, entry.auth_header, entry.auth_scheme) if entry else req_headers
             if entry: nonlocal last_key_id; last_key_id = entry.key_id
             sent_at = time.time()
-            key_tag = f"[{entry.key_id}]" if pool and entry else ""
+            key_tag = f" [{entry.key_id}]" if pool and entry else ""
             self.logger.debug(f"{_tag(method, path, provider, model)}{key_tag} #{n} 发出上游 总{sent_at - t0:.2f}s")
             try:
                 response = await self._send_upstream(method, url, hdrs, body)
@@ -445,7 +445,7 @@ class RetryProxy:
             return task
         launch(time.time())
         while True:
-            key_tag = f"[{last_key_id}]" if pool and last_key_id else ""
+            key_tag = f" [{last_key_id}]" if pool and last_key_id else ""
             if not in_flight:
                 if max_attempts > 0 and total_sent >= max_attempts: break
                 wait = max(next_allowed - time.time(), 0)
@@ -470,7 +470,7 @@ class RetryProxy:
                 in_flight.pop(task, None)
                 if task.cancelled(): continue
                 kind, result, attempt, entry = task.result()
-                key_tag = f"[{entry.key_id}]" if pool and entry is not None else ""
+                key_tag = f" [{entry.key_id}]" if pool and entry is not None else ""
                 if kind == "error":
                     _record_key_attempt(key_attempts, entry, None if is_host_level_error(result) else False)
                     last_status = 0; retry_codes.append(0)
@@ -590,7 +590,7 @@ class RetryProxy:
             self.logger.debug(f"{_tag(method, path, provider, model)} #{attempt} 选号 总{time.time() - start:.2f}s")
             entry = await _pick_key(pool, getattr(self.config, "key_pool_wait_timeout", None), session_id); send_headers = headers_with_key(headers, entry.key, entry.auth_header, entry.auth_scheme) if entry else headers
             if entry: last_key_id = entry.key_id
-            key_tag = f"[{last_key_id}]" if pool and last_key_id else ""
+            key_tag = f" [{last_key_id}]" if pool and last_key_id else ""
             if max_attempts > 0 and attempt > max_attempts:
                 self.logger.error(f"{_tag(method, path, provider, model)}{key_tag} 放弃({max_attempts}次) {time.time() - start:.1f}s")
                 break
@@ -643,7 +643,7 @@ class RetryProxy:
             except (httpx.RequestError, httpx.HTTPError) as exc:
                 _record_key_attempt(key_attempts, entry, None if is_host_level_error(exc) else False)
                 last_status = 0; retry_codes.append(0); elapsed = time.time() - cycle
-                key_tag = f"[{last_key_id}]" if pool and last_key_id else ""
+                key_tag = f" [{last_key_id}]" if pool and last_key_id else ""
                 if not model:
                     self.logger.warning(f"{_tag(method, path, provider, model)}{key_tag} ERR #1({elapsed:.2f}s) 不重试")
                     return RetryResult(None, 0, 1, 0, retry_codes, False, last_key_id, start, key_attempts)
@@ -667,7 +667,7 @@ class RetryProxy:
                 except Exception: pass
                 detail = _response_error_message(response)
                 detail_tag = f" 上游={detail}" if detail else ""
-                key_tag = f"[{last_key_id}]" if pool and last_key_id else ""
+                key_tag = f" [{last_key_id}]" if pool and last_key_id else ""
                 if pool and pool.has_fresh():
                     await response.aclose()
                     self.logger.warning(f"{_tag(method, path, provider, model)}{key_tag} {_sc(response.status_code)} #{attempt} 换key{detail_tag} 总{time.time() - start:.1f}s")
@@ -688,7 +688,7 @@ class RetryProxy:
                 await _sleep_before_retry(
                     sleep_for, pool, pool_wait, getattr(self.config, "key_pool_wait_timeout", None),
                 ); continue
-            key_tag = f"[{last_key_id}]" if pool and last_key_id else ""
+            key_tag = f" [{last_key_id}]" if pool and last_key_id else ""
             self.logger.info(f"{_tag(method, path, provider, model)}{key_tag} {_response_status_log(response.status_code, path, body)} #{attempt} {time.time() - start:.2f}s")
             defer_success = (
                 defer_stream_success and response.status_code < 400

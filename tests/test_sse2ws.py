@@ -9,6 +9,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.testclient import WebSocketDenialResponse
+from websockets.exceptions import InvalidStatus
 
 from retry_proxy.sse2ws import (
     BridgeError,
@@ -29,6 +30,7 @@ from tests.asyncio_compat import (TEST_CLIENT_BACKEND_OPTIONS,
 def _settings(**overrides):
     values = {
         "sse2ws_mode": "bridge",
+        "sse2ws_upstream_transport": "sse",
         "sse2ws_first_event_timeout": 0.1,
         "sse2ws_first_event_retries": 1,
         "max_retries": 10,
@@ -421,7 +423,8 @@ class _Service:
     def __init__(self):
         self.bodies = []
 
-    async def request(self, _method, _url, _headers, body, *_args, **_kwargs):
+    async def request(self, _method, _url, _headers, body, _path, _provider,
+                      _model, pool, _session_id, **_kwargs):
         payload = json.loads(body)
         self.bodies.append(payload)
         call = len(self.bodies)
@@ -431,13 +434,19 @@ class _Service:
             "id": "call-1" if call == 1 else "answer-2",
             "call_id": "call-1" if call == 1 else None,
         }]
-        return _result(_sse_response([
+        result = _result(_sse_response([
             {"type": "response.created", "response": {"id": response_id}},
             {"type": "response.output_item.done", "item": output[0]},
             {"type": "response.completed", "response": {
                 "id": response_id, "output": output,
             }},
         ]))
+        if pool is not None:
+            entry = pool.pick()
+            result.key_id = entry.key_id
+            result.key_entry = entry
+            result.key_attempts = [{"key_id": entry.key_id, "available": None}]
+        return result
 
 
 class _StallingService:
@@ -479,6 +488,25 @@ class _PoolHttpErrorService:
         return result
 
 
+class _NativeWebSocket:
+    def __init__(self, *messages):
+        self.messages = list(messages)
+        self.sent = []
+        self.closed = asyncio.Event()
+
+    async def send(self, message):
+        self.sent.append(message)
+
+    async def recv(self):
+        if self.messages:
+            return self.messages.pop(0)
+        await self.closed.wait()
+        await asyncio.Future()
+
+    async def close(self, *_args, **_kwargs):
+        self.closed.set()
+
+
 class WebSocketBridgeTests(unittest.TestCase):
     def _app(self, service, store):
         app = FastAPI()
@@ -511,6 +539,184 @@ class WebSocketBridgeTests(unittest.TestCase):
                     pass
 
         self.assertEqual(raised.exception.status_code, 426)
+
+    def test_auto_mode_passthrough_uses_native_upstream_websocket(self):
+        service = SimpleNamespace(request=AsyncMock())
+        store = SimpleNamespace(write=AsyncMock())
+        app = self._app(service, store)
+        config = _settings(sse2ws_upstream_transport="auto")
+        pool = KeyPool([("pool-key", "pool-key")])
+        pool.entries[0].key_id = "A008-Plus/Team|0.02"
+        upstream = _NativeWebSocket(
+            json.dumps({
+                "type": "response.created",
+                "response": {"id": "resp-native"},
+            }),
+            json.dumps({
+                "type": "response.completed",
+                "response": {"id": "resp-native", "output": []},
+            }),
+        )
+
+        with patch("retry_proxy.sse2ws.settings", config), \
+                patch("retry_proxy.config.settings", config), \
+                patch("retry_proxy.sse2ws.KEY_POOLS", {
+                    "https://upstream.test/v1": pool,
+                }), \
+                patch("retry_proxy.sse2ws.match_route",
+                      return_value=("https://upstream.test/v1", "test", "responses")), \
+                patch("retry_proxy.sse2ws.websockets.connect",
+                      new=AsyncMock(return_value=upstream)) as connect, \
+                patch("retry_proxy.sse2ws.logger") as trace_logger, \
+                TestClient(app, backend_options=TEST_CLIENT_BACKEND_OPTIONS) as client:
+            with client.websocket_connect("/v1/responses?trace=yes") as websocket:
+                websocket.send_json({
+                    "type": "response.create",
+                    "model": "gpt-test",
+                    "input": [{"role": "user", "content": "hello"}],
+                })
+                self.assertEqual(websocket.receive_json()["type"], "response.created")
+                self.assertEqual(websocket.receive_json()["type"], "response.completed")
+                websocket.close()
+
+        service.request.assert_not_awaited()
+        self.assertEqual(connect.await_args.args[0],
+                         "wss://upstream.test/v1/responses?trace=yes")
+        self.assertEqual(
+            connect.await_args.kwargs["additional_headers"]["authorization"],
+            "Bearer pool-key",
+        )
+        self.assertEqual(json.loads(upstream.sent[0])["type"], "response.create")
+        record = store.write.await_args.args[0]
+        self.assertEqual(record["upstream_transport"], "websocket")
+        self.assertEqual(record["final_status"], 101)
+        self.assertTrue(record["succeeded"])
+        completed_logs = [
+            call.args[0] for call in trace_logger.info.call_args_list
+            if "Responses WS流结束 status=response.completed HTTP=101" in call.args[0]
+        ]
+        self.assertEqual(len(completed_logs), 1)
+        self.assertIn("[WS→WS /v1/responses]", completed_logs[0])
+        self.assertIn("[A008-Plus/Team|0.02] Responses WS流结束",
+                      completed_logs[0])
+
+    def test_auto_mode_falls_back_to_sse_for_unsupported_websocket(self):
+        service = _Service()
+        store = SimpleNamespace(write=AsyncMock())
+        app = self._app(service, store)
+        config = _settings(sse2ws_upstream_transport="auto")
+        pool = KeyPool([("pool-key", "pool-key")])
+        pool.entries[0].key_id = "A008-Plus/Team|0.02"
+        rejected = InvalidStatus(SimpleNamespace(
+            status_code=404, headers={}, body=b"not found",
+        ))
+
+        with patch("retry_proxy.sse2ws.settings", config), \
+                patch("retry_proxy.config.settings", config), \
+                patch("retry_proxy.sse2ws.KEY_POOLS", {
+                    "https://upstream.test/v1": pool,
+                }), \
+                patch("retry_proxy.sse2ws.match_route",
+                      return_value=("https://upstream.test/v1", "test", "responses")), \
+                patch("retry_proxy.sse2ws.websockets.connect",
+                      new=AsyncMock(side_effect=rejected)) as connect, \
+                patch("retry_proxy.sse2ws.logger") as trace_logger, \
+                TestClient(app, backend_options=TEST_CLIENT_BACKEND_OPTIONS) as client:
+            with client.websocket_connect("/v1/responses") as websocket:
+                websocket.send_json({
+                    "type": "response.create", "model": "gpt-test", "input": [],
+                })
+                events = []
+                while not events or events[-1]["type"] != "response.completed":
+                    events.append(websocket.receive_json())
+                first_id = events[-1]["response"]["id"]
+                websocket.send_json({
+                    "type": "response.create", "model": "gpt-test",
+                    "previous_response_id": first_id, "input": [],
+                })
+                second = []
+                while not second or second[-1]["type"] != "response.completed":
+                    second.append(websocket.receive_json())
+
+        connect.assert_awaited_once()
+        self.assertEqual(len(service.bodies), 2)
+        self.assertEqual(store.write.await_args.args[0]["upstream_transport"], "sse")
+        fallback_logs = [
+            call.args[0] for call in trace_logger.info.call_args_list
+            if "上游不支持原生WebSocket" in call.args[0]
+        ]
+        self.assertEqual(len(fallback_logs), 1)
+        self.assertIn("[A008-Plus/Team|0.02] 上游不支持原生WebSocket",
+                      fallback_logs[0])
+        completed_logs = [
+            call.args[0] for call in trace_logger.info.call_args_list
+            if "SSE2WS流结束 status=response.completed HTTP=200" in call.args[0]
+        ]
+        self.assertEqual(len(completed_logs), 2)
+        self.assertTrue(all(
+            "[SSE→WS /v1/responses]" in log
+            and "[A008-Plus/Team|0.02] SSE2WS流结束" in log
+            for log in completed_logs
+        ))
+
+    def test_auto_mode_does_not_fallback_on_websocket_auth_failure(self):
+        service = SimpleNamespace(request=AsyncMock())
+        store = SimpleNamespace(write=AsyncMock())
+        app = self._app(service, store)
+        config = _settings(sse2ws_upstream_transport="auto")
+        rejected = InvalidStatus(SimpleNamespace(
+            status_code=401, headers={},
+            body=b'{"error":{"message":"invalid key"}}',
+        ))
+
+        with patch("retry_proxy.sse2ws.settings", config), \
+                patch("retry_proxy.config.settings", config), \
+                patch("retry_proxy.sse2ws.KEY_POOLS", {}), \
+                patch("retry_proxy.sse2ws.match_route",
+                      return_value=("https://upstream.test/v1", "test", "responses")), \
+                patch("retry_proxy.sse2ws.websockets.connect",
+                      new=AsyncMock(side_effect=rejected)), \
+                TestClient(app, backend_options=TEST_CLIENT_BACKEND_OPTIONS) as client:
+            with client.websocket_connect("/v1/responses") as websocket:
+                websocket.send_json({
+                    "type": "response.create", "model": "gpt-test", "input": [],
+                })
+                error = websocket.receive_json()
+
+        self.assertEqual(error["status"], 401)
+        self.assertEqual(error["error"]["message"], "invalid key")
+        service.request.assert_not_awaited()
+        self.assertEqual(store.write.await_args.args[0]["upstream_transport"], "websocket")
+
+    def test_native_websocket_forwards_binary_messages_both_ways(self):
+        service = SimpleNamespace(request=AsyncMock())
+        store = SimpleNamespace(write=AsyncMock())
+        app = self._app(service, store)
+        config = _settings(sse2ws_upstream_transport="auto")
+        upstream = _NativeWebSocket(b"binary-upstream")
+
+        with patch("retry_proxy.sse2ws.settings", config), \
+                patch("retry_proxy.config.settings", config), \
+                patch("retry_proxy.sse2ws.KEY_POOLS", {}), \
+                patch("retry_proxy.sse2ws.match_route",
+                      return_value=("https://upstream.test/v1", "test", "responses")), \
+                patch("retry_proxy.sse2ws.websockets.connect",
+                      new=AsyncMock(return_value=upstream)), \
+                TestClient(app, backend_options=TEST_CLIENT_BACKEND_OPTIONS) as client:
+            with client.websocket_connect("/v1/responses") as websocket:
+                websocket.send_json({
+                    "type": "response.create", "model": "gpt-test", "input": [],
+                })
+                self.assertEqual(websocket.receive_bytes(), b"binary-upstream")
+                websocket.send_bytes(b"binary-client")
+                for _ in range(100):
+                    if b"binary-client" in upstream.sent:
+                        break
+                    time.sleep(0.001)
+                websocket.close()
+
+        self.assertIn(b"binary-client", upstream.sent)
+        service.request.assert_not_awaited()
 
     def test_invalid_binary_and_unknown_messages_are_rejected(self):
         service = SimpleNamespace(request=AsyncMock())
@@ -625,6 +831,8 @@ class WebSocketBridgeTests(unittest.TestCase):
             if "SSE2WS流结束 status=response.completed HTTP=200" in call.args[0]
         ]
         self.assertEqual(len(completed_logs), 2)
+        self.assertTrue(all("[SSE→WS /v1/responses]" in log
+                            for log in completed_logs))
 
     def test_cancel_before_first_event_closes_upstream_without_closing_websocket(self):
         service = _StallingService()

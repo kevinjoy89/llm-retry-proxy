@@ -99,6 +99,34 @@ class RetryLoggingTests(unittest.IsolatedAsyncioTestCase):
         messages = [call.args[0] for call in trace_logger.info.call_args_list]
         self.assertTrue(any("响应头已建立，等待Responses流结束" in message for message in messages))
 
+    async def test_key_pool_log_tag_is_separated_from_model_tag(self):
+        config = SimpleNamespace(hedge_mode="off", max_retries=1)
+        trace_logger = Mock()
+        pool = KeyPool([("pool-key", "pool-key")])
+        response = httpx.Response(
+            200, request=httpx.Request("POST", "https://upstream.test/responses"),
+        )
+        proxy = RetryProxy(config=config, client=object(), logger_=trace_logger)
+        proxy._send = AsyncMock(return_value=response)
+
+        result = await proxy.request(
+            "POST", "https://upstream.test/responses", {}, b"{}",
+            "aihub/responses", "test", "model", pool,
+        )
+
+        self.assertEqual(result.key_id, "pool-key")
+        messages = [
+            LogCaptureHandler._ANSI_RE.sub("", call.args[0])
+            for method in (trace_logger.debug, trace_logger.info)
+            for call in method.call_args_list
+        ]
+        self.assertTrue(any(
+            "[test/model] [pool-key]" in message for message in messages
+        ))
+        self.assertFalse(any(
+            "[test/model][pool-key]" in message for message in messages
+        ))
+
     async def test_sse2ws_streaming_response_logs_transport_and_first_event_stage(self):
         config = SimpleNamespace(hedge_mode="off", max_retries=1)
         trace_logger = Mock()

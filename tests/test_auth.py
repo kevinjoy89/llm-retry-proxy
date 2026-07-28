@@ -8,7 +8,8 @@ import httpx
 from fastapi import HTTPException
 from starlette.requests import Request
 
-from retry_proxy.config import admin_session_value, can_use_key_pool, require_admin
+from retry_proxy.config import (LogCaptureHandler, admin_session_value,
+                                can_use_key_pool, require_admin)
 from retry_proxy.api import create_handlers
 from retry_proxy.key_pool import KeyEntry, KeyPool
 
@@ -116,6 +117,7 @@ class ProxyPoolRoutingTests(unittest.IsolatedAsyncioTestCase):
             hedge_mode_for=lambda request_pool: "off",
         )
         store = SimpleNamespace(write=AsyncMock())
+        trace_logger = Mock()
         proxy = create_handlers(service, store)[-1]
         request = Request({
             "type": "http", "method": "POST", "path": "/responses",
@@ -129,6 +131,7 @@ class ProxyPoolRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("retry_proxy.api.settings", config), \
                 patch("retry_proxy.config.settings", config), \
+                patch("retry_proxy.api.logger", trace_logger), \
                 patch("retry_proxy.api.KEY_POOLS", {"https://upstream.test": pool}), \
                 patch("retry_proxy.api.match_route",
                       return_value=("https://upstream.test", "test", "responses")), \
@@ -139,6 +142,17 @@ class ProxyPoolRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(body, stream_body)
         record_cache.assert_called_once_with(ANY, entry, 4096, 0, "cache-1")
+        info_messages = [
+            LogCaptureHandler._ANSI_RE.sub("", call.args[0])
+            for call in trace_logger.info.call_args_list
+        ]
+        self.assertTrue(any(
+            "[test/grok-test] [pool-key] Responses流结束" in message
+            for message in info_messages
+        ))
+        self.assertFalse(any(
+            "[test/grok-test][pool-key]" in message for message in info_messages
+        ))
 
     async def test_cancelled_responses_stream_is_logged_as_client_end(self):
         config = SimpleNamespace(
@@ -200,9 +214,18 @@ class ProxyPoolRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["stream_status"], "cancelled")
         self.assertFalse(record["succeeded"])
         self.assertIsNone(record["key_attempts"][-1]["available"])
-        info_messages = [call.args[0] for call in trace_logger.info.call_args_list]
-        warning_messages = [call.args[0] for call in trace_logger.warning.call_args_list]
-        self.assertTrue(any("Responses流客户端已结束" in message for message in info_messages))
+        info_messages = [
+            LogCaptureHandler._ANSI_RE.sub("", call.args[0])
+            for call in trace_logger.info.call_args_list
+        ]
+        warning_messages = [
+            LogCaptureHandler._ANSI_RE.sub("", call.args[0])
+            for call in trace_logger.warning.call_args_list
+        ]
+        self.assertTrue(any(
+            "[test/grok-test] [pool-key] Responses流客户端已结束" in message
+            for message in info_messages
+        ))
         self.assertFalse(any("Responses流失败" in message for message in warning_messages))
 
     async def test_responses_stream_logs_embedded_502_after_body_finishes(self):
@@ -233,6 +256,7 @@ class ProxyPoolRoutingTests(unittest.IsolatedAsyncioTestCase):
             hedge_mode_for=lambda request_pool: "off",
         )
         store = SimpleNamespace(write=AsyncMock())
+        trace_logger = Mock()
         proxy = create_handlers(service, store)[-1]
         request = Request({
             "type": "http", "method": "POST", "path": "/responses",
@@ -246,6 +270,7 @@ class ProxyPoolRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("retry_proxy.api.settings", config), \
                 patch("retry_proxy.config.settings", config), \
+                patch("retry_proxy.api.logger", trace_logger), \
                 patch("retry_proxy.api.KEY_POOLS", {"https://upstream.test": pool}), \
                 patch("retry_proxy.api.match_route",
                       return_value=("https://upstream.test", "test", "responses")), \
@@ -263,6 +288,14 @@ class ProxyPoolRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["stream_error_status"], 502)
         self.assertFalse(record["key_attempts"][-1]["available"])
         self.assertGreater(entry.cooldown_until, time.time())
+        warning_messages = [
+            LogCaptureHandler._ANSI_RE.sub("", call.args[0])
+            for call in trace_logger.warning.call_args_list
+        ]
+        self.assertTrue(any(
+            "[test/grok-test] [pool-key] Responses流失败" in message
+            for message in warning_messages
+        ))
 
     async def test_real_model_not_found_response_updates_the_used_group(self):
         config = SimpleNamespace(

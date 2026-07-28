@@ -20,7 +20,7 @@
 
 - 通用反向代理：透传所有路径、Header、Body、Query
 - 支持 SSE 流式响应；重试只发生在首字节之前
-- 可选 Codex Responses SSE→WebSocket 桥接，兼容只支持 HTTP/SSE 的上游
+- 可选 Codex Responses WebSocket 代理，优先透传原生 WS，不支持时回退 SSE→WS
 - 503/502/504/529/429 自动重试，支持固定间隔、指数退避和 `Retry-After`
 - 默认有最大重试次数保护，可设置为无限重试
 - 响应头附带 `X-Forward-Attempts`，告知客户端本次请求尝试次数
@@ -92,7 +92,7 @@ docker compose up -d --build
 | `RETRY_INTERVAL_429` | `5.0` | 429 专用重试间隔/退避基数 |
 | `RETRY_BROAD` | `off` | 是否把鉴权和网络错误也纳入重试/换 key |
 | `HEDGE_MODE` | `off` | `off` 串行；`race` / `stagger` 竞速 |
-| `SSE2WS_MODE` | `off` | `bridge` 接收 Codex WebSocket，并桥接到上游 HTTP/SSE |
+| `SSE2WS_MODE` | `off` | `bridge` 接收 Codex WebSocket，优先透传上游 WS，不支持时桥接到 HTTP/SSE |
 | `KEY_POOL_FILE` | 空 | CSV 号池文件；优先于 `KEY_POOLS` |
 | `ADMIN_PASSWORD` | 空 | `/stats`、`/logs` 和号池管理页的密码 |
 | `LOG_DIR` | `logs` | 日志目录 |
@@ -100,12 +100,13 @@ docker compose up -d --build
 
 完整配置表和默认值见[配置项](docs/configuration.md)。
 
-## Codex SSE→WebSocket 桥接
+## Codex Responses WebSocket 代理
 
-当上游只支持 Responses HTTP/SSE，而 Codex 使用 WebSocket 更稳定时，可开启：
+需要让 Codex 通过 WebSocket 访问 Responses API 时，可开启：
 
 ```env
 SSE2WS_MODE=bridge
+SSE2WS_UPSTREAM_TRANSPORT=auto
 SSE2WS_FIRST_EVENT_TIMEOUT=30
 SSE2WS_FIRST_EVENT_RETRIES=2
 ```
@@ -119,7 +120,7 @@ wire_api = "responses"
 supports_websockets = true
 ```
 
-桥接会在下游保持 WebSocket，把每个 `response.create` 转为上游 SSE 请求，并在首个事件到达前执行超时重试。工具调用的后续轮次会重放完整 transcript，不依赖上游保存 `previous_response_id`。该模式不是原生上游 WebSocket：上游仍会为每轮建立 HTTP/SSE 请求。
+`auto` 模式会优先连接上游原生 WebSocket 并双向透传；只有上游明确不支持 Upgrade 时，才把每个 `response.create` 转为上游 SSE 请求。SSE 回退会在首个事件到达前执行超时重试，工具调用的后续轮次会重放完整 transcript，不依赖上游保存 `previous_response_id`。可将 `SSE2WS_UPSTREAM_TRANSPORT` 设为 `websocket` 强制只使用原生 WS，或设为 `sse` 跳过探测并始终桥接。
 
 若服务前还有 Nginx，必须为代理路径透传 Upgrade：
 

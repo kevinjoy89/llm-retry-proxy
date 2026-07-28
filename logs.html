@@ -307,7 +307,8 @@
   }
 
   .log-level {
-    flex-shrink: 0;
+    flex: 0 0 64px;
+    width: 64px;
     font-size: 11px;
     font-weight: 700;
     padding: 1px 6px;
@@ -316,6 +317,7 @@
     min-width: 46px;
     text-align: center;
     letter-spacing: 0.02em;
+    white-space: nowrap;
     user-select: none;
   }
 
@@ -419,6 +421,7 @@
     .search-input { width: 140px; }
     .level-filter { gap: 6px; font-size: 11px; }
     .log-ts { min-width: 130px; font-size: 11px; }
+    .log-level { flex-basis: 60px; width: 60px; }
     .terminal { padding: 10px 10px 80px; font-size: 12px; }
   }
 
@@ -426,6 +429,7 @@
     .search-input { width: 100px; }
     .line-count { font-size: 10px; }
     .log-ts { min-width: 110px; font-size: 10px; }
+    .log-level { flex-basis: 58px; width: 58px; }
   }
 
   /* ── Layout ── */
