@@ -102,6 +102,9 @@ Docker 中若 Nginx、Traefik 等反向代理通过容器网络访问本服务�
 | `KEY_TTFT_RETEST_INTERVAL` | `60` | “兼顾两者”轮转复测单个低倍率分组的最小间隔（秒） |
 | `KEY_TTFT_CONFIRMATIONS` | `2` | 当前分组升级前要求的连续慢样本数；低倍率恢复探测达到恢复线后立即切换 |
 | `KEY_TTFT_HYSTERESIS` | `0.1` | 切换滞回比例；目标 5 秒、值为 0.1 时，超过 5.5 秒升级，低于 4.5 秒降回 |
+| `KEY_CACHE_MISS_THRESHOLD` | `3` | 同一 Responses 会话在同一“端点类型 + 模型 + 分组”连续多少次符合条件的响应无缓存后熔断整个分组；`0` = 禁用 |
+| `KEY_CACHE_MISS_MIN_INPUT_TOKENS` | `1024` | 计入连续无缓存判定的最小输入 token 数，短请求不会误触发 |
+| `KEY_CACHE_MISS_COOLDOWN` | `3600` | 连续无缓存分组的熔断时间（秒）；`0` = 禁用 |
 
 ## 在线同步
 

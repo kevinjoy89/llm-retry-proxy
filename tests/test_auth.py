@@ -2,7 +2,7 @@ import asyncio
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 import httpx
 from fastapi import HTTPException
@@ -89,6 +89,57 @@ class ProxyPoolAuthTests(unittest.TestCase):
 
 
 class ProxyPoolRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completed_responses_stream_records_cache_usage(self):
+        config = SimpleNamespace(
+            proxy_api_key="", dlp_mode="off", dlp_max_body_bytes=1024,
+            image_upstream_user_agent="", image_upstream_originator="",
+        )
+        stream_body = (
+            b'data: {"type":"response.completed","response":{"usage":'
+            b'{"input_tokens":4096,"input_tokens_details":{"cached_tokens":0}}}}\n\n'
+        )
+        upstream_response = httpx.Response(
+            200, content=stream_body, headers={"content-type": "text/event-stream"},
+            request=httpx.Request("POST", "https://upstream.test/responses"),
+        )
+        pool = KeyPool([("pool-key", "pool-key")])
+        entry = pool.entries[0]
+        result = SimpleNamespace(
+            response=upstream_response, winner_attempt=1, total_sent=1,
+            last_status=200, retry_codes=[], first_ok=True, key_id=entry.key_id,
+            key_attempts=[{"key_id": entry.key_id, "available": True}],
+            started_at=time.time(), key_entry=entry,
+            response_started_mono=time.monotonic(),
+        )
+        service = SimpleNamespace(
+            request=lambda *args, **kwargs: None,
+            hedge_mode_for=lambda request_pool: "off",
+        )
+        store = SimpleNamespace(write=AsyncMock())
+        proxy = create_handlers(service, store)[-1]
+        request = Request({
+            "type": "http", "method": "POST", "path": "/responses",
+            "headers": [(b"content-type", b"application/json")],
+            "query_string": b"", "server": ("test", 80), "client": ("127.0.0.1", 1),
+        }, receive=AsyncMock(return_value={
+            "type": "http.request",
+            "body": b'{"model":"grok-test","stream":true,"prompt_cache_key":"cache-1"}',
+            "more_body": False,
+        }))
+
+        with patch("retry_proxy.api.settings", config), \
+                patch("retry_proxy.config.settings", config), \
+                patch("retry_proxy.api.KEY_POOLS", {"https://upstream.test": pool}), \
+                patch("retry_proxy.api.match_route",
+                      return_value=("https://upstream.test", "test", "responses")), \
+                patch("retry_proxy.api._run_until_disconnect", AsyncMock(return_value=result)), \
+                patch.object(KeyPool, "record_cache_usage", autospec=True) as record_cache:
+            response = await proxy("responses", request)
+            body = b"".join([chunk async for chunk in response.body_iterator])
+
+        self.assertEqual(body, stream_body)
+        record_cache.assert_called_once_with(ANY, entry, 4096, 0, "cache-1")
+
     async def test_cancelled_responses_stream_is_logged_as_client_end(self):
         config = SimpleNamespace(
             proxy_api_key="", dlp_mode="off", dlp_max_body_bytes=1024,

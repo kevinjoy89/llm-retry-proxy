@@ -12,6 +12,7 @@ from fastapi.responses import Response
 from .api import (
     _key_pool_secrets,
     _request_ip,
+    _response_cache_usage,
     _response_event_status,
     classify_endpoint,
     classify_model_scope,
@@ -586,9 +587,10 @@ async def _relay(websocket, opened):
     output_items = []
     terminal = ""
     sent = False
+    cache_usage = None
 
     async def emit(events):
-        nonlocal response_id, terminal, sent, output_items
+        nonlocal response_id, terminal, sent, output_items, cache_usage
         for event in events:
             error = _event_error(event)
             if error is not None:
@@ -602,6 +604,7 @@ async def _relay(websocket, opened):
             if event.event_type == "response.completed" and isinstance(response_data, dict):
                 if isinstance(response_data.get("output"), list):
                     output_items = response_data["output"]
+                cache_usage = _response_cache_usage(event.payload)
             await websocket.send_text(event.text)
             sent = True
             if event.event_type in _TERMINAL_EVENT_TYPES:
@@ -611,7 +614,7 @@ async def _relay(websocket, opened):
 
     try:
         if await emit(opened.initial_events):
-            return terminal, response_id, output_items, sent
+            return terminal, response_id, output_items, sent, cache_usage
         chunk_task = asyncio.create_task(opened.iterator.__anext__())
         while True:
             kind, value = await _receive_during_stream(websocket, chunk_task)
@@ -646,7 +649,7 @@ async def _relay(websocket, opened):
                 if payload.get("type") == "response.cancel":
                     chunk_task.cancel()
                     await asyncio.gather(chunk_task, return_exceptions=True)
-                    return "cancelled", response_id, output_items, sent
+                    return "cancelled", response_id, output_items, sent, cache_usage
                 await _send_error(websocket, BridgeError(
                     "only one response may be in flight", status=409,
                     code="response_in_progress",
@@ -657,7 +660,7 @@ async def _relay(websocket, opened):
             except BridgeError:
                 raise
             if await emit(events):
-                return terminal, response_id, output_items, sent
+                return terminal, response_id, output_items, sent, cache_usage
             chunk_task = asyncio.create_task(opened.iterator.__anext__())
     except StopAsyncIteration as exc:
         parser.finish()
@@ -831,8 +834,15 @@ def create_sse2ws_handler(service, store):
                         service, request_args, request_pool, session_id, metrics,
                         websocket,
                     )
-                    status, response_id, output_items, sent = await _relay(websocket, opened)
+                    status, response_id, output_items, sent, cache_usage = await _relay(
+                        websocket, opened,
+                    )
                     succeeded = status == "response.completed"
+                    if (succeeded and request_pool is not None
+                            and metrics.key_entry is not None and cache_usage is not None):
+                        request_pool.record_cache_usage(
+                            metrics.key_entry, *cache_usage, session_id,
+                        )
                     await _write_turn_log(
                         store, path, provider, model, upstream, request_pool, client_ip,
                         metrics, 200, status, succeeded,

@@ -24,6 +24,86 @@ class KeyPoolStickyTests(unittest.TestCase):
         }).encode()
         self.assertEqual(parse_request_session_id(body), "thread-id")
 
+    def test_consecutive_cache_misses_cool_the_entire_group(self):
+        pool = KeyPool([])
+        pool.entries = [
+            KeyEntry("cold-1", "cold-1", sort="0.01", group_id="cold", group_name="Cold"),
+            KeyEntry("cold-2", "cold-2", sort="0.01", group_id="cold", group_name="Cold"),
+            KeyEntry("warm", "warm", sort="0.02", group_id="warm", group_name="Warm"),
+        ]
+        pool.finalize_entries()
+        config = SimpleNamespace(
+            key_cache_miss_threshold=3, key_cache_miss_min_input_tokens=1024,
+            key_cache_miss_cooldown=3600, key_ttft_stale_after=300,
+        )
+
+        with patch("retry_proxy.key_pool.settings", config), \
+                patch("retry_proxy.key_pool.time.time", return_value=100):
+            self.assertFalse(pool.record_cache_usage(pool.entries[0], 4096, 0, "session"))
+            self.assertFalse(pool.record_cache_usage(pool.entries[1], 4096, 0, "session"))
+            self.assertTrue(pool.record_cache_usage(pool.entries[0], 4096, 0, "session"))
+            self.assertEqual(pool.pick().group_id, "warm")
+
+        self.assertEqual([entry.cooldown_until for entry in pool.entries[:2]], [3700, 3700])
+        self.assertTrue(all(
+            entry.last_failure_kind == "cache_miss" for entry in pool.entries[:2]
+        ))
+
+    def test_cache_hit_clears_streak_and_cache_only_circuit(self):
+        pool = KeyPool([])
+        pool.entries = [
+            KeyEntry("cold", "cold", sort="0.01", group_id="cold"),
+            KeyEntry("warm", "warm", sort="0.02", group_id="warm"),
+        ]
+        pool.finalize_entries()
+        config = SimpleNamespace(
+            key_cache_miss_threshold=1, key_cache_miss_min_input_tokens=1024,
+            key_cache_miss_cooldown=3600, key_ttft_stale_after=300,
+        )
+
+        with patch("retry_proxy.key_pool.settings", config), \
+                patch("retry_proxy.key_pool.time.time", return_value=100):
+            self.assertTrue(pool.record_cache_usage(pool.entries[0], 4096, 0, "session"))
+            self.assertFalse(pool.record_cache_usage(pool.entries[0], 4096, 1024, "session"))
+
+        self.assertEqual(pool.entries[0].cooldown_until, 0)
+        self.assertEqual(pool.entries[0].last_failure_kind, "")
+        self.assertFalse(pool._cache_metrics)
+
+    def test_cache_miss_ignores_short_inputs_and_never_cools_only_group(self):
+        pool = KeyPool([])
+        pool.entries = [KeyEntry("only", "only", group_id="only")]
+        pool.finalize_entries()
+        config = SimpleNamespace(
+            key_cache_miss_threshold=1, key_cache_miss_min_input_tokens=1024,
+            key_cache_miss_cooldown=3600,
+        )
+
+        with patch("retry_proxy.key_pool.settings", config):
+            self.assertFalse(pool.record_cache_usage(pool.entries[0], 100, 0, "session"))
+            self.assertFalse(pool.record_cache_usage(pool.entries[0], 4096, 0, "session"))
+
+        self.assertEqual(pool.entries[0].cooldown_until, 0)
+
+    def test_cache_misses_require_one_continuous_session(self):
+        pool = KeyPool([])
+        pool.entries = [
+            KeyEntry("cold", "cold", group_id="cold"),
+            KeyEntry("warm", "warm", group_id="warm"),
+        ]
+        pool.finalize_entries()
+        config = SimpleNamespace(
+            key_cache_miss_threshold=2, key_cache_miss_min_input_tokens=1024,
+            key_cache_miss_cooldown=3600,
+        )
+
+        with patch("retry_proxy.key_pool.settings", config):
+            self.assertFalse(pool.record_cache_usage(pool.entries[0], 4096, 0))
+            self.assertFalse(pool.record_cache_usage(pool.entries[0], 4096, 0, "one"))
+            self.assertFalse(pool.record_cache_usage(pool.entries[0], 4096, 0, "two"))
+
+        self.assertEqual(pool.entries[0].cooldown_until, 0)
+
     def test_session_affinity_isolated_and_fails_over_by_rate(self):
         pool = KeyPool([])
         pool.entries = [

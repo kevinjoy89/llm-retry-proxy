@@ -11,7 +11,10 @@ from collections import OrderedDict
 
 from .config import logger, settings
 
-_FAILURE_KIND_PRIORITY = {"transport": 1, "probe": 2, "upstream": 2, "rate_limit": 3, "auth": 4}
+_FAILURE_KIND_PRIORITY = {
+    "transport": 1, "cache_miss": 1, "probe": 2, "upstream": 2,
+    "rate_limit": 3, "auth": 4,
+}
 _RUNTIME_FIELDS = (
     "cooldown_until", "total_fail", "last_fail_ts", "consecutive_failures",
     "last_failure_kind", "last_failure_status", "last_cooldown_s",
@@ -123,6 +126,7 @@ class KeyPool:
         self._view_access_sequence = 0
         self._last_view_access = 0
         self._metrics = {}
+        self._cache_metrics = OrderedDict()
         self.prior_metrics = {}
         self._balanced_group = None
         self._failover_floor = None
@@ -605,6 +609,86 @@ class KeyPool:
             if self._group_key(candidate) == group_key:
                 candidate.probe_latency_s = seconds
                 candidate.probe_last_ts = now
+
+    def record_cache_usage(self, entry, input_tokens, cached_tokens, session_id=""):
+        """Track Responses cache reads and cool a consistently cold group."""
+        if (entry is None or getattr(entry, "_retired", False)
+                or not session_id):
+            return False
+        threshold = max(int(self._setting("key_cache_miss_threshold", 3)), 0)
+        cooldown = max(float(self._setting("key_cache_miss_cooldown", 3600)), 0.0)
+        min_input = max(int(self._setting("key_cache_miss_min_input_tokens", 1024)), 0)
+        if threshold == 0 or cooldown == 0 or input_tokens < min_input:
+            return False
+
+        group_key = self._group_key(entry)
+        metric_key = (group_key, session_id)
+        metric = self._cache_metrics.get(metric_key)
+        if metric is None:
+            if len(self._cache_metrics) >= _SESSION_ROUTE_LIMIT:
+                self._cache_metrics.popitem(last=False)
+            metric = {
+                "miss_streak": 0, "last_ts": 0.0, "circuit_until": 0.0,
+            }
+            self._cache_metrics[metric_key] = metric
+        else:
+            self._cache_metrics.move_to_end(metric_key)
+        now = time.time()
+        metric["last_ts"] = now
+        if cached_tokens > 0:
+            for key in list(self._cache_metrics):
+                if key[0] == group_key:
+                    self._cache_metrics.pop(key, None)
+            cleared = False
+            for peer in self.entries:
+                if (self._group_key(peer) == group_key
+                        and peer.last_failure_kind == "cache_miss"):
+                    peer.cooldown_until = 0.0
+                    peer.consecutive_failures = 0
+                    peer.last_failure_kind = ""
+                    peer.last_failure_status = None
+                    peer.last_cooldown_s = 0.0
+                    cleared = True
+            if cleared:
+                self._failover_floor = None
+            return False
+
+        metric["miss_streak"] += 1
+        if metric["miss_streak"] < threshold:
+            return False
+        alternatives = {
+            self._group_key(candidate) for candidate in self.entries
+            if self._group_key(candidate) != group_key
+            and candidate.cooldown_until <= now
+        }
+        if not alternatives:
+            return False
+
+        if metric["circuit_until"] <= now:
+            metric["circuit_until"] = now + cooldown
+            logger.warning(
+                "号池分组连续无缓存，已长时间熔断: "
+                f"group={entry.group_name or group_key} workload={self._workload[0]}/"
+                f"{self._workload[1]} misses={metric['miss_streak']} cooldown={cooldown:.0f}s"
+            )
+        remaining = max(metric["circuit_until"] - now, 0.0)
+        for peer in self.entries:
+            if self._group_key(peer) == group_key:
+                self.mark_cooldown(
+                    peer, remaining, failure_kind="cache_miss", status=None,
+                )
+        return True
+
+    def reset_cache_circuit(self, group_id=None):
+        targets = [self, *self._views.values()]
+        for target in targets:
+            if group_id is None:
+                target._cache_metrics.clear()
+            else:
+                group_key = str(group_id)
+                for key in list(target._cache_metrics):
+                    if key[0] == group_key:
+                        target._cache_metrics.pop(key, None)
 
     def scheduler_status(self, now=None):
         now = time.time() if now is None else now

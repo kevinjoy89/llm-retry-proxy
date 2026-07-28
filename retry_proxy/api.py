@@ -182,6 +182,7 @@ def _new_responses_stream_state():
         "terminal": "",
         "error": False,
         "error_status": None,
+        "cache_usage": None,
         "buffer": b"",
     }
 
@@ -208,6 +209,32 @@ def _response_event_status(payload):
     return None
 
 
+def _response_cache_usage(payload):
+    """Return (input_tokens, cached_tokens) only for explicit cache telemetry."""
+    if not isinstance(payload, dict):
+        return None
+    response = payload.get("response")
+    source = response if isinstance(response, dict) else payload
+    usage = source.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    details = usage.get("input_tokens_details")
+    if not isinstance(details, dict) or "cached_tokens" not in details:
+        return None
+    input_tokens = usage.get("input_tokens")
+    cached_tokens = details.get("cached_tokens")
+    if isinstance(input_tokens, bool) or isinstance(cached_tokens, bool):
+        return None
+    try:
+        input_tokens = int(input_tokens)
+        cached_tokens = int(cached_tokens)
+    except (TypeError, ValueError):
+        return None
+    if input_tokens < 0 or cached_tokens < 0 or cached_tokens > input_tokens:
+        return None
+    return input_tokens, cached_tokens
+
+
 def _consume_responses_sse(state, chunk):
     state["buffer"] = (state["buffer"] + chunk).replace(b"\r\n", b"\n")
     while b"\n\n" in state["buffer"]:
@@ -232,6 +259,8 @@ def _consume_responses_sse(state, chunk):
         event_type = event_type or event_name
         if event_type in ("response.completed", "response.incomplete"):
             state["terminal"] = event_type
+            if event_type == "response.completed":
+                state["cache_usage"] = _response_cache_usage(payload)
         elif event_type in ("error", "response.failed", "response.error") or (
             isinstance(payload, dict) and isinstance(payload.get("error"), dict)
         ):
@@ -674,6 +703,7 @@ def create_handlers(service, store, pool_sync=None):
             stream_state = _new_responses_stream_state()
             bad_gateway_body = False
             stream_override = ""
+            cache_body = bytearray() if endpoint_family == "responses" and not responses_stream else None
             try:
                 async for chunk in response.aiter_bytes():
                     if responses_stream and chunk:
@@ -685,6 +715,11 @@ def create_handlers(service, store, pool_sync=None):
                                     b"bad gateway" in lower or b"<html" in lower
                                 )
                             )
+                    elif cache_body is not None and chunk:
+                        if len(cache_body) + len(chunk) <= 1_048_576:
+                            cache_body.extend(chunk)
+                        else:
+                            cache_body = None
                     if not ttft_recorded and response.status_code < 400 and chunk:
                         if is_sse:
                             probe_buffer += chunk.replace(b"\r\n", b"\n")
@@ -727,6 +762,11 @@ def create_handlers(service, store, pool_sync=None):
                                 )
                         error_tag = f" 内嵌HTTP={stream_error_status}" if stream_error_status else ""
                         if succeeded:
+                            if (request_pool is not None and entry is not None
+                                    and stream_state["cache_usage"] is not None):
+                                request_pool.record_cache_usage(
+                                    entry, *stream_state["cache_usage"], session_id,
+                                )
                             logger.info(
                                 f"{_tag(request.method, path, provider, model_name, client_ip)} "
                                 f"Responses流结束 status={stream_status} HTTP={response.status_code} "
@@ -748,5 +788,15 @@ def create_handlers(service, store, pool_sync=None):
                         if stream_error_status:
                             extra["stream_error_status"] = stream_error_status
                         await write_log(response.status_code, succeeded, **extra)
+                    elif (cache_body is not None and response.status_code < 400
+                          and request_pool is not None and entry is not None):
+                        try:
+                            cache_usage = _response_cache_usage(json.loads(cache_body))
+                        except (TypeError, ValueError, UnicodeDecodeError):
+                            cache_usage = None
+                        if cache_usage is not None:
+                            request_pool.record_cache_usage(
+                                entry, *cache_usage, session_id,
+                            )
         return StreamingResponse(body_gen(), status_code=response.status_code, headers=headers, media_type=response.headers.get("content-type"))
     return health, stats_page, stats_api, logs_page, logs_history, logs_stream, proxy

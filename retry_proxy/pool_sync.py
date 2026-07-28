@@ -1112,6 +1112,7 @@ class PoolSyncManager:
                 raise PoolSyncError("分组不存在或尚未加载")
             for entry in entries:
                 pool.mark_success(entry)
+            pool.reset_cache_circuit(str(group_id))
             logger.info(
                 f"号池分组已手动解除熔断: upstream={source['base_url']} group={group_id}"
             )
@@ -1127,6 +1128,7 @@ class PoolSyncManager:
                 raise PoolSyncError("号池尚未加载")
             for entry in pool.entries:
                 pool.mark_success(entry)
+            pool.reset_cache_circuit()
             logger.info(f"号池全部分组已手动解除熔断: upstream={source['base_url']}")
             return self.status()
 

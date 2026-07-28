@@ -4,6 +4,7 @@ from retry_proxy.api import (
     _consume_responses_sse,
     _finish_responses_stream_state,
     _new_responses_stream_state,
+    _response_cache_usage,
     _sse_has_token,
 )
 
@@ -37,6 +38,29 @@ class TtftSseTests(unittest.TestCase):
 
 
 class ResponsesStreamStateTests(unittest.TestCase):
+    def test_cache_usage_requires_explicit_valid_cached_tokens(self):
+        payload = {"response": {"usage": {
+            "input_tokens": 4096,
+            "input_tokens_details": {"cached_tokens": 2048},
+        }}}
+
+        self.assertEqual(_response_cache_usage(payload), (4096, 2048))
+        self.assertIsNone(_response_cache_usage({"usage": {"input_tokens": 4096}}))
+        self.assertIsNone(_response_cache_usage({"usage": {
+            "input_tokens": 10,
+            "input_tokens_details": {"cached_tokens": 20},
+        }}))
+
+    def test_completed_event_captures_cache_usage(self):
+        state = _new_responses_stream_state()
+        _consume_responses_sse(
+            state,
+            b'data: {"type":"response.completed","response":{"usage":'
+            b'{"input_tokens":4096,"input_tokens_details":{"cached_tokens":0}}}}\n\n',
+        )
+
+        self.assertEqual(state["cache_usage"], (4096, 0))
+
     def test_completed_event_marks_stream_successful_across_chunks(self):
         state = _new_responses_stream_state()
 
