@@ -497,6 +497,7 @@ async def _wait_for_prime(websocket, awaitable, timeout):
 
 
 async def _open_with_retries(service, request_args, pool, session_id, metrics, websocket=None):
+    path, provider, model = request_args[4:7]
     retries = max(settings.sse2ws_first_event_retries, 0)
     per_key_limit = retries + 1
     total_limit = settings.max_retries
@@ -568,9 +569,10 @@ async def _open_with_retries(service, request_args, pool, session_id, metrics, w
             if total_limit > 0 and (pool is None or not pool.has_fresh()):
                 break
         logger.warning(
-            f"SSE2WS首事件失败 attempt={metrics.bridge_attempts}/"
-            f"{total_limit or '∞'} "
-            f"[{marker}] code={last_error.code}"
+            f"{_tag('WS→SSE', path, provider, model)}{_key_tag(metrics)} "
+            f"SSE2WS首事件失败 bridge#{metrics.bridge_attempts} "
+            f"upstream#{attempt_budget.sent}/{total_limit or '∞'} "
+            f"code={last_error.code}，准备重连"
         )
     raise last_error
 

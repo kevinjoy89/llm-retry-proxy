@@ -336,7 +336,7 @@ class FirstEventRetryTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("retry_proxy.sse2ws.settings", _settings(
             sse2ws_first_event_timeout=0.01,
-        )):
+        )), patch("retry_proxy.sse2ws.logger") as trace_logger:
             opened = await _open_with_retries(
                 service, args, None, "session-1", TurnMetrics(),
             )
@@ -344,6 +344,14 @@ class FirstEventRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service.request.await_count, 2)
         self.assertTrue(blocked.closed.is_set())
         self.assertEqual(opened.initial_events[0].event_type, "response.created")
+        retry_log = trace_logger.warning.call_args.args[0]
+        self.assertIn("[WS→SSE /v1/responses]", retry_log)
+        self.assertIn(
+            "SSE2WS首事件失败 bridge#1 upstream#1/10 "
+            "code=first_event_timeout，准备重连",
+            retry_log,
+        )
+        self.assertNotIn("passthrough", retry_log)
         await opened.result.response.aclose()
 
     async def test_stalled_pool_key_retries_before_failover(self):
