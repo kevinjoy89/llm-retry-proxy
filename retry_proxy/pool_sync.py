@@ -1406,13 +1406,19 @@ class PoolSyncManager:
                 current_prefix = source.get("route_prefix", "")
                 if requested_provider and requested_provider != current_provider:
                     raise PoolSyncError("该手动号池已使用其他 provider；请删除后重新创建")
-                if normalized_route_prefix and normalized_route_prefix != current_prefix:
+                if (normalized_route_prefix is not None
+                        and normalized_route_prefix != current_prefix):
                     raise PoolSyncError("该手动号池已使用其他代理前缀；请删除后重新创建")
                 effective_provider = current_provider
                 effective_prefix = current_prefix
             else:
                 effective_provider = requested_provider or self.config.provider
                 effective_prefix = normalized_route_prefix or ""
+                if (self.route_registry is not None and not effective_prefix
+                        and not self.route_registry.has_route_for_url(base_url)):
+                    raise PoolSyncError(
+                        "该上游地址尚无可用代理路由，请填写代理前缀"
+                    )
                 if self.route_registry is not None and effective_prefix:
                     try:
                         self.route_registry.validate(

@@ -120,6 +120,22 @@ class UsageAccumulatorTests(unittest.TestCase):
         acc.feed_chunk(frame[mid:])
         self.assertEqual(acc.finalize(), (2, 4, 6, 0))
 
+    def test_split_crlf_does_not_end_multiline_sse_frame_early(self):
+        acc = UsageAccumulator("chat", is_sse=True, content_type="text/event-stream")
+        acc.feed_chunk(b'data: {"usage":{"prompt_tokens":3,\r')
+        acc.feed_chunk(
+            b'\ndata: "completion_tokens":5,"total_tokens":8}}\r\n\r\n'
+        )
+        self.assertEqual(acc.finalize(), (3, 5, 8, 0))
+
+    def test_bare_cr_sse_delimiter_is_flushed_on_finalize(self):
+        acc = UsageAccumulator("chat", is_sse=True, content_type="text/event-stream")
+        acc.feed_chunk(
+            b'data: {"usage":{"prompt_tokens":3,'
+            b'"completion_tokens":5,"total_tokens":8}}\r\r'
+        )
+        self.assertEqual(acc.finalize(), (3, 5, 8, 0))
+
     def test_non_stream_invalid_json_returns_none(self):
         acc = UsageAccumulator("chat", is_sse=False)
         acc.feed_chunk(b"not json at all")
@@ -442,6 +458,30 @@ class BodyGenLogWriteTimingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["completion_tokens"], 12)
         self.assertEqual(record["total_tokens"], 20)
         self.assertEqual(record["cached_tokens"], 0)
+
+    async def test_mixed_case_sse_content_type_is_detected(self):
+        sse = (
+            b'data: {"choices":[],"usage":{"prompt_tokens":3,'
+            b'"completion_tokens":5,"total_tokens":8}}\n\n'
+            b'data: [DONE]\n\n'
+        )
+        upstream_response = httpx.Response(
+            200, content=sse, headers={"content-type": "Text/Event-Stream"},
+            request=httpx.Request("POST", "https://upstream.test/v1/chat/completions"),
+        )
+        store = SimpleNamespace(write=AsyncMock())
+        proxy, request, pool, entry, config, result = self._build_proxy(
+            upstream_response, store,
+        )
+
+        response, body = await self._run(proxy, request, pool, config, result)
+
+        self.assertEqual(body, sse)
+        self.assertEqual(response.headers["x-accel-buffering"], "no")
+        record = store.write.await_args.args[0]
+        self.assertEqual(record["prompt_tokens"], 3)
+        self.assertEqual(record["completion_tokens"], 5)
+        self.assertEqual(record["total_tokens"], 8)
 
     async def test_chat_stream_transport_error_marks_failed_in_finally(self):
         # The upstream stream raises a transport error mid-way. The early-write

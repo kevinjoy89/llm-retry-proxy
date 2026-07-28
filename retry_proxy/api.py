@@ -693,13 +693,14 @@ def create_handlers(service, store, pool_sync=None):
                 await write_log(response.status_code, False)
                 return Response(error_body, status_code=response.status_code, headers=headers)
         # 流式响应禁用反向代理缓冲，否则 nginx/群晖反代会攒批 flush 导致远程访问"一顿一顿"
-        if "event-stream" in response.headers.get("content-type", "") or response.headers.get("content-length") is None:
+        if ("event-stream" in response.headers.get("content-type", "").lower()
+                or response.headers.get("content-length") is None):
             headers["X-Accel-Buffering"] = "no"; headers["Cache-Control"] = "no-cache"
         async def body_gen():
             probe_buffer = b""
             ttft_recorded = False
             content_type = response.headers.get("content-type", "")
-            is_sse = "event-stream" in content_type
+            is_sse = "event-stream" in content_type.lower()
             stream_state = _new_responses_stream_state()
             usage_acc = UsageAccumulator(endpoint_family, is_sse, content_type)
             bad_gateway_body = False

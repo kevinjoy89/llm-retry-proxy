@@ -107,6 +107,11 @@ class RouteRegistry:
         route = next((route for route in self._environment if route[1] == upstream_url), None)
         return route[0] if route else ""
 
+    def has_route_for_url(self, upstream_url: str) -> bool:
+        """Return whether an upstream is reachable through the current route table."""
+        upstream_url = (upstream_url or "").strip().rstrip("/")
+        return any(route[1].rstrip("/") == upstream_url for route in self.routes)
+
     def match(self, path: str):
         for prefix, upstream_url, provider, strip in self.routes:
             if not prefix:

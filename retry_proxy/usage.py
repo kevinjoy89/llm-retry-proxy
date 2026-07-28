@@ -68,6 +68,7 @@ class UsageAccumulator:
         self._max_buffer = 1_048_576
         self._truncated = False
         self._supported = self.family in self.SUPPORTED
+        self._pending_sse_cr = False
 
     def feed_chunk(self, chunk):
         """Consume one ``aiter_bytes`` chunk from the upstream response."""
@@ -86,7 +87,22 @@ class UsageAccumulator:
 
     def _feed_sse(self, chunk):
         """Split SSE frames and extract usage from each complete one."""
-        self.buffer = (self.buffer + chunk).replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        raw = chunk
+        # A CRLF delimiter may be split across transport chunks. Preserve a
+        # trailing CR until the next chunk instead of turning it into LF early,
+        # which would combine with the next leading LF into a false blank line.
+        if self._pending_sse_cr:
+            self.buffer += b"\n"
+            self._pending_sse_cr = False
+            if raw.startswith(b"\n"):
+                raw = raw[1:]
+        if raw.endswith(b"\r"):
+            raw = raw[:-1]
+            self._pending_sse_cr = True
+        self.buffer += raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        self._consume_sse_frames()
+
+    def _consume_sse_frames(self):
         while b"\n\n" in self.buffer:
             frame, self.buffer = self.buffer.split(b"\n\n", 1)
             self._handle_sse_frame(frame)
@@ -214,6 +230,10 @@ class UsageAccumulator:
         """Return ``(prompt, completion, total, cached)`` or ``None`` when no usage found."""
         if not self._supported:
             return None
+        if self.is_sse and self._pending_sse_cr:
+            self.buffer += b"\n"
+            self._pending_sse_cr = False
+            self._consume_sse_frames()
         if not self.is_sse and self.buffer and not self._truncated:
             # Non-stream JSON response: parse the buffered body in one shot.
             try:

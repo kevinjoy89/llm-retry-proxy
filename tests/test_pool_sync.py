@@ -1578,6 +1578,39 @@ class ManualAdapterTests(unittest.IsolatedAsyncioTestCase):
             ("https://existing.test", "existing"),
         )
 
+    async def test_manual_source_without_reachable_route_is_rejected(self):
+        from retry_proxy.sync_adapters.manual import ManualAdapter
+        registry = RouteRegistry(self.config)
+        pools = {}
+        manager = PoolSyncManager(
+            pools, self.config, None, {"manual": ManualAdapter()}, registry,
+        )
+
+        with self.assertRaisesRegex(PoolSyncError, "填写代理前缀"):
+            await manager.add_manual_keys(
+                "https://unrouted.test", [{"key": "sk-key-1"}],
+            )
+
+        self.assertEqual(manager.sources, {})
+        self.assertNotIn("https://unrouted.test", pools)
+
+    async def test_manual_source_for_default_upstream_can_omit_route_prefix(self):
+        from retry_proxy.sync_adapters.manual import ManualAdapter
+        registry = RouteRegistry(self.config)
+        pools = {}
+        manager = PoolSyncManager(
+            pools, self.config, None, {"manual": ManualAdapter()}, registry,
+        )
+
+        await manager.add_manual_keys(
+            self.config.upstream_url, [{"key": "sk-key-1"}],
+        )
+
+        self.assertIn(self.config.upstream_url, pools)
+        self.assertEqual(
+            registry.match("v1/chat/completions")[0], self.config.upstream_url,
+        )
+
     async def test_existing_manual_source_rejects_route_changes(self):
         from retry_proxy.sync_adapters.manual import ManualAdapter
         registry = RouteRegistry(self.config)
@@ -1593,6 +1626,11 @@ class ManualAdapterTests(unittest.IsolatedAsyncioTestCase):
             await manager.add_manual_keys(
                 "https://manual.test", [{"key": "sk-key-2"}],
                 route_prefix="/changed",
+            )
+        with self.assertRaisesRegex(PoolSyncError, "其他代理前缀"):
+            await manager.add_manual_keys(
+                "https://manual.test", [{"key": "sk-key-2"}],
+                route_prefix="",
             )
 
         source = next(iter(manager.sources.values()))
