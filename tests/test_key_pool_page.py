@@ -56,6 +56,46 @@ class KeyPoolPageTests(unittest.TestCase):
         self.assertIn("api('experience-source'", self.html)
         self.assertIn("api('experience-mapping'", self.html)
 
+    def test_manual_key_edit_dialog_is_wired(self):
+        self.assertIn('id="manualEditModal"', self.html)
+        self.assertIn('id="manualEditForm"', self.html)
+        self.assertIn('id="editLabel"', self.html)
+        self.assertIn('id="editSort"', self.html)
+        self.assertIn('id="editGroup"', self.html)
+        self.assertIn('id="editModels"', self.html)
+        self.assertIn('id="editPaths"', self.html)
+        self.assertIn('id="manualEditSubmit"', self.html)
+        self.assertIn('编辑 Key', self.html)
+        self.assertIn('data-manual-edit="${esc(k.source_key_id)}"', self.html)
+        self.assertIn("function openManualEdit(sourceId,sourceKeyId)", self.html)
+        self.assertIn("button[data-manual-edit]", self.html)
+        self.assertIn("api('manual-update'", self.html)
+        self.assertIn("group_id:group,group_name:group", self.html)
+        self.assertIn("models:$('editModels').value.trim(),paths:$('editPaths').value.trim()", self.html)
+        self.assertIn("(key.paths||[]).join('; ')", self.html)
+        self.assertIn('id="manualPaths"', self.html)
+        self.assertIn("paths:paths||''", self.html)
+        self.assertIn("$('manualEditModal').classList.remove('open')", self.html)
+
+    def test_manual_source_hides_meta_and_capability_columns(self):
+        # 手动号池展开时隐藏账号所在元信息行，并省略平台/自动能力/手工规则列
+        self.assertIn("policyBar(s)+`<div class=\"source-meta\">", self.html)
+        self.assertIn("s.adapter==='manual'?'':'<th>平台</th>'", self.html)
+        self.assertIn("s.adapter==='manual'?'':'<th>自动能力</th><th>手工规则</th>'", self.html)
+        self.assertIn("platformCell=isManual?'':", self.html)
+        self.assertIn("colspan=\"${isManual?7:10}\"", self.html)
+
+    def test_manual_add_key_dialog_is_wired(self):
+        self.assertIn('id="manualAddModal"', self.html)
+        self.assertIn('id="manualAddForm"', self.html)
+        self.assertIn('id="addKey"', self.html)
+        self.assertIn('id="manualAddSubmit"', self.html)
+        self.assertIn('添加 Key', self.html)
+        self.assertIn('data-manual-add-key="${esc(s.id)}"', self.html)
+        self.assertIn("function openManualAddKey(sourceId)", self.html)
+        self.assertIn("button[data-manual-add-key]", self.html)
+        self.assertIn("base_url:baseUrl,keys:[{key,", self.html)
+
 
 if __name__ == "__main__":
     unittest.main()
