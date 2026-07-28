@@ -528,10 +528,12 @@ class RetryProxy:
 
     async def request(self, method, url, headers, body, path, provider, model, pool=None,
                       session_id="", defer_stream_success=False, max_attempts=None,
-                      attempt_budget=None, log_method=""):
+                      attempt_budget=None, log_method="", request_progress=None,
+                      log_cancelled=True):
         start = time.time()
         spawned = set()
-        progress = {"sent": 0}
+        progress = request_progress if request_progress is not None else {}
+        progress.update({"sent": 0, "key_entry": None, "key_id": "", "key_attempts": []})
         log_method_token = _request_log_method.set(log_method)
         self.logger.debug(f"{_tag(method, path, provider, model)} 开始转发")
         spawned_token = _spawned_tasks.set(spawned)
@@ -567,7 +569,8 @@ class RetryProxy:
             )
         except asyncio.CancelledError:
             await _cancel_spawned(spawned)
-            self.logger.info(f"{_tag(method, path, provider, model)} 下游已断开，停止重试")
+            if log_cancelled:
+                self.logger.info(f"{_tag(method, path, provider, model)} 下游已断开，停止重试")
             raise
         finally:
             _request_attempt_budget.reset(attempt_budget_token)
@@ -585,6 +588,9 @@ class RetryProxy:
             return await self._stagger(method, url, headers, body, path, start, provider, model, pool, session_id)
         max_attempts = _max_attempts(self.config)
         attempt = 0; last_status = 0; retry_codes = []; key_attempts = []; c429 = cother = 0; last_key_id = ""
+        progress = _request_progress.get()
+        if progress is not None:
+            progress["key_attempts"] = key_attempts
         while True:
             attempt += 1
             self.logger.debug(f"{_tag(method, path, provider, model)} #{attempt} 选号 总{time.time() - start:.2f}s")
@@ -594,6 +600,9 @@ class RetryProxy:
             if max_attempts > 0 and attempt > max_attempts:
                 self.logger.error(f"{_tag(method, path, provider, model)}{key_tag} 放弃({max_attempts}次) {time.time() - start:.1f}s")
                 break
+            if progress is not None:
+                progress["key_entry"] = entry
+                progress["key_id"] = entry.key_id if entry is not None else ""
             cycle = time.time()
             cycle_mono = time.monotonic()
             self.logger.debug(f"{_tag(method, path, provider, model)}{key_tag} #{attempt} 发出上游 总{cycle - start:.2f}s")

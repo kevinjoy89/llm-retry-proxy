@@ -3,7 +3,7 @@ import json
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 from fastapi import FastAPI
@@ -21,7 +21,7 @@ from retry_proxy.sse2ws import (
     create_sse2ws_handler,
 )
 from retry_proxy.key_pool import KeyPool
-from retry_proxy.retry import RequestAttemptBudget, RequestAttemptLimit
+from retry_proxy.retry import RequestAttemptBudget, RequestAttemptLimit, RetryProxy
 from tests.asyncio_compat import (TEST_CLIENT_BACKEND_OPTIONS,
                                   ThreadedAsyncTestCase)
 
@@ -401,6 +401,63 @@ class FirstEventRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selected, ["slow", "slow", "good"])
         self.assertGreater(pool.entries[0].cooldown_until, time.time())
         self.assertEqual(opened.result.key_id, "good")
+        await opened.result.response.aclose()
+
+    async def test_header_stall_cools_inflight_pool_key_before_failover(self):
+        pool = KeyPool([("slow", "slow"), ("good", "good")])
+        selected = []
+        trace_logger = Mock()
+        config = _settings(
+            hedge_mode="off",
+            max_retries=10,
+            retry_interval=0,
+            key_pool_wait_timeout=1,
+            key_cooldown=30,
+            key_cooldown_5xx=30,
+            key_cooldown_backoff=False,
+            key_cooldown_max=60,
+            sse2ws_first_event_timeout=0.01,
+            sse2ws_first_event_retries=2,
+        )
+        proxy = RetryProxy(config=config, client=object(), logger_=trace_logger)
+
+        async def send(_method, _url, headers, _body):
+            selected.append(headers.get("authorization"))
+            if headers.get("authorization") == "Bearer slow":
+                await asyncio.Future()
+            return _sse_response([
+                {"type": "response.created", "response": {"id": "resp-ok"}},
+                {"type": "response.completed", "response": {
+                    "id": "resp-ok", "output": [],
+                }},
+            ])
+
+        proxy._send = send
+        args = (
+            "POST", "https://upstream.test/v1/responses", {},
+            b'{"model":"gpt-test","stream":true}', "v1/responses",
+            "test", "gpt-test", pool, "session-1",
+        )
+
+        with patch("retry_proxy.sse2ws.settings", config):
+            metrics = TurnMetrics()
+            opened = await _open_with_retries(
+                proxy, args, pool, "session-1", metrics,
+            )
+
+        self.assertEqual(selected, [
+            "Bearer slow", "Bearer slow", "Bearer slow", "Bearer good",
+        ])
+        self.assertGreater(pool.entries[0].cooldown_until, time.time())
+        self.assertEqual(opened.result.key_id, "good")
+        self.assertEqual(
+            [attempt["available"] for attempt in metrics.key_attempts],
+            [False, False, False, True],
+        )
+        self.assertFalse(any(
+            "下游已断开" in call.args[0]
+            for call in trace_logger.info.call_args_list
+        ))
         await opened.result.response.aclose()
 
     async def test_done_without_terminal_is_rejected_before_downstream_events(self):

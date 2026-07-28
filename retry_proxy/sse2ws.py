@@ -343,6 +343,8 @@ async def _prime(service, method, url, headers, body, path, provider, model, poo
             max_attempts=max_attempts,
             attempt_budget=attempt_budget,
             log_method="WS→SSE",
+            request_progress=result_holder,
+            log_cancelled=False,
         )
         if attempt_budget is not None:
             reported = max(int(getattr(result, "total_sent", 0) or 0), 0)
@@ -524,6 +526,15 @@ async def _open_with_retries(service, request_args, pool, session_id, metrics, w
                 metrics.add_result(result)
             else:
                 metrics.total_sent = max(metrics.total_sent, attempt_budget.sent)
+                progress_attempts = holder.get("key_attempts") or []
+                metrics.key_attempts.extend(dict(attempt) for attempt in progress_attempts)
+                entry = holder.get("key_entry")
+                if entry is not None:
+                    metrics.key_entry = entry
+                    metrics.key_id = getattr(entry, "key_id", "") or ""
+                    metrics.key_attempts.append({
+                        "key_id": metrics.key_id, "available": None,
+                    })
             last_error = BridgeError(
                 f"upstream did not produce a first event within {settings.sse2ws_first_event_timeout:.1f}s",
                 status=504,
@@ -549,7 +560,8 @@ async def _open_with_retries(service, request_args, pool, session_id, metrics, w
             raise
 
         metrics.bridge_retry_reasons.append(last_error.code)
-        entry = getattr(result, "key_entry", None) if result is not None else None
+        entry = (getattr(result, "key_entry", None) if result is not None
+                 else holder.get("key_entry"))
         marker = getattr(entry, "key_id", "") or "__passthrough__"
         failures[marker] = failures.get(marker, 0) + 1
         if failures[marker] >= per_key_limit:
