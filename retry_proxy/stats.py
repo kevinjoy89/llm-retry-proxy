@@ -163,7 +163,7 @@ def _agg_by_key(records: list, key_aliases: dict = None) -> list:
     key_aliases = key_aliases or {}
     attempts = defaultdict(lambda: {
         "attempts": 0, "available": 0, "failed": 0, "ignored": 0, "legacy": 0,
-        "events": [],
+        "events": [], "observations": [],
     })
     requests = {item["key_id"]: item for item in _agg_by(
         records, "key_id", "key_id", key_fn=lambda record: key_aliases.get(record.get("key_id", ""), record.get("key_id", ""))
@@ -186,6 +186,13 @@ def _agg_by_key(records: list, key_aliases: dict = None) -> list:
                     bucket["events"].append((ts, record_index, attempt_index, False))
                 else:
                     bucket["ignored"] += 1
+                available = item.get("available")
+                is_neutral_bridge = (
+                    available is None and record.get("stream_status") == "first_event_timeout"
+                )
+                bucket["observations"].append(
+                    (ts, record_index, attempt_index, is_neutral_bridge)
+                )
             continue
         raw_key_id = record.get("key_id", "")
         key_id = key_aliases.get(raw_key_id, raw_key_id)
@@ -199,6 +206,7 @@ def _agg_by_key(records: list, key_aliases: dict = None) -> list:
             available = _req_succeeded(record)
             bucket["available" if available else "failed"] += 1
             bucket["events"].append((ts, record_index, 0, available))
+            bucket["observations"].append((ts, record_index, 0, False))
 
     out = []
     for key_id in attempts.keys() | requests.keys():
@@ -206,7 +214,9 @@ def _agg_by_key(records: list, key_aliases: dict = None) -> list:
         request = requests.get(key_id, {})
         measured = attempt["available"] + attempt["failed"]
         events = sorted(attempt["events"], key=lambda event: (event[0], event[1], event[2]))
+        observations = sorted(attempt["observations"], key=lambda event: (event[0], event[1], event[2]))
         latest_available = events[-1][3] if events else None
+        latest_neutral = observations[-1][3] if observations else False
         previous_available = events[-2][3] if len(events) > 1 else None
         consecutive_failures = 0
         for event in reversed(events):
@@ -223,6 +233,7 @@ def _agg_by_key(records: list, key_aliases: dict = None) -> list:
             "legacy_attempts": attempt["legacy"],
             "availability_pct": round(attempt["available"] / measured * 100, 2) if measured else None,
             "latest_available": latest_available,
+            "latest_neutral": latest_neutral,
             "previous_available": previous_available,
             "consecutive_failures": consecutive_failures,
             "last_attempt_at": events[-1][0] if events else None,
@@ -260,6 +271,10 @@ def _key_health_status(stats: dict, meta: dict) -> str:
         return "circuit_open"
     if meta.get("consecutive_failures", 0) > 0:
         return "unavailable"
+    # A successful SSE2WS response header is neutralized when its first event
+    # times out. Do not let an older failure remain the current health state.
+    if stats.get("latest_neutral"):
+        return "available"
     if stats.get("latest_available") is False:
         return "unavailable"
     if stats.get("latest_available") is True:
@@ -300,7 +315,7 @@ def compute_key_pool_stats(records: list, pool_configs: list, health_records: li
                 "request_availability_pct": None, "avg_retries": 0, "max_retries": 0,
             })
             health = health_by_key.get(key_id, {})
-            for field in ("latest_available", "previous_available", "consecutive_failures",
+            for field in ("latest_available", "latest_neutral", "previous_available", "consecutive_failures",
                           "last_attempt_at", "last_success_at", "last_failure_at"):
                 stats[field] = health.get(field)
             meta = pool["key_meta"].get(key_id, {})

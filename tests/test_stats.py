@@ -256,6 +256,39 @@ class KeyAvailabilityStatsTests(unittest.TestCase):
         self.assertEqual(key["health_status"], "unavailable")
         self.assertEqual(key["consecutive_failures"], 2)
 
+    def test_neutral_latest_observation_does_not_retain_old_failure_status(self):
+        configs = [{"id": "pool", "provider": "p", "keys": ["key-1"]}]
+        records = [
+            {"ts": "2026-07-17T10:00:00", "provider": "p", "key_pool": "pool",
+             "key_id": "key-1", "final_status": 503,
+             "key_attempts": [{"key_id": "key-1", "available": False}]},
+            # SSE2WS response headers succeeded, but the first event timed out;
+            # this neutral sample is excluded from the availability percentage.
+            {"ts": "2026-07-17T10:01:00", "provider": "p", "key_pool": "pool",
+             "key_id": "key-1", "final_status": 504, "stream_status": "first_event_timeout",
+             "key_attempts": [{"key_id": "key-1", "available": None}]},
+        ]
+
+        key = compute_key_pool_stats(records, configs, health_records=records)[0]["keys"][0]
+
+        self.assertEqual(key["availability_pct"], 0)
+        self.assertEqual(key["latest_available"], False)
+        self.assertEqual(key["health_status"], "available")
+
+    def test_generic_neutral_observation_does_not_clear_old_failure_status(self):
+        configs = [{"id": "pool", "provider": "p", "keys": ["key-1"]}]
+        records = [
+            {"ts": "2026-07-17T10:00:00", "provider": "p", "key_pool": "pool",
+             "key_id": "key-1", "key_attempts": [{"key_id": "key-1", "available": False}]},
+            {"ts": "2026-07-17T10:01:00", "provider": "p", "key_pool": "pool",
+             "key_id": "key-1", "stream_status": "cancelled",
+             "key_attempts": [{"key_id": "key-1", "available": None}]},
+        ]
+
+        key = compute_key_pool_stats(records, configs, health_records=records)[0]["keys"][0]
+
+        self.assertEqual(key["health_status"], "unavailable")
+
     def test_active_cooldown_is_reported_as_open_circuit(self):
         configs = [{"id": "pool", "provider": "p", "keys": [
             {"key_id": "key-1", "cooled": True, "cooldown_remaining": 12},
