@@ -21,6 +21,18 @@ class KeyPoolPageTests(unittest.TestCase):
         self.assertIn("expandedSourceId=opening?String(sourceId):''", self.html)
         self.assertIn("item.classList.toggle('collapsed',!expanded)", self.html)
 
+    def test_full_render_preserves_page_and_table_scroll_positions(self):
+        self.assertIn("function captureScrollState()", self.html)
+        self.assertIn("function restoreScrollState(snapshot)", self.html)
+        self.assertIn("x:window.scrollX,y:window.scrollY", self.html)
+        self.assertIn("window.scrollTo(snapshot.x,snapshot.y)", self.html)
+        self.assertIn('data-scroll-role="scheduler"', self.html)
+        self.assertIn('data-scroll-role="keys"', self.html)
+        self.assertIn("el.scrollLeft=position.left;el.scrollTop=position.top", self.html)
+        self.assertIn("scroller.scrollLeft=left;scroller.scrollTop=top", self.html)
+        self.assertIn("const scrollState=captureScrollState()", self.html)
+        self.assertIn("restoreScrollState(scrollState)", self.html)
+
     def test_external_source_is_configured_and_mapped_in_page(self):
         self.assertIn('.source-policy [hidden]{display:none!important}', self.html)
         self.assertIn('<h3>接口请求</h3>', self.html)
