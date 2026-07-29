@@ -966,6 +966,26 @@ class KeyPoolStickyTests(unittest.TestCase):
             "", "v1/chat/completions", "chat",
         ))
 
+    def test_model_only_capabilities_do_not_restrict_unknown_endpoint_permissions(self):
+        pool = KeyPool([])
+        pool.entries = [KeyEntry("newapi", "newapi", routing_capabilities={
+            "model_patterns": ["gpt-5.4", "gpt-image-1"],
+            "model_list_known": True,
+        })]
+
+        self.assertIsNotNone(pool.for_request(
+            "gpt-5.4", "v1/chat/completions", "chat",
+        ))
+        self.assertIsNotNone(pool.for_request(
+            "gpt-5.4", "v1/responses", "responses",
+        ))
+        self.assertIsNotNone(pool.for_request(
+            "gpt-image-1", "v1/images/generations", "images",
+        ))
+        self.assertIsNone(pool.for_request(
+            "unsupported", "v1/chat/completions", "chat",
+        ))
+
     def test_group_model_lists_keep_paid_fallback(self):
         pool = KeyPool([])
         free = KeyEntry("free", "free", sort="0", routing_capabilities={

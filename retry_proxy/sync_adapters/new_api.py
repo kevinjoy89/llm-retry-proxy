@@ -1,5 +1,7 @@
 import asyncio
+import fnmatch
 
+from ..config import logger
 from .base import PoolSyncAdapter, PoolSyncError, request_with_retry
 
 
@@ -85,6 +87,45 @@ def _model_limits(item):
     if not isinstance(values, (list, tuple)):
         return []
     return [str(value).strip() for value in values if str(value).strip()]
+
+
+def _model_ids(payload):
+    if isinstance(payload, dict):
+        items = payload.get("data")
+        if items is None:
+            items = payload.get("models")
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        items = None
+    if not isinstance(items, list):
+        raise PoolSyncError("模型列表响应格式无法识别")
+    models = []
+    seen = set()
+    for item in items:
+        if isinstance(item, str):
+            value = item
+        elif isinstance(item, dict):
+            value = item.get("id") or item.get("name")
+        else:
+            continue
+        value = str(value or "").strip()
+        if value.startswith("models/"):
+            value = value[7:]
+        normalized = value.lower()
+        if not value or normalized in seen:
+            continue
+        seen.add(normalized)
+        models.append(value)
+    return models
+
+
+def _models_allowed_by_limits(models, limits):
+    patterns = [str(value).strip().lower() for value in limits if str(value).strip()]
+    return [
+        model for model in models
+        if any(fnmatch.fnmatchcase(model.lower(), pattern) for pattern in patterns)
+    ]
 
 
 class NewAPIAdapter(PoolSyncAdapter):
@@ -313,6 +354,63 @@ class NewAPIAdapter(PoolSyncAdapter):
                 client, source, session, "GET", "/api/user/groups",
             )
 
+    async def _get_group_models(self, client, source, api_key):
+        response = await request_with_retry(
+            client, "GET", source["base_url"] + "/v1/models",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            timeout=20,
+        )
+        return _model_ids(_unwrap(response))
+
+    async def _apply_group_model_cache(self, client, source, entries):
+        raw_cache = source.get("group_model_cache")
+        cache = raw_cache if isinstance(raw_cache, dict) else {}
+        cache = {
+            str(group_id): [str(model) for model in models]
+            for group_id, models in cache.items()
+            if isinstance(models, list)
+        }
+        source["group_model_cache"] = cache
+
+        # Restricted Tokens may receive an already filtered /v1/models result,
+        # so only an unrestricted Token can represent the whole group.
+        representatives = {}
+        for item in entries:
+            group_id = str(item.get("group_id") or "")
+            capabilities = item.get("routing_capabilities") or {}
+            if group_id and not capabilities.get("model_list_known"):
+                representatives.setdefault(group_id, item)
+        for group_id, item in representatives.items():
+            if group_id in cache:
+                continue
+            try:
+                cache[group_id] = await self._get_group_models(
+                    client, source, item["key"],
+                )
+            except Exception as exc:
+                logger.warning(
+                    "New API 分组模型列表读取失败: upstream=%s group=%s error=%s",
+                    source["base_url"], item.get("group_name") or group_id, exc,
+                )
+
+        for item in entries:
+            group_id = str(item.get("group_id") or "")
+            if group_id not in cache:
+                continue
+            capabilities = dict(item.get("routing_capabilities") or {})
+            models = list(cache[group_id])
+            if capabilities.get("model_list_known"):
+                models = _models_allowed_by_limits(
+                    models, capabilities.get("model_patterns") or [],
+                )
+            capabilities["model_patterns"] = models
+            capabilities["model_list_known"] = True
+            item["routing_capabilities"] = capabilities
+        return entries
+
     @staticmethod
     def _group_catalog(groups, tokens, default_group="default"):
         counts = {}
@@ -329,7 +427,7 @@ class NewAPIAdapter(PoolSyncAdapter):
             metadata = metadata if isinstance(metadata, dict) else {}
             catalog.append({
                 "id": str(group_id), "name": str(metadata.get("desc") or group_id),
-                "platform": "", "allow_image_generation": False,
+                "platform": "", "allow_image_generation": None,
                 "routing_capabilities": {},
                 "rate_multiplier": _number_text(metadata.get("ratio")),
                 "key_count": counts.get(str(group_id), 0),
@@ -338,7 +436,7 @@ class NewAPIAdapter(PoolSyncAdapter):
         for group_id in counts.keys() - {str(value) for value in (groups or {})}:
             catalog.append({
                 "id": group_id, "name": group_id, "platform": "",
-                "allow_image_generation": False, "routing_capabilities": {},
+                "allow_image_generation": None, "routing_capabilities": {},
                 "rate_multiplier": "", "key_count": counts[group_id],
                 "active_key_count": active_counts.get(group_id, 0),
             })
@@ -374,16 +472,27 @@ class NewAPIAdapter(PoolSyncAdapter):
                 "label": label, "sort": _number_text(metadata.get("ratio")),
                 "key_name": key_name, "group_id": group_id,
                 "group_name": group_name, "platform": "",
-                "allow_image_generation": False,
+                "allow_image_generation": None,
                 "routing_capabilities": capabilities,
             })
+        await self._apply_group_model_cache(client, source, entries)
         return session, entries
 
     async def catalog(self, client, source, session):
         session, tokens = await self._fetch_all_tokens(client, source, session)
         session, groups = await self._fetch_groups(client, source, session)
         groups = groups if isinstance(groups, dict) else {}
-        return session, self._group_catalog(groups, tokens, session.get("user_group"))
+        catalog = self._group_catalog(groups, tokens, session.get("user_group"))
+        model_cache = source.get("group_model_cache")
+        model_cache = model_cache if isinstance(model_cache, dict) else {}
+        for group in catalog:
+            models = model_cache.get(str(group.get("id")))
+            if isinstance(models, list):
+                group["routing_capabilities"] = {
+                    "model_patterns": list(models),
+                    "model_list_known": True,
+                }
+        return session, catalog
 
     async def create_keys(self, client, source, session, group_ids, only_missing=False,
                           options=None):

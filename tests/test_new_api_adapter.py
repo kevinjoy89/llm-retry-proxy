@@ -6,7 +6,7 @@ import httpx
 from retry_proxy.pool_sync import PoolSyncManager
 from retry_proxy.sync_adapters import ADAPTERS, PoolSyncError
 from retry_proxy.sync_adapters.base import request_with_retry
-from retry_proxy.sync_adapters.new_api import NewAPIAdapter, _unwrap
+from retry_proxy.sync_adapters.new_api import NewAPIAdapter, _model_ids, _unwrap
 
 
 def api_response(data=None, *, success=True, status=200, headers=None):
@@ -66,6 +66,14 @@ class NewAPIAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Cloudflare/CDN", str(raised.exception))
         self.assertNotIn("secret response body", str(raised.exception))
+
+    def test_model_ids_parse_openai_and_gemini_shapes(self):
+        self.assertEqual(_model_ids({"data": [
+            {"id": "gpt-5.4"}, {"id": "gpt-5.4"},
+        ]}), ["gpt-5.4"])
+        self.assertEqual(_model_ids({"models": [
+            {"name": "models/gemini-2.5-pro"},
+        ]}), ["gemini-2.5-pro"])
 
     async def test_connect_and_fetch_secure_masked_tokens(self):
         calls = []
@@ -134,6 +142,74 @@ class NewAPIAdapterTests(unittest.IsolatedAsyncioTestCase):
             "model_list_known": True,
         })
         self.assertEqual(len(calls), 4)
+
+    async def test_fetch_probes_and_caches_unrestricted_group_models(self):
+        model_requests = []
+
+        async def handler(request):
+            if request.url.path == "/api/token/":
+                return api_response({"items": [
+                    {
+                        "id": 1, "key": "sk-unrestricted", "name": "all",
+                        "status": 1, "group": "vip",
+                    },
+                    {
+                        "id": 2, "key": "sk-limited", "name": "mini",
+                        "status": 1, "group": "vip", "model_limits_enabled": True,
+                        "model_limits": "gpt-5.4-mini, missing-model",
+                    },
+                    {
+                        "id": 3, "key": "sk-limited-only", "name": "claude",
+                        "status": 1, "group": "limited", "model_limits_enabled": True,
+                        "model_limits": "claude-*",
+                    },
+                ], "total": 3})
+            if request.url.path == "/api/user/self/groups":
+                return api_response({
+                    "vip": {"ratio": 0.5, "desc": "VIP"},
+                    "limited": {"ratio": 1, "desc": "受限"},
+                })
+            if request.url.path == "/v1/models":
+                model_requests.append(request)
+                self.assertEqual(
+                    request.headers["authorization"], "Bearer sk-unrestricted",
+                )
+                return httpx.Response(200, json={"object": "list", "data": [
+                    {"id": "gpt-5.4"}, {"id": "gpt-5.4-mini"},
+                    {"id": "gpt-image-1"},
+                ]})
+            raise AssertionError(request.url)
+
+        source = {"base_url": "https://new-api.test"}
+        session = {"access_token": "access-1"}
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            adapter = NewAPIAdapter()
+            _, first = await adapter.fetch(client, source, session)
+            _, second = await adapter.fetch(client, source, session)
+            _, catalog = await adapter.catalog(client, source, session)
+
+        self.assertEqual(len(model_requests), 1)
+        self.assertEqual(source["group_model_cache"]["vip"], [
+            "gpt-5.4", "gpt-5.4-mini", "gpt-image-1",
+        ])
+        self.assertNotIn("limited", source["group_model_cache"])
+        self.assertEqual(first[0]["routing_capabilities"]["model_patterns"], [
+            "gpt-5.4", "gpt-5.4-mini", "gpt-image-1",
+        ])
+        self.assertEqual(first[1]["routing_capabilities"]["model_patterns"], [
+            "gpt-5.4-mini",
+        ])
+        self.assertEqual(first[2]["routing_capabilities"]["model_patterns"], [
+            "claude-*",
+        ])
+        self.assertEqual(
+            first[0]["routing_capabilities"], second[0]["routing_capabilities"],
+        )
+        vip = next(group for group in catalog if group["id"] == "vip")
+        self.assertIsNone(vip["allow_image_generation"])
+        self.assertEqual(vip["routing_capabilities"]["model_patterns"], [
+            "gpt-5.4", "gpt-5.4-mini", "gpt-image-1",
+        ])
 
     async def test_restored_session_refreshes_before_fetch(self):
         calls = []
@@ -348,6 +424,13 @@ class NewAPIAdapterTests(unittest.IsolatedAsyncioTestCase):
                 return api_response(None, success=False, status=404)
             if request.url.path == "/api/user/groups":
                 return api_response({"default": {"ratio": 1, "desc": "默认分组"}})
+            if request.url.path == "/v1/models":
+                self.assertEqual(
+                    request.headers["authorization"], "Bearer sk-legacy-full",
+                )
+                return httpx.Response(200, json={
+                    "object": "list", "data": [{"id": "gpt-4o-mini"}],
+                })
             raise AssertionError(request.url)
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -362,6 +445,9 @@ class NewAPIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session["cookies"], {"session": "legacy-cookie"})
         self.assertEqual(entries[0]["key"], "sk-legacy-full")
         self.assertEqual(entries[0]["sort"], "1")
+        self.assertEqual(entries[0]["routing_capabilities"], {
+            "model_patterns": ["gpt-4o-mini"], "model_list_known": True,
+        })
 
     async def test_catalog_create_and_delete_tokens_by_group(self):
         created_bodies = []

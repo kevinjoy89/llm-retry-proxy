@@ -91,6 +91,17 @@ class KeyPoolPageTests(unittest.TestCase):
         self.assertIn("platformCell=isManual?'':", self.html)
         self.assertIn("colspan=\"${isManual?7:10}\"", self.html)
 
+    def test_unknown_image_permission_does_not_disable_synced_models(self):
+        self.assertIn(
+            "imagePermissionKnown=Object.prototype.hasOwnProperty.call(c,'image_generation')",
+            self.html,
+        )
+        self.assertIn(
+            "g.allow_image_generation===false?'<span class=\"pill muted\">未开启</span>'",
+            self.html,
+        )
+        self.assertIn("'<span class=\"pill muted\">未知</span>'", self.html)
+
     def test_manual_add_key_dialog_is_wired(self):
         self.assertIn('id="manualAddModal"', self.html)
         self.assertIn('id="manualAddForm"', self.html)

@@ -54,27 +54,28 @@ class KeyEntry:
         self.models = tuple(pattern.lower() for pattern in models)
         self.paths = tuple(pattern.lstrip("/").lower() for pattern in paths)
         capabilities = routing_capabilities if isinstance(routing_capabilities, dict) else {}
-        self.routing_capabilities = {
-            "platform": str(capabilities.get("platform") or "").strip().lower(),
-            "endpoint_families": tuple(
-                str(value).strip().lower() for value in capabilities.get("endpoint_families", ())
-                if str(value).strip()
-            ),
-            "model_patterns": tuple(
-                str(value).strip().lower() for value in capabilities.get("model_patterns", ())
-                if str(value).strip()
-            ),
-            "rejected_models": tuple(
-                str(value).strip().lower() for value in capabilities.get("rejected_models", ())
-                if str(value).strip()
-            ),
-            "model_scopes": tuple(
-                str(value).strip().lower() for value in capabilities.get("model_scopes", ())
-                if str(value).strip()
-            ),
-            "model_list_known": bool(capabilities.get("model_list_known")),
-            "image_generation": bool(capabilities.get("image_generation")),
-        } if capabilities else {}
+        normalized_capabilities = {}
+        if capabilities:
+            if "platform" in capabilities:
+                normalized_capabilities["platform"] = str(
+                    capabilities.get("platform") or ""
+                ).strip().lower()
+            for field in ("endpoint_families", "model_patterns", "rejected_models",
+                          "model_scopes"):
+                if field in capabilities:
+                    normalized_capabilities[field] = tuple(
+                        str(value).strip().lower() for value in capabilities.get(field, ())
+                        if str(value).strip()
+                    )
+            if "model_list_known" in capabilities:
+                normalized_capabilities["model_list_known"] = bool(
+                    capabilities.get("model_list_known")
+                )
+            if "image_generation" in capabilities:
+                normalized_capabilities["image_generation"] = bool(
+                    capabilities.get("image_generation")
+                )
+        self.routing_capabilities = normalized_capabilities
         auth = auth if isinstance(auth, dict) else {}
         self.auth_header = str(auth.get("header") or settings.key_auth_header).strip().lower()
         raw_scheme = auth.get("scheme") if "scheme" in auth else None
@@ -207,11 +208,13 @@ class KeyPool:
         if not capabilities:
             return False
         families = capabilities.get("endpoint_families", ())
-        if endpoint_family and endpoint_family not in families:
+        if (endpoint_family and "endpoint_families" in capabilities
+                and endpoint_family not in families):
             return False
         if model and model in capabilities.get("rejected_models", ()):
             return False
-        if model and _is_image_model(model) and not capabilities.get("image_generation"):
+        if (model and _is_image_model(model) and "image_generation" in capabilities
+                and not capabilities.get("image_generation")):
             return False
         patterns = capabilities.get("model_patterns", ())
         if capabilities.get("model_list_known"):
