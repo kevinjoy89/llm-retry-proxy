@@ -50,10 +50,7 @@ def _log_startup():
     logger.info(f"DLP: 模式={settings.dlp_mode}, 规则={','.join(sorted(settings.dlp_rules)) if settings.dlp_rules else '无'}")
     logger.info(f"代理: trust_env={'是(跟随系统代理)' if settings.trust_env else '否(直连)'}")
     if settings.sse2ws_mode == "bridge":
-        logger.info(
-            f"SSE2WS: 已开启 首事件={settings.sse2ws_first_event_timeout:.0f}s "
-            f"额外重试={settings.sse2ws_first_event_retries}次"
-        )
+        logger.info(f"SSE2WS: 已开启 首事件={settings.sse2ws_first_event_timeout:.0f}s")
     else:
         logger.info("SSE2WS: 未开启")
     logger.info(f"管理端鉴权: {'已启用' if settings.admin_password else '未配置（统计与日志端点已禁用）'}")
@@ -82,8 +79,6 @@ async def lifespan(_app):
         raise ValueError(f"未知 SSE2WS_MODE: {settings.sse2ws_mode!r}")
     if settings.sse2ws_mode == "bridge" and settings.sse2ws_first_event_timeout <= 0:
         raise ValueError("SSE2WS_FIRST_EVENT_TIMEOUT 必须大于 0")
-    if settings.sse2ws_mode == "bridge" and settings.sse2ws_first_event_retries < 0:
-        raise ValueError("SSE2WS_FIRST_EVENT_RETRIES 不能小于 0")
     if settings.max_request_body <= 0:
         raise ValueError("MAX_REQUEST_BODY 必须大于 0")
     if settings.key_cache_miss_threshold < 0:

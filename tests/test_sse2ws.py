@@ -16,12 +16,12 @@ from retry_proxy.sse2ws import (
     Transcript,
     TurnMetrics,
     _dlp_body,
-    _open_with_retries,
+    _open_once,
     _reject_oversized_websocket_message,
     create_sse2ws_handler,
 )
 from retry_proxy.key_pool import KeyPool
-from retry_proxy.retry import RequestAttemptBudget, RequestAttemptLimit, RetryProxy
+from retry_proxy.retry import RetryProxy
 from tests.asyncio_compat import (TEST_CLIENT_BACKEND_OPTIONS,
                                   ThreadedAsyncTestCase)
 
@@ -30,7 +30,6 @@ def _settings(**overrides):
     values = {
         "sse2ws_mode": "bridge",
         "sse2ws_first_event_timeout": 0.1,
-        "sse2ws_first_event_retries": 1,
         "max_retries": 10,
         "retry_broad": False,
         "retry_status_codes": frozenset({429, 502, 503, 504, 524, 529}),
@@ -220,31 +219,8 @@ def _streaming_response(stream, **headers):
     )
 
 
-class FirstEventRetryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_global_attempt_limit_caps_bridge_reconnects(self):
-        stream = _BlockingStream()
-        service = SimpleNamespace(request=AsyncMock(return_value=_result(
-            _streaming_response(stream),
-        )))
-        args = (
-            "POST", "https://upstream.test/v1/responses", {},
-            b'{"model":"gpt-test","stream":true}', "v1/responses",
-            "test", "gpt-test", None, "session-1",
-        )
-        config = _settings(
-            max_retries=1, sse2ws_first_event_timeout=0.01,
-            sse2ws_first_event_retries=3,
-        )
-
-        with patch("retry_proxy.sse2ws.settings", config), \
-                self.assertRaises(BridgeError):
-            await _open_with_retries(
-                service, args, None, "session-1", TurnMetrics(),
-            )
-
-        self.assertEqual(service.request.await_count, 1)
-
-    async def test_zero_global_attempt_limit_allows_bridge_reconnect(self):
+class FirstEventOpenTests(unittest.IsolatedAsyncioTestCase):
+    async def test_first_event_timeout_does_not_reconnect(self):
         blocked = _BlockingStream()
         service = SimpleNamespace(request=AsyncMock(side_effect=[
             _result(_streaming_response(blocked)),
@@ -260,27 +236,17 @@ class FirstEventRetryTests(unittest.IsolatedAsyncioTestCase):
             b'{"model":"gpt-test","stream":true}', "v1/responses",
             "test", "gpt-test", None, "session-1",
         )
-        config = _settings(
-            max_retries=0, sse2ws_first_event_timeout=0.01,
-            sse2ws_first_event_retries=0,
-        )
+        config = _settings(sse2ws_first_event_timeout=0.01)
 
-        with patch("retry_proxy.sse2ws.settings", config):
-            opened = await _open_with_retries(
+        with patch("retry_proxy.sse2ws.settings", config), \
+                self.assertRaises(BridgeError) as raised:
+            await _open_once(
                 service, args, None, "session-1", TurnMetrics(),
             )
 
-        self.assertEqual(service.request.await_count, 2)
+        self.assertEqual(raised.exception.code, "first_event_timeout")
+        self.assertEqual(service.request.await_count, 1)
         self.assertTrue(blocked.closed.is_set())
-        await opened.result.response.aclose()
-
-    async def test_request_attempt_budget_rejects_claim_past_limit(self):
-        budget = RequestAttemptBudget(2)
-        budget.claim()
-        budget.claim()
-
-        with self.assertRaises(RequestAttemptLimit):
-            budget.claim()
 
     async def test_request_level_400_is_not_reclassified_as_key_failure(self):
         pool = KeyPool(["sk-test"])
@@ -300,10 +266,9 @@ class FirstEventRetryTests(unittest.IsolatedAsyncioTestCase):
             "test", "gpt-test", pool, "session-1",
         )
 
-        with patch("retry_proxy.sse2ws.settings", _settings(
-            sse2ws_first_event_retries=0,
-        )), self.assertRaises(BridgeError) as raised:
-            await _open_with_retries(
+        with patch("retry_proxy.sse2ws.settings", _settings()), \
+                self.assertRaises(BridgeError) as raised:
+            await _open_once(
                 service, args, pool, "session-1", TurnMetrics(),
             )
 
@@ -311,7 +276,7 @@ class FirstEventRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entry.total_fail, 0)
         self.assertEqual(entry.cooldown_until, 0)
 
-    async def test_first_event_timeout_closes_attempt_and_retries(self):
+    async def test_first_event_timeout_closes_attempt(self):
         blocked = _BlockingStream()
         stalled = httpx.Response(
             200,
@@ -319,13 +284,7 @@ class FirstEventRetryTests(unittest.IsolatedAsyncioTestCase):
             headers={"content-type": "text/event-stream"},
             request=httpx.Request("POST", "https://upstream.test/v1/responses"),
         )
-        healthy = _sse_response([
-            {"type": "response.created", "response": {"id": "resp-ok"}},
-            {"type": "response.completed", "response": {"id": "resp-ok", "output": []}},
-        ])
-        service = SimpleNamespace(request=AsyncMock(side_effect=[
-            _result(stalled), _result(healthy),
-        ]))
+        service = SimpleNamespace(request=AsyncMock(return_value=_result(stalled)))
         args = (
             "POST", "https://upstream.test/v1/responses", {},
             b'{"model":"gpt-test","stream":true}', "v1/responses",
@@ -334,74 +293,86 @@ class FirstEventRetryTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("retry_proxy.sse2ws.settings", _settings(
             sse2ws_first_event_timeout=0.01,
-        )), patch("retry_proxy.sse2ws.logger") as trace_logger:
-            opened = await _open_with_retries(
+        )), self.assertRaises(BridgeError) as raised:
+            await _open_once(
                 service, args, None, "session-1", TurnMetrics(),
             )
 
-        self.assertEqual(service.request.await_count, 2)
+        self.assertEqual(raised.exception.code, "first_event_timeout")
+        self.assertEqual(service.request.await_count, 1)
         self.assertTrue(blocked.closed.is_set())
-        self.assertEqual(opened.initial_events[0].event_type, "response.created")
-        retry_log = trace_logger.warning.call_args.args[0]
-        self.assertIn("[WS→SSE /v1/responses]", retry_log)
-        self.assertIn(
-            "SSE2WS首事件失败 bridge#1 upstream#1/10 "
-            "code=first_event_timeout，准备重连",
-            retry_log,
-        )
-        self.assertNotIn("passthrough", retry_log)
-        await opened.result.response.aclose()
 
-    async def test_stalled_pool_key_retries_before_failover(self):
-        pool = KeyPool([("slow", "slow"), ("good", "good")])
-        selected = []
+    async def test_first_event_budget_starts_after_response_headers(self):
+        blocked = _BlockingStream()
+        headers_returned = asyncio.Event()
 
-        class PoolService:
-            async def request(self, *_args, **_kwargs):
-                entry = pool.pick()
-                selected.append(entry.key_id)
-                if entry.key_id == "slow":
-                    response = httpx.Response(
-                        200,
-                        stream=_BlockingStream(),
-                        headers={"content-type": "text/event-stream"},
-                        request=httpx.Request("POST", "https://upstream.test/v1/responses"),
-                    )
-                else:
-                    response = _sse_response([
-                        {"type": "response.created", "response": {"id": "resp-ok"}},
-                        {"type": "response.completed", "response": {
-                            "id": "resp-ok", "output": [],
-                        }},
-                    ])
-                result = _result(response)
-                result.key_id = entry.key_id
-                result.key_entry = entry
-                result.key_attempts = [{"key_id": entry.key_id, "available": None}]
-                return result
+        async def delayed_response(*_args, **_kwargs):
+            await asyncio.sleep(0.02)
+            headers_returned.set()
+            return _result(_streaming_response(blocked))
 
+        service = SimpleNamespace(request=AsyncMock(side_effect=delayed_response))
         args = (
             "POST", "https://upstream.test/v1/responses", {},
             b'{"model":"gpt-test","stream":true}', "v1/responses",
-            "test", "gpt-test", pool, "session-1",
+            "test", "gpt-test", None, "session-1",
         )
+
+        with patch("retry_proxy.sse2ws.settings", _settings(
+            sse2ws_first_event_timeout=0.01,
+        )), self.assertRaises(BridgeError):
+            await _open_once(
+                service, args, None, "session-1", TurnMetrics(),
+            )
+
+        self.assertTrue(headers_returned.is_set())
+        self.assertTrue(blocked.closed.is_set())
+
+    async def test_first_event_timeout_is_neutral_for_pool_key(self):
+        pool = KeyPool([("slow", "slow"), ("good", "good")])
+        selected = []
         config = _settings(
+            hedge_mode="off",
+            max_retries=10,
+            retry_interval=0,
+            key_pool_wait_timeout=1,
             sse2ws_first_event_timeout=0.01,
             key_cooldown=30,
             key_cooldown_5xx=30,
             key_cooldown_backoff=False,
             key_cooldown_max=60,
+            responses_attempt_header_timeout=1,
         )
+        proxy = RetryProxy(config=config, client=object(), logger_=Mock())
+        blocked = _BlockingStream()
 
-        with patch("retry_proxy.sse2ws.settings", config):
-            opened = await _open_with_retries(
-                PoolService(), args, pool, "session-1", TurnMetrics(),
+        async def send(_method, _url, headers, _body):
+            selected.append(headers.get("authorization"))
+            return _streaming_response(blocked)
+
+        proxy._send = send
+        args = (
+            "POST", "https://upstream.test/v1/responses", {},
+            b'{"model":"gpt-test","stream":true}', "v1/responses",
+            "test", "gpt-test", pool, "session-1",
+        )
+        metrics = TurnMetrics()
+
+        with patch("retry_proxy.sse2ws.settings", config), \
+                self.assertRaises(BridgeError) as raised:
+            await _open_once(
+                proxy, args, pool, "session-1", metrics,
             )
 
-        self.assertEqual(selected, ["slow", "slow", "good"])
-        self.assertGreater(pool.entries[0].cooldown_until, time.time())
-        self.assertEqual(opened.result.key_id, "good")
-        await opened.result.response.aclose()
+        self.assertEqual(raised.exception.code, "first_event_timeout")
+        self.assertEqual(selected, ["Bearer slow"])
+        self.assertEqual(pool.entries[0].cooldown_until, 0)
+        self.assertEqual(pool.entries[0].total_fail, 0)
+        self.assertEqual(metrics.key_attempts, [{
+            "key_id": pool.entries[0].key_id,
+            "available": None,
+        }])
+        self.assertTrue(blocked.closed.is_set())
 
     async def test_header_stall_cools_inflight_pool_key_before_failover(self):
         pool = KeyPool([("slow", "slow"), ("good", "good")])
@@ -416,8 +387,8 @@ class FirstEventRetryTests(unittest.IsolatedAsyncioTestCase):
             key_cooldown_5xx=30,
             key_cooldown_backoff=False,
             key_cooldown_max=60,
-            sse2ws_first_event_timeout=0.01,
-            sse2ws_first_event_retries=2,
+            responses_attempt_header_timeout=0.01,
+            sse2ws_first_event_timeout=0.2,
         )
         proxy = RetryProxy(config=config, client=object(), logger_=trace_logger)
 
@@ -441,18 +412,18 @@ class FirstEventRetryTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("retry_proxy.sse2ws.settings", config):
             metrics = TurnMetrics()
-            opened = await _open_with_retries(
+            opened = await _open_once(
                 proxy, args, pool, "session-1", metrics,
             )
 
         self.assertEqual(selected, [
-            "Bearer slow", "Bearer slow", "Bearer slow", "Bearer good",
+            "Bearer slow", "Bearer good",
         ])
         self.assertGreater(pool.entries[0].cooldown_until, time.time())
         self.assertEqual(opened.result.key_id, "good")
         self.assertEqual(
             [attempt["available"] for attempt in metrics.key_attempts],
-            [False, False, False, True],
+            [False, True],
         )
         self.assertFalse(any(
             "下游已断开" in call.args[0]
@@ -471,10 +442,9 @@ class FirstEventRetryTests(unittest.IsolatedAsyncioTestCase):
             "test", "gpt-test", None, "session-1",
         )
 
-        with patch("retry_proxy.sse2ws.settings", _settings(
-            sse2ws_first_event_retries=0,
-        )), self.assertRaises(BridgeError) as raised:
-            await _open_with_retries(
+        with patch("retry_proxy.sse2ws.settings", _settings()), \
+                self.assertRaises(BridgeError) as raised:
+            await _open_once(
                 service, args, None, "session-1", TurnMetrics(),
             )
 
@@ -765,7 +735,7 @@ class WebSocketBridgeTests(unittest.TestCase):
             **{"x-request-id": "req-safe", "authorization": "Bearer secret"},
         ))
         app = self._app(service, SimpleNamespace(write=AsyncMock()))
-        config = _settings(sse2ws_first_event_retries=0)
+        config = _settings()
 
         with patch("retry_proxy.sse2ws.settings", config), \
                 patch("retry_proxy.config.settings", config), \
@@ -786,7 +756,7 @@ class WebSocketBridgeTests(unittest.TestCase):
     def test_request_level_400_does_not_cool_pool_key(self):
         pool = KeyPool(["sk-test"])
         app = self._app(_PoolHttpErrorService(), SimpleNamespace(write=AsyncMock()))
-        config = _settings(sse2ws_first_event_retries=0)
+        config = _settings()
 
         with patch("retry_proxy.sse2ws.settings", config), \
                 patch("retry_proxy.config.settings", config), \
@@ -815,7 +785,7 @@ class WebSocketBridgeTests(unittest.TestCase):
         service = _SingleResponseService(_streaming_response(stream))
         store = SimpleNamespace(write=AsyncMock())
         app = self._app(service, store)
-        config = _settings(sse2ws_first_event_retries=2)
+        config = _settings()
 
         with patch("retry_proxy.sse2ws.settings", config), \
                 patch("retry_proxy.config.settings", config), \
@@ -845,7 +815,7 @@ class WebSocketBridgeTests(unittest.TestCase):
         stream = _SequenceStream(created)
         service = _SingleResponseService(_streaming_response(stream))
         app = self._app(service, SimpleNamespace(write=AsyncMock()))
-        config = _settings(sse2ws_first_event_retries=2)
+        config = _settings()
 
         with patch("retry_proxy.sse2ws.settings", config), \
                 patch("retry_proxy.config.settings", config), \

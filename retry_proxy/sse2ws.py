@@ -20,11 +20,10 @@ from .api import (
     parse_request_model,
     parse_request_session_id,
 )
-from .config import can_use_key_pool, logger, settings, should_retry_status
+from .config import can_use_key_pool, logger, settings
 from .dlp import inspect_json_body
 from .key_pool import KEY_POOLS
-from .retry import (RequestAttemptBudget, _mark_key_failure, _tag, reset_client_ip,
-                    set_client_ip)
+from .retry import _mark_key_failure, _tag, reset_client_ip, set_client_ip
 from .routes import is_excluded_path, match_route
 
 
@@ -331,24 +330,17 @@ def _event_error(event):
     return bridge_error
 
 
-async def _prime(service, method, url, headers, body, path, provider, model, pool, session_id,
-                 result_holder=None, max_attempts=None, attempt_budget=None):
+async def _request_stream(service, method, url, headers, body, path, provider, model, pool,
+                          session_id, result_holder=None):
     response = None
     result = None
-    budget_before = attempt_budget.sent if attempt_budget is not None else 0
     try:
         result = await service.request(
             method, url, headers, body, path, provider, model, pool, session_id,
-            defer_stream_success=True,
-            max_attempts=max_attempts,
-            attempt_budget=attempt_budget,
             log_method="WS→SSE",
             request_progress=result_holder,
             log_cancelled=False,
         )
-        if attempt_budget is not None:
-            reported = max(int(getattr(result, "total_sent", 0) or 0), 0)
-            attempt_budget.sent = max(attempt_budget.sent, budget_before + reported)
         if result_holder is not None:
             result_holder["result"] = result
         response = result.response
@@ -374,6 +366,21 @@ async def _prime(service, method, url, headers, body, path, provider, model, poo
         if "text/event-stream" not in response.headers.get("content-type", "").lower():
             raise BridgeError("upstream did not return text/event-stream",
                               status=502, code="invalid_content_type")
+        response = None
+        return result
+    except BridgeError as exc:
+        exc.result = result
+        if response is not None:
+            exc.headers = response.headers
+        raise
+    finally:
+        if response is not None:
+            await response.aclose()
+
+
+async def _prime_first_event(result):
+    response = result.response
+    try:
         parser = ResponsesSseParser()
         iterator = response.aiter_bytes().__aiter__()
         while True:
@@ -412,17 +419,12 @@ async def _prime(service, method, url, headers, body, path, provider, model, poo
             await response.aclose()
 
 
-def _confirm_key_success(opened, pool, session_id, metrics):
+def _record_first_event(opened, pool):
     entry = getattr(opened.result, "key_entry", None)
     if pool is not None and entry is not None:
-        pool.mark_success(entry, session_id=session_id)
         sent_at = getattr(opened.result, "response_started_mono", 0.0)
         if sent_at > 0:
             pool.record_ttft(entry, time.monotonic() - sent_at)
-        for attempt in reversed(metrics.key_attempts):
-            if attempt.get("key_id") == entry.key_id and attempt.get("available") is None:
-                attempt["available"] = True
-                break
 
 
 def _mark_deferred_failure(pool, entry, session_id, metrics, status=0):
@@ -434,149 +436,157 @@ def _mark_deferred_failure(pool, entry, session_id, metrics, status=0):
     _mark_key_failure(pool, entry, settings, status, session_id=session_id)
 
 
+def _mark_key_neutral(entry, metrics):
+    if entry is None:
+        return
+    for attempt in reversed(metrics.key_attempts):
+        if (attempt.get("key_id") == entry.key_id
+                and attempt.get("available") is True):
+            attempt["available"] = None
+            break
+
+
 def _is_key_failure_status(status):
     return status == 0 or status >= 500 or status in (429, 401, 403)
 
 
-async def _wait_for_prime(websocket, awaitable, timeout):
-    if websocket is None:
-        return await asyncio.wait_for(awaitable, timeout=timeout)
-    prime_task = asyncio.create_task(awaitable)
-    deadline = time.monotonic() + timeout
-    try:
-        while True:
-            receive_task = asyncio.create_task(websocket.receive())
-            remaining = max(deadline - time.monotonic(), 0.0)
-            done, _ = await asyncio.wait(
-                (prime_task, receive_task), timeout=remaining,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if not done:
-                receive_task.cancel()
-                await asyncio.gather(receive_task, return_exceptions=True)
-                raise asyncio.TimeoutError
-            if prime_task in done:
-                receive_task.cancel()
-                await asyncio.gather(receive_task, return_exceptions=True)
-                return await prime_task
-            message = await receive_task
-            if message.get("type") == "websocket.disconnect":
-                raise ClientDisconnected
-            if await _reject_oversized_websocket_message(websocket, message):
-                continue
-            raw = message.get("text")
-            if raw is None and message.get("bytes") is not None:
-                await _send_error(websocket, BridgeError(
-                    "binary WebSocket messages are not supported", status=400,
-                    code="unsupported_websocket_message",
-                ))
-                continue
-            try:
-                payload = json.loads(raw or "") if raw is not None else {}
-            except ValueError:
-                payload = {}
-            if isinstance(payload, dict) and payload.get("type") == "response.cancel":
-                raise TurnCancelled
-            await _send_error(websocket, BridgeError(
-                "only response.cancel is allowed while waiting for the first event",
-                status=409,
-                code="response_in_progress",
-            ))
-    finally:
-        if not prime_task.done():
-            prime_task.cancel()
-        await asyncio.gather(prime_task, return_exceptions=True)
+class _ProgressWaiter:
+    def __init__(self, websocket):
+        self.websocket = websocket
+        self.receive_task = None
 
-
-async def _open_with_retries(service, request_args, pool, session_id, metrics, websocket=None):
-    path, provider, model = request_args[4:7]
-    retries = max(settings.sse2ws_first_event_retries, 0)
-    per_key_limit = retries + 1
-    total_limit = settings.max_retries
-    attempt_budget = RequestAttemptBudget(total_limit)
-    failures = {}
-    last_error = BridgeError("upstream did not produce a first event", status=504,
-                             code="first_event_timeout")
-
-    while total_limit == 0 or attempt_budget.sent < total_limit:
-        metrics.bridge_attempts += 1
-        opened = None
-        result = None
-        holder = {}
-        remaining = total_limit - attempt_budget.sent if total_limit > 0 else None
+    async def wait(self, awaitable, timeout=None):
+        if self.websocket is None:
+            if timeout is None:
+                return await awaitable
+            return await asyncio.wait_for(awaitable, timeout=timeout)
+        operation_task = asyncio.create_task(awaitable)
+        deadline = time.monotonic() + timeout if timeout is not None else None
         try:
-            opened = await _wait_for_prime(
-                websocket,
-                _prime(
-                    service, *request_args, result_holder=holder,
-                    max_attempts=remaining,
-                    attempt_budget=attempt_budget,
-                ),
-                settings.sse2ws_first_event_timeout,
-            )
-            result = opened.result
-            metrics.add_result(result)
-            metrics.total_sent = max(metrics.total_sent, attempt_budget.sent)
-            metrics.first_event_s = time.time() - metrics.started_at
-            _confirm_key_success(opened, pool, session_id, metrics)
-            return opened
-        except asyncio.TimeoutError:
-            result = holder.get("result")
-            if result is not None:
-                metrics.add_result(result)
-            else:
-                metrics.total_sent = max(metrics.total_sent, attempt_budget.sent)
-                progress_attempts = holder.get("key_attempts") or []
-                metrics.key_attempts.extend(dict(attempt) for attempt in progress_attempts)
-                entry = holder.get("key_entry")
-                if entry is not None:
-                    metrics.key_entry = entry
-                    metrics.key_id = getattr(entry, "key_id", "") or ""
-                    metrics.key_attempts.append({
-                        "key_id": metrics.key_id, "available": None,
-                    })
-            last_error = BridgeError(
-                f"upstream did not produce a first event within {settings.sse2ws_first_event_timeout:.1f}s",
-                status=504,
-                code="first_event_timeout",
-            )
-        except BridgeError as exc:
-            last_error = exc
-            if getattr(exc, "key_outcome_recorded", False):
-                exc.key_failure_recorded = True
-            result = getattr(exc, "result", None)
-            if result is not None:
-                metrics.add_result(result)
-            metrics.total_sent = max(metrics.total_sent, attempt_budget.sent)
-            if (exc.code == "upstream_unavailable"
-                    or (exc.status < 500 and not should_retry_status(exc.status))):
-                raise
-        except (TurnCancelled, ClientDisconnected):
-            result = holder.get("result")
-            if result is not None:
-                metrics.add_result(result)
-            else:
-                metrics.total_sent = max(metrics.total_sent, attempt_budget.sent)
-            raise
+            while True:
+                if self.receive_task is None:
+                    self.receive_task = asyncio.create_task(self.websocket.receive())
+                remaining = (max(deadline - time.monotonic(), 0.0)
+                             if deadline is not None else None)
+                done, _ = await asyncio.wait(
+                    (operation_task, self.receive_task), timeout=remaining,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    raise asyncio.TimeoutError
+                if self.receive_task in done:
+                    receive_task, self.receive_task = self.receive_task, None
+                    message = await receive_task
+                    if message.get("type") == "websocket.disconnect":
+                        raise ClientDisconnected
+                    if await _reject_oversized_websocket_message(
+                            self.websocket, message):
+                        continue
+                    raw = message.get("text")
+                    if raw is None and message.get("bytes") is not None:
+                        await _send_error(self.websocket, BridgeError(
+                            "binary WebSocket messages are not supported", status=400,
+                            code="unsupported_websocket_message",
+                        ))
+                        continue
+                    try:
+                        payload = json.loads(raw or "") if raw is not None else {}
+                    except ValueError:
+                        payload = {}
+                    if (isinstance(payload, dict)
+                            and payload.get("type") == "response.cancel"):
+                        raise TurnCancelled
+                    await _send_error(self.websocket, BridgeError(
+                        "only response.cancel is allowed while a response is in progress",
+                        status=409,
+                        code="response_in_progress",
+                    ))
+                    continue
+                return await operation_task
+        finally:
+            if not operation_task.done():
+                operation_task.cancel()
+            await asyncio.gather(operation_task, return_exceptions=True)
 
-        metrics.bridge_retry_reasons.append(last_error.code)
+    async def close(self):
+        if self.receive_task is not None and not self.receive_task.done():
+            self.receive_task.cancel()
+        if self.receive_task is not None:
+            await asyncio.gather(self.receive_task, return_exceptions=True)
+        self.receive_task = None
+
+
+async def _open_once(service, request_args, pool, session_id, metrics, websocket=None):
+    waiter = _ProgressWaiter(websocket)
+    try:
+        return await _open_once_inner(
+            service, request_args, pool, session_id, metrics, waiter,
+        )
+    finally:
+        await waiter.close()
+
+
+async def _open_once_inner(service, request_args, pool, session_id, metrics, waiter):
+    metrics.bridge_attempts = 1
+    holder = {}
+    result = None
+    try:
+        result = await waiter.wait(
+            _request_stream(service, *request_args, result_holder=holder),
+        )
+        opened = await waiter.wait(
+            _prime_first_event(result),
+            settings.sse2ws_first_event_timeout,
+        )
+        metrics.add_result(result)
+        metrics.first_event_s = time.time() - metrics.started_at
+        _record_first_event(opened, pool)
+        return opened
+    except asyncio.TimeoutError:
+        error = BridgeError(
+            f"upstream did not produce a first event within "
+            f"{settings.sse2ws_first_event_timeout:.1f}s",
+            status=504,
+            code="first_event_timeout",
+        )
+        error.result = result
+    except BridgeError as exc:
+        error = exc
+        result = getattr(exc, "result", None)
+    except (TurnCancelled, ClientDisconnected):
+        result = holder.get("result")
+        if result is not None:
+            metrics.add_result(result)
+        else:
+            metrics.total_sent = max(metrics.total_sent, holder.get("sent", 0))
+        raise
+
+    result = result or holder.get("result")
+    if result is not None:
+        metrics.add_result(result)
+    else:
+        metrics.total_sent = max(metrics.total_sent, holder.get("sent", 0))
+        metrics.key_attempts.extend(
+            dict(attempt) for attempt in holder.get("key_attempts") or []
+        )
+        entry = holder.get("key_entry")
+        if entry is not None:
+            metrics.key_entry = entry
+            metrics.key_id = getattr(entry, "key_id", "") or ""
+
+    if error.code == "first_event_timeout":
         entry = (getattr(result, "key_entry", None) if result is not None
                  else holder.get("key_entry"))
-        marker = getattr(entry, "key_id", "") or "__passthrough__"
-        failures[marker] = failures.get(marker, 0) + 1
-        if failures[marker] >= per_key_limit:
-            if _is_key_failure_status(last_error.status):
-                _mark_deferred_failure(pool, entry, session_id, metrics, last_error.status)
-                last_error.key_failure_recorded = True
-            if total_limit > 0 and (pool is None or not pool.has_fresh()):
-                break
-        logger.warning(
-            f"{_tag('WS→SSE', path, provider, model)}{_key_tag(metrics)} "
-            f"SSE2WS首事件失败 bridge#{metrics.bridge_attempts} "
-            f"upstream#{attempt_budget.sent}/{total_limit or '∞'} "
-            f"code={last_error.code}，准备重连"
-        )
-    raise last_error
+        _mark_key_neutral(entry, metrics)
+        error.key_failure_recorded = True
+    elif getattr(error, "key_outcome_recorded", False):
+        error.key_failure_recorded = True
+    elif _is_key_failure_status(error.status):
+        entry = (getattr(result, "key_entry", None) if result is not None
+                 else holder.get("key_entry"))
+        _mark_deferred_failure(pool, entry, session_id, metrics, error.status)
+        error.key_failure_recorded = True
+    raise error
 
 
 async def _receive_during_stream(websocket, chunk_task):
@@ -729,7 +739,7 @@ def create_sse2ws_handler(service, store):
         if classify_endpoint(remaining) != "responses":
             await _deny(websocket, message="WebSocket bridge only supports Responses API paths")
             return
-        if settings.sse2ws_first_event_timeout <= 0 or settings.sse2ws_first_event_retries < 0:
+        if settings.sse2ws_first_event_timeout <= 0:
             await _deny(websocket, status=503, message="Invalid SSE2WS timeout configuration")
             return
 
@@ -850,7 +860,7 @@ def create_sse2ws_handler(service, store):
                         "POST", url, outbound_headers, body, path, provider, model,
                         request_pool, session_id,
                     )
-                    opened = await _open_with_retries(
+                    opened = await _open_once(
                         service, request_args, request_pool, session_id, metrics,
                         websocket,
                     )

@@ -107,7 +107,6 @@ docker compose up -d --build
 ```env
 SSE2WS_MODE=bridge
 SSE2WS_FIRST_EVENT_TIMEOUT=30
-SSE2WS_FIRST_EVENT_RETRIES=2
 ```
 
 并在 Codex 的 `config.toml` 中为对应自定义 provider 声明：
@@ -119,7 +118,7 @@ wire_api = "responses"
 supports_websockets = true
 ```
 
-桥接会在下游保持 WebSocket，把每个 `response.create` 转为上游 SSE 请求，并在首个事件到达前执行超时重试。工具调用的后续轮次会重放完整 transcript，不依赖上游保存 `previous_response_id`。该模式不是原生上游 WebSocket：上游仍会为每轮建立 HTTP/SSE 请求。
+桥接会在下游保持 WebSocket，把每个 `response.create` 转为上游 SSE 请求。重试、换 Key 与纯 SSE 请求共用同一套处理；上游返回 2xx 响应头后，首事件超时只结束当前轮次，在 Key 可用率中记为中性结果，不在桥接层重连也不熔断 Key；空流、明确错误事件、非法 SSE 或传输失败仍按流失败处理。工具调用的后续轮次会重放完整 transcript，不依赖上游保存 `previous_response_id`。该模式不是原生上游 WebSocket：上游仍会为每轮建立 HTTP/SSE 请求。
 
 若服务前还有 Nginx，必须为代理路径透传 Upgrade：
 

@@ -148,7 +148,6 @@ class Settings:
     responses_attempt_header_timeout: float = float(os.getenv("RESPONSES_ATTEMPT_HEADER_TIMEOUT", "15"))
     sse2ws_mode: str = os.getenv("SSE2WS_MODE", "off").strip().lower()
     sse2ws_first_event_timeout: float = float(os.getenv("SSE2WS_FIRST_EVENT_TIMEOUT", "30"))
-    sse2ws_first_event_retries: int = int(os.getenv("SSE2WS_FIRST_EVENT_RETRIES", "2"))
     provider: str = os.getenv("PROVIDER", "xfyun")
     extra_upstreams: str = os.getenv("EXTRA_UPSTREAMS", "")
     log_dir: str = os.getenv("LOG_DIR", "logs")

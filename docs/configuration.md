@@ -46,10 +46,9 @@
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `SSE2WS_MODE` | `off` | `off` = 握手返回 426 并由客户端回退 HTTP；`bridge` = 接收 Responses WebSocket 并转为上游 HTTP/SSE |
-| `SSE2WS_FIRST_EVENT_TIMEOUT` | `30` | 桥接模式单次上游从开始请求到首个有效 Responses 事件的超时（秒），同时覆盖响应头和 SSE 首事件 |
-| `SSE2WS_FIRST_EVENT_RETRIES` | `2` | 首事件超时或首事件前流损坏时，同一 key 的额外重试次数；耗尽后熔断并尝试号池下一 key |
+| `SSE2WS_FIRST_EVENT_TIMEOUT` | `30` | 桥接模式在最终上游返回 2xx 响应头后，等待首个有效 Responses 事件的超时（秒） |
 
-桥接模式只接受匹配到 Responses API 的 WebSocket 路径。客户端必须发送文本 JSON `response.create`；同一连接一次只允许一个生成请求。`generate=false` warmup 由代理本地完成，不产生上游请求或统计记录。
+桥接模式只接受匹配到 Responses API 的 WebSocket 路径。客户端必须发送文本 JSON `response.create`；同一连接一次只允许一个生成请求。桥接与纯 SSE 共用响应头之前的重试与换 Key 逻辑；首事件超时从最终 2xx 响应头到达后独立计时，只结束当前轮次，不重连也不熔断 Key。`generate=false` warmup 由代理本地完成，不产生上游请求或统计记录。
 
 该功能默认关闭。开启前需确保外层反向代理支持 WebSocket Upgrade，并在 Codex 自定义 provider 中设置 `supports_websockets = true`。
 
@@ -57,7 +56,7 @@
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `MAX_RETRIES` | `60` | 单个下游请求的实际上游尝试总上限；`0` = 无限重试。桥接模式下内部 HTTP 重试、首事件重连和跨 Key 尝试共享此预算 |
+| `MAX_RETRIES` | `60` | 单个下游请求在响应头之前的实际上游尝试总上限；`0` = 无限重试。桥接模式与纯 SSE 共用此预算 |
 | `RETRY_STATUS_CODES` | `503,502,504,524,529,429` | 触发重试的上游状态码，逗号分隔 |
 | `RETRY_BROAD` | `off` | 开启后，5xx、429、401/403 和网络异常均触发重试或换 key；普通 JSON 400、404、422 等请求错误仍直接透传。号池请求的 HTML 400 会作为网关/CDN 故障切换分组 |
 | `RETRY_INTERVAL` | `1.0` | 非 429 错误的基础重试间隔（秒） |
