@@ -132,6 +132,7 @@ class Settings:
     upstream_url: str = os.getenv("UPSTREAM_URL", "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2").rstrip("/")
     listen_host: str = os.getenv("LISTEN_HOST", "0.0.0.0")
     listen_port: int = int(os.getenv("LISTEN_PORT", "8080"))
+    uvicorn_loop: str = os.getenv("UVICORN_LOOP", "auto").strip().lower() or "auto"
     retry_interval: float = float(os.getenv("RETRY_INTERVAL", "1.0"))
     retry_interval_429: float = float(os.getenv("RETRY_INTERVAL_429", "5.0"))
     retry_backoff_429: bool = _bool("RETRY_BACKOFF_429", "true")

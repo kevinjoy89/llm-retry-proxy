@@ -12,6 +12,7 @@
 | `DOCKER_REGISTRY` | `docker.io` | Docker 仓库域名；国内可改为镜像站域名，如 `docker.m.daocloud.io` |
 | `PYTHON_BASE_IMAGE` | `library/python:3.12-slim` | 基础镜像命名空间/镜像名:tag，与 `DOCKER_REGISTRY` 拼接为完整引用 |
 | `PIP_INDEX_URL` | 清华 PyPI 镜像 | Docker 构建使用的 Python 包索引 |
+| `UVICORN_LOOP` | `auto` | Uvicorn 事件循环；`auto` 在可用时使用 uvloop，旧环境模板覆盖为 `asyncio` |
 
 ## 服务与访问控制
 
@@ -166,5 +167,17 @@
 默认模板 `.env.example` 使用 Docker Hub；国内无代理环境可将完整模板
 `.env.cn.example` 复制为 `.env`，其中为 `DOCKER_REGISTRY` 预置了国内镜像站
 域名。`DOCKER_REGISTRY` 与 `PYTHON_BASE_IMAGE` 共同组成完整镜像地址。
+
+Linux 旧内核（如 3.10）配合 Docker 19 时，默认 seccomp 规则可能使新版
+glibc 的 `clone3` 调用返回 `EPERM`，表现为 `can't start new thread`。仅在确认
+遇到该问题后叠加兼容模板：
+
+```bash
+docker compose -f compose.yaml -f compose.legacy.yaml up -d --build
+```
+
+`compose.legacy.yaml` 会将 `UVICORN_LOOP` 设为 `asyncio`，并通过
+`seccomp:unconfined` 关闭容器的系统调用过滤。后者会降低容器隔离强度，因此
+不应在现代内核或新版 Docker 环境中使用。
 
 号池、在线同步调度和熔断状态是进程内状态，生产部署必须保持单 Uvicorn worker、单容器副本。当前不支持通过多 worker 或多副本横向扩容；多个进程会各自持有不同的号池，并竞争写入同步状态文件。

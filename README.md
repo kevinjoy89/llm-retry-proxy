@@ -80,6 +80,15 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+仅当宿主机为 Linux 旧内核（如 3.10）且使用 Docker 19，出现
+`can't start new thread` 等兼容问题时，叠加旧环境模板：
+
+```bash
+docker compose -f compose.yaml -f compose.legacy.yaml up -d --build
+```
+
+该模板会关闭容器 seccomp 过滤并改用 asyncio 事件循环，不应在现代环境中启用。
+
 ## 常用配置
 
 最常调整的是：
@@ -89,6 +98,7 @@ docker compose up -d --build
 | `UPSTREAM_URL` | `https://maas-coding-api.cn-huabei-1.xf-yun.com/v2` | 上游地址，不要带尾斜杠 |
 | `LISTEN_HOST` | `0.0.0.0` | 监听地址 |
 | `LISTEN_PORT` | `8080` | 监听端口 |
+| `UVICORN_LOOP` | `auto` | Uvicorn 事件循环；旧环境模板设为 `asyncio` |
 | `MAX_RETRIES` | `60` | 单个请求的实际上游尝试总上限；`0` 表示无限重试 |
 | `RETRY_INTERVAL` | `1.0` | 非 429 错误的重试间隔/退避基数 |
 | `RETRY_INTERVAL_429` | `5.0` | 429 专用重试间隔/退避基数 |

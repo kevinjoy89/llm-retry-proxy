@@ -8,12 +8,6 @@ services:
         PIP_INDEX_URL: "${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
     container_name: llm-retry-proxy
     command: ["python", "/app/main.py"]
-    # 旧内核(如3.10)没有 clone3 系统调用，
-    # 而 docker 19 的默认 seccomp profile 对未知 syscall 返回 EPERM，
-    # 导致镜像内 glibc 创建线程时报 can't start new thread。解除 seccomp 规避。
-    # 新内核 + 新 docker 环境下 clone3 本就在白名单内，此选项无副作用。
-    security_opt:
-      - seccomp:unconfined
     restart: unless-stopped
     env_file:
       - .env

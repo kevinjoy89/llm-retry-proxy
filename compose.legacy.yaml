@@ -1,0 +1,8 @@
+# 仅用于 Linux 旧内核（如 3.10）配合 Docker 19 的兼容部署。
+# 此覆盖会关闭容器 seccomp 过滤，请勿在现代环境中启用。
+services:
+  llm-retry-proxy:
+    environment:
+      UVICORN_LOOP: asyncio
+    security_opt:
+      - seccomp:unconfined

@@ -1,11 +1,17 @@
+import ast
 import re
 import unittest
 from pathlib import Path
 
+import yaml
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCKERFILE = REPO_ROOT / "Dockerfile"
+COMPOSE_FILE = REPO_ROOT / "compose.yaml"
+LEGACY_COMPOSE_FILE = REPO_ROOT / "compose.legacy.yaml"
 ENV_EXAMPLE = REPO_ROOT / ".env.example"
 CN_ENV_EXAMPLE = REPO_ROOT / ".env.cn.example"
+MAIN_FILE = REPO_ROOT / "main.py"
 
 # Dockerfile 和默认模板走 Docker Hub，国内模板使用镜像站。
 EXPECTED_DOCKERFILE_REFERENCE = "docker.io/library/python:3.12-slim"
@@ -46,6 +52,8 @@ class DockerBuildConfigTests(unittest.TestCase):
         self.arg_defaults = _arg_defaults(DOCKERFILE.read_text())
         self.env = _env_values(ENV_EXAMPLE.read_text())
         self.cn_env = _env_values(CN_ENV_EXAMPLE.read_text())
+        self.compose = yaml.safe_load(COMPOSE_FILE.read_text())
+        self.legacy_compose = yaml.safe_load(LEGACY_COMPOSE_FILE.read_text())
 
     def test_dockerfile_defaults_produce_valid_reference(self):
         ref = f"{self.arg_defaults['DOCKER_REGISTRY']}/{self.arg_defaults['PYTHON_BASE_IMAGE']}"
@@ -89,6 +97,34 @@ class DockerBuildConfigTests(unittest.TestCase):
         for values in (self.arg_defaults, self.env, self.cn_env):
             for key in ("DOCKER_REGISTRY", "PYTHON_BASE_IMAGE"):
                 self.assertNotIn("://", values[key], f"{key} 镜像引用不支持 scheme: {values[key]}")
+
+    def test_default_compose_keeps_seccomp_enabled(self):
+        service = self.compose["services"]["llm-retry-proxy"]
+        self.assertNotIn("security_opt", service)
+
+    def test_legacy_compose_explicitly_enables_compatibility_options(self):
+        service = self.legacy_compose["services"]["llm-retry-proxy"]
+        self.assertEqual(service["security_opt"], ["seccomp:unconfined"])
+        self.assertEqual(service["environment"]["UVICORN_LOOP"], "asyncio")
+
+    def test_default_event_loop_remains_auto(self):
+        self.assertEqual(self.env["UVICORN_LOOP"], "auto")
+        self.assertEqual(self.cn_env["UVICORN_LOOP"], "auto")
+
+        tree = ast.parse(MAIN_FILE.read_text())
+        loop_values = [
+            keyword.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "uvicorn"
+            and node.func.attr == "run"
+            for keyword in node.keywords
+            if keyword.arg == "loop"
+        ]
+        self.assertEqual(len(loop_values), 1)
+        self.assertEqual(ast.unparse(loop_values[0]), "settings.uvicorn_loop")
 
 
 if __name__ == "__main__":
