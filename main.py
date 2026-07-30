@@ -15,6 +15,7 @@ if __name__ == "__main__":
         app,
         host=settings.listen_host,
         port=settings.listen_port,
+        loop="asyncio",
         ws="wsproto",
         log_config=None,
         access_log=False,
