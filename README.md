@@ -73,7 +73,9 @@ curl http://127.0.0.1:8080/chat/completions \
 ### Docker Compose
 
 ```bash
+# 二选一：默认使用 Docker Hub
 cp .env.example .env
+# 国内无代理环境改用：cp .env.cn.example .env
 # 编辑 .env
 docker compose up -d --build
 ```

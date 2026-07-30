@@ -163,6 +163,8 @@
 
 `compose.yaml` 会将 `LOG_DIR` 映射到宿主机的 `./logs`，并在未设置 `KEY_POOL_FILE` 时将其默认指向容器内的 `/app/key_pool.csv`。部署前请准备 `.env`；需要静态号池时复制 `key_pool.csv.example` 为 `key_pool.csv`。
 
-`.env.example` 已为 `DOCKER_REGISTRY` 预置国内镜像站域名(实测可用)，复制后即可在无代理环境构建。`DOCKER_REGISTRY` 与 `PYTHON_BASE_IMAGE` 共同组成完整镜像地址, 不配置时默认为官方镜像地址。
+默认模板 `.env.example` 使用 Docker Hub；国内无代理环境可将完整模板
+`.env.cn.example` 复制为 `.env`，其中为 `DOCKER_REGISTRY` 预置了国内镜像站
+域名。`DOCKER_REGISTRY` 与 `PYTHON_BASE_IMAGE` 共同组成完整镜像地址。
 
 号池、在线同步调度和熔断状态是进程内状态，生产部署必须保持单 Uvicorn worker、单容器副本。当前不支持通过多 worker 或多副本横向扩容；多个进程会各自持有不同的号池，并竞争写入同步状态文件。
