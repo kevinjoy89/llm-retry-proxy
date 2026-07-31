@@ -28,9 +28,19 @@ from .usage import UsageAccumulator
 SKIP_REQUEST_HEADERS = {
     "host", "content-length", "transfer-encoding", "connection", "keep-alive",
     "proxy-authenticate", "proxy-authorization", "te", "trailers", "upgrade",
-    "accept-encoding",
+    "accept-encoding", "proxy-connection", "via",
 }
 SKIP_RESPONSE_HEADERS = {"content-length", "transfer-encoding", "connection", "keep-alive", "content-encoding"}
+
+DOWNSTREAM_PROXY_REQUEST_HEADERS = {
+    "cdn-loop",
+    "forwarded",
+    "true-client-ip",
+    "x-client-ip",
+    "x-original-forwarded-for",
+    "x-real-ip",
+}
+DOWNSTREAM_PROXY_REQUEST_PREFIXES = ("cf-", "x-forwarded-")
 
 _GEMINI_MODEL_PATH = re.compile(
     r"(?:^|/)models/([^/:]+):(?:generatecontent|streamgeneratecontent|embedcontent|batchgeneratecontent)(?:/|$)",
@@ -322,7 +332,14 @@ def _maybe_inject_stream_usage(body, endpoint_family):
 
 
 def outbound_request_headers(request_headers, path, model, config=settings):
-    headers = filter_headers(request_headers, SKIP_REQUEST_HEADERS)
+    headers = {
+        name: value
+        for name, value in filter_headers(
+            request_headers, SKIP_REQUEST_HEADERS,
+        ).items()
+        if name.lower() not in DOWNSTREAM_PROXY_REQUEST_HEADERS
+        and not name.lower().startswith(DOWNSTREAM_PROXY_REQUEST_PREFIXES)
+    }
     # httpx decodes response bodies before ``aiter_bytes`` yields them, and
     # the proxy consequently removes Content-Encoding downstream. Only offer
     # encodings supported by the installed httpx decoders so compressed SSE

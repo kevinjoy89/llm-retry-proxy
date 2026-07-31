@@ -32,6 +32,33 @@ class OutboundRequestHeadersTests(unittest.TestCase):
         self.assertEqual(headers["accept-encoding"], "gzip, deflate")
         self.assertNotIn("originator", headers)
 
+    def test_downstream_proxy_identity_is_not_forwarded_upstream(self):
+        headers = outbound_request_headers({
+            "authorization": "Bearer downstream-token",
+            "cf-connecting-ip": "203.0.113.7",
+            "cf-ipcountry": "CN",
+            "cf-ray": "test-ray",
+            "cdn-loop": "cloudflare; loops=1",
+            "forwarded": "for=203.0.113.7;proto=https",
+            "true-client-ip": "203.0.113.7",
+            "x-client-ip": "203.0.113.7",
+            "x-forwarded-for": "203.0.113.7, 198.51.100.20",
+            "x-forwarded-host": "proxy.example.com",
+            "x-forwarded-proto": "https",
+            "x-original-forwarded-for": "203.0.113.7",
+            "x-real-ip": "203.0.113.7",
+        }, "responses", "gpt-5.6", self.config)
+
+        self.assertEqual(headers["authorization"], "Bearer downstream-token")
+        self.assertEqual(headers["accept-encoding"], "gzip, deflate")
+        for name in (
+            "cf-connecting-ip", "cf-ipcountry", "cf-ray", "cdn-loop",
+            "forwarded", "true-client-ip", "x-client-ip",
+            "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto",
+            "x-original-forwarded-for", "x-real-ip",
+        ):
+            self.assertNotIn(name, headers)
+
 
 class RequestIpTests(unittest.TestCase):
     @staticmethod
