@@ -1801,6 +1801,44 @@ class ManualAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(manager._has_connected_sources())
 
+    async def test_reset_group_accepts_source_key_id_for_manual_key_without_group(self):
+        """手动 Key 未填分组时前端传 source_key_id，reset_group 仍应解除熔断。
+
+        回归:前端 data-reset-group 在 group_id 为空时回退到 source_key_id，
+        而后端按 (entry.group_id or entry.key) 匹配，对未分组手动 Key 会因
+        source_key_id(哈希) 与 entry.key(原文) 不一致而报“分组不存在或尚未加载”。
+        """
+        from retry_proxy.sync_adapters.manual import ManualAdapter
+        pools = {}
+        manager = PoolSyncManager(pools, self.config, None, {"manual": ManualAdapter()})
+
+        status = await manager.add_manual_keys(
+            "https://manual.test",
+            [{"key": "sk-key-1", "label": "Key One"}],
+        )
+        source_id = status["sources"][0]["id"]
+        visible = status["sources"][0]["keys"][0]
+        # 未填分组时前端回退到 source_key_id 作为 group_id 传给 reset-group
+        self.assertEqual(visible["group_id"], "")
+        group_id = visible["source_key_id"]
+
+        pool = pools["https://manual.test"]
+        entry = pool.entries[0]
+        pool.mark_cooldown(entry, 1800, failure_kind="auth", status=403)
+        self.assertTrue(entry.cooldown_until > 0)
+
+        with self.assertLogs("forward", level="INFO") as captured:
+            status = await manager.reset_group(source_id, group_id)
+
+        self.assertEqual(entry.cooldown_until, 0)
+        refreshed = next(item for item in status["sources"][0]["keys"]
+                         if item["source_key_id"] == group_id)
+        self.assertFalse(refreshed["cooled"])
+        # 回退解析后 group_key 为原始 Key，日志不得泄漏明文
+        log_text = "\n".join(captured.output)
+        self.assertNotIn("sk-key-1", log_text)
+        self.assertIn("已手动解除熔断", log_text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1152,13 +1152,23 @@ class PoolSyncManager:
             if source is None:
                 raise PoolSyncError("号池同步连接不存在")
             pool = self.pools.get(self._pool_url(source))
+            group_key = str(group_id)
             entries = [entry for entry in pool.entries
-                       if (entry.group_id or entry.key) == str(group_id)] if pool else []
+                       if (entry.group_id or entry.key) == group_key] if pool else []
+            if not entries:
+                # 未填分组的手动 Key 前端回退传 source_key_id，需据其解析真实 group_key。
+                item = next((entry for entry in source.get("entries") or []
+                             if str(entry.get("source_key_id")) == group_key), None)
+                if item is not None and pool is not None:
+                    group_key = str(item.get("group_id") or item.get("key") or "")
+                    entries = [entry for entry in pool.entries
+                               if (entry.group_id or entry.key) == group_key]
             if not entries:
                 raise PoolSyncError("分组不存在或尚未加载")
-            pool.reset_circuit(group_id=str(group_id))
+            pool.reset_circuit(group_id=group_key)
             logger.info(
-                f"号池分组已手动解除熔断: upstream={source['base_url']} group={group_id}"
+                f"号池分组已手动解除熔断: upstream={source['base_url']} "
+                f"group={_mask_key(group_key)}"
             )
             return self.status()
 
