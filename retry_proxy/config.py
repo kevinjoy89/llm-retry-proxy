@@ -147,8 +147,6 @@ class Settings:
     max_request_body: int = int(os.getenv("MAX_REQUEST_BODY", str(64 * 1024 * 1024)))
     responses_header_timeout: float = float(os.getenv("RESPONSES_HEADER_TIMEOUT", "120"))
     responses_attempt_header_timeout: float = float(os.getenv("RESPONSES_ATTEMPT_HEADER_TIMEOUT", "15"))
-    sse2ws_mode: str = os.getenv("SSE2WS_MODE", "off").strip().lower()
-    sse2ws_first_event_timeout: float = float(os.getenv("SSE2WS_FIRST_EVENT_TIMEOUT", "30"))
     provider: str = os.getenv("PROVIDER", "xfyun")
     extra_upstreams: str = os.getenv("EXTRA_UPSTREAMS", "")
     log_dir: str = os.getenv("LOG_DIR", "logs")
@@ -209,6 +207,14 @@ class Settings:
     # stream_options={"include_usage":true} 以确保末帧返回 usage。关闭则保持
     # 请求体原样透传，stream 场景的 token 统计可能缺失。默认关闭以保持透明代理。
     token_stats_inject_usage: bool = _bool("TOKEN_STATS_INJECT_USAGE", "false")
+
+    # Codex Responses WebSocket -> upstream HTTP/SSE bridge
+    sse2ws_mode: str = os.getenv("SSE2WS_MODE", "off").strip().lower()
+    sse2ws_first_event_timeout: float = float(os.getenv("SSE2WS_FIRST_EVENT_TIMEOUT", "30"))
+    sse2ws_first_event_retries: int = int(os.getenv("SSE2WS_FIRST_EVENT_RETRIES", "2"))
+    sse2ws_first_message_timeout: float = float(os.getenv("SSE2WS_FIRST_MESSAGE_TIMEOUT", "30"))
+    sse2ws_inter_turn_idle_timeout: float = float(os.getenv("SSE2WS_INTER_TURN_IDLE_TIMEOUT", "300"))
+    sse2ws_max_body_bytes: int = int(os.getenv("SSE2WS_MAX_BODY_BYTES", str(64 * 1024 * 1024)))
 
     @property
     def stats_html_path(self):

@@ -127,30 +127,6 @@ class RetryLoggingTests(unittest.IsolatedAsyncioTestCase):
             "[test/model][pool-key]" in message for message in messages
         ))
 
-    async def test_sse2ws_streaming_response_logs_transport_and_first_event_stage(self):
-        config = SimpleNamespace(hedge_mode="off", max_retries=1)
-        trace_logger = Mock()
-        response = SimpleNamespace(status_code=200, headers={})
-        proxy = RetryProxy(config=config, client=object(), logger_=trace_logger)
-        proxy._send = AsyncMock(return_value=response)
-
-        await proxy.request(
-            "POST", "https://upstream.test/responses", {},
-            b'{"model":"model","stream":true}',
-            "v1/responses", "test", "model",
-            log_method="WS→SSE",
-        )
-
-        messages = [call.args[0] for call in trace_logger.info.call_args_list]
-        self.assertTrue(any(
-            "[WS→SSE /v1/responses]" in message
-            and "上游SSE响应头已建立，等待首事件" in message
-            for message in messages
-        ))
-        self.assertFalse(any(
-            "等待Responses流结束" in message for message in messages
-        ))
-
     async def test_deferred_stream_success_does_not_establish_key_sticky_state(self):
         config = SimpleNamespace(hedge_mode="off", max_retries=1)
         pool = KeyPool([("only", "only")])

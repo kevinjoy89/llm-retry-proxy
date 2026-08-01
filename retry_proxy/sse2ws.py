@@ -1,944 +1,861 @@
+"""Responses WebSocket <-> upstream HTTP/SSE 双向桥接（名称 sse2ws 指响应方向）。
+
+方向标识（双向桥接，一次 WebSocket 连接内可连续多轮）：
+
+- ``WS → SSE``（请求方向，客户端 → 上游）：客户端通过 WebSocket 发送
+  ``response.create`` 文本帧，桥接转成一次上游 HTTP/SSE Responses 请求。
+- ``SSE → WS``（响应方向，上游 → 客户端）：上游的 SSE 事件流被逐帧转成
+  WebSocket JSON 文本帧推回客户端。
+
+Codex CLI 等客户端通过 ``/v1/responses`` 建立 WebSocket 长连接，逐轮发送
+``response.create`` 帧；本模块把每一轮翻译成一次上游 HTTP/SSE Responses 请求，
+再把上游的 SSE 事件流逐帧转成 WebSocket JSON 文本帧推回客户端。
+
+设计要点（参考 sub2api 的 openai_ws_http_bridge）：
+
+- 无状态桥接：上游通常是纯 HTTP/SSE 端点，不理解 WS 连接级的
+  ``previous_response_id`` 状态。因此连接内累积上下文 item，在续轮时把完整
+  input 重放给上游并丢弃 ``previous_response_id``，保证多轮工具调用正确衔接。
+- 首事件守护：上游返回了响应头但迟迟不发首帧时，按 ``SSE2WS_FIRST_EVENT_TIMEOUT``
+  超时并重试整个 turn（``SSE2WS_FIRST_EVENT_RETRIES`` 次），避免挂死。
+- 终止事件判定：以收到 ``response.completed`` / ``response.failed`` /
+  ``response.incomplete`` / ``response.cancelled`` / ``error`` 为准，绝不把
+  提前 EOF 当作成功。
+"""
+
 import asyncio
 import json
 import time
-import uuid
-from dataclasses import dataclass, field
 from datetime import datetime
 
-import httpx
 from fastapi import WebSocket, WebSocketDisconnect
-from fastapi.responses import Response
 
 from .api import (
     _key_pool_secrets,
-    _request_ip,
-    _response_cache_usage,
-    _response_event_status,
     classify_endpoint,
     classify_model_scope,
     outbound_request_headers,
-    parse_request_model,
     parse_request_session_id,
 )
 from .config import can_use_key_pool, logger, settings
 from .dlp import inspect_json_body
 from .key_pool import KEY_POOLS
 from .retry import _mark_key_failure, _tag, reset_client_ip, set_client_ip
-from .routes import is_excluded_path, match_route
+from .routes import match_route
+
+SSE2WS_TERMINAL_EVENTS = frozenset({
+    "response.completed", "response.failed", "response.incomplete",
+    "response.cancelled", "response.done", "error",
+})
+
+SSE2WS_OK_TERMINAL_EVENTS = frozenset({
+    "response.completed", "response.done", "response.incomplete",
+})
+
+TOOL_CALL_CONTEXT_TYPES = frozenset({
+    "tool_call", "function_call", "local_shell_call", "tool_search_call",
+    "custom_tool_call", "mcp_tool_call",
+})
+TOOL_CALL_OUTPUT_TYPES = frozenset({
+    "function_call_output", "tool_search_output", "custom_tool_call_output",
+    "mcp_tool_call_output",
+})
+
+SKIP_UPSTREAM_WS_HEADERS = (
+    "sec-websocket-key", "sec-websocket-version", "sec-websocket-extensions",
+    "sec-websocket-protocol", "sec-websocket-accept",
+)
+# Codex WS 握手专属头，转发到 HTTP/SSE 上游没有意义，甚至可能让网关按 WS 协议
+# 处理 HTTP 请求（如 openai-beta: responses_websockets=...、session/thread 粘性）。
+SKIP_UPSTREAM_WS_SESSION_HEADERS = (
+    "session-id", "thread-id", "x-client-request-id",
+)
 
 
-_ERROR_EVENT_TYPES = {"error", "response.error", "response.failed"}
-_TERMINAL_EVENT_TYPES = {"response.completed", "response.incomplete"}
-_SAFE_ERROR_HEADERS = {
-    "openai-request-id", "request-id", "retry-after", "x-request-id",
-}
-
-
-class BridgeError(Exception):
-    def __init__(self, message, status=502, code="sse2ws_bridge_error", payload=None,
-                 headers=None):
-        self.message = message
-        self.status = status
-        self.code = code
-        self.payload = payload
-        self.headers = headers
-        self.key_failure_recorded = False
-        super().__init__(message)
-
-
-class ClientDisconnected(Exception):
+class _ClientDisconnected(Exception):
     pass
 
 
-class TurnCancelled(Exception):
-    pass
+def is_responses_ws_path(path: str) -> bool:
+    normalized = (path or "").strip("/").lower()
+    return normalized == "responses" or normalized.endswith("/responses")
 
 
-@dataclass
-class SseEvent:
-    event_type: str
-    payload: dict
-    text: str
+def _extract_input_items(payload) -> list:
+    value = payload.get("input")
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, str):
+        return [value]
+    return []
 
 
-class ResponsesSseParser:
+def _canonical(item) -> str:
+    try:
+        return json.dumps(item, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return repr(item)
+
+
+def _items_have_prefix(items, prefix) -> bool:
+    if not prefix:
+        return True
+    if len(items) < len(prefix):
+        return False
+    return all(_canonical(a) == _canonical(b) for a, b in zip(items, prefix))
+
+
+def _is_context_item(item) -> bool:
+    return isinstance(item, dict) and item.get("type") in TOOL_CALL_CONTEXT_TYPES
+
+
+def _normalize_replay_item(item):
+    """把输出形态的工具调用 item 归一化成上游 input 接受的形态。
+
+    上游 output 里的 ``function_call`` 带 ``id`` / ``status`` 等输出字段，直接
+    塞回 input 会导致部分上游（如 aihub）校验失败返回 502。input 形态只需要
+    ``type`` / ``call_id`` / ``name`` / ``arguments``。
+    """
+    if not isinstance(item, dict) or item.get("type") != "function_call":
+        return item
+    out = {}
+    for key in ("type", "call_id", "name", "arguments"):
+        if key in item:
+            out[key] = item[key]
+    return out
+
+
+def _dedup_context(items) -> list:
+    seen = set()
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        # 去重 key 取自已归一化前的 item，保留 id/call_id 用于区分。
+        key = item.get("call_id") or item.get("id") or _canonical(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(_normalize_replay_item(item))
+    return out
+
+
+def _build_error_event(status, message, error_type="server_error") -> str:
+    message = (message or "").strip()
+    if not message:
+        message = "upstream request failed"
+    return json.dumps({
+        "type": "error",
+        "status": status,
+        "error": {"type": error_type, "message": message},
+    }, ensure_ascii=False)
+
+
+def _embedded_failure_status(payload):
+    if not isinstance(payload, dict):
+        return None
+    candidates = []
+    error = payload.get("error")
+    if isinstance(error, dict):
+        candidates.append(error.get("status_code"))
+        candidates.append(error.get("status"))
+        candidates.append(error.get("code"))
+    response = payload.get("response")
+    if isinstance(response, dict):
+        nested = response.get("error")
+        if isinstance(nested, dict):
+            candidates.append(nested.get("status_code"))
+            candidates.append(nested.get("status"))
+            candidates.append(nested.get("code"))
+    for value in candidates:
+        try:
+            status = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 400 <= status <= 599:
+            return status
+    return None
+
+
+class _SSEParser:
     def __init__(self):
-        self.buffer = b""
-        self.saw_done = False
+        self._buffer = b""
 
     def feed(self, chunk):
-        self.buffer += chunk
-        trailing_cr = self.buffer.endswith(b"\r")
-        source = self.buffer[:-1] if trailing_cr else self.buffer
-        source = source.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-        self.buffer = source + (b"\r" if trailing_cr else b"")
-        events = []
-        while b"\n\n" in self.buffer:
-            frame, self.buffer = self.buffer.split(b"\n\n", 1)
-            event = self._parse_frame(frame)
-            if event is not None:
-                events.append(event)
-        if len(self.buffer) > 1_048_576:
-            raise BridgeError("SSE event exceeds 1 MiB", code="invalid_sse_event")
-        return events
+        if not chunk:
+            return
+        self._buffer += chunk.replace(b"\r\n", b"\n")
 
-    def finish(self):
-        if self.buffer.strip(b"\r\n"):
-            raise BridgeError("upstream SSE ended with a truncated event", code="truncated_sse_event")
+    def events(self):
+        while b"\n\n" in self._buffer:
+            frame, self._buffer = self._buffer.split(b"\n\n", 1)
+            data = self._frame_data(frame)
+            if data is None:
+                continue
+            try:
+                payload = json.loads(data)
+            except (TypeError, ValueError, UnicodeDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            yield payload, data
 
-    def _parse_frame(self, frame):
-        event_name = ""
+    @staticmethod
+    def _frame_data(frame):
         data_lines = []
         for line in frame.splitlines():
-            if not line or line.startswith(b":"):
-                continue
-            name, separator, value = line.partition(b":")
-            if separator and value.startswith(b" "):
-                value = value[1:]
-            if name == b"event":
-                event_name = value.decode("utf-8", errors="replace")
-            elif name == b"data":
-                data_lines.append(value)
+            if line.startswith(b"data:"):
+                data_lines.append(line[5:].strip())
         if not data_lines:
             return None
         data = b"\n".join(data_lines)
-        if data.strip() == b"[DONE]":
-            self.saw_done = True
+        if data == b"[DONE]":
             return None
+        return data.decode("utf-8", errors="replace")
+
+
+class ResponsesWSBridge:
+    def __init__(self, websocket, path, service, store):
+        self.ws = websocket
+        self.path = path
+        self.service = service
+        self.store = store
+        self._replay_input = None
+        self._pending_replay = []
+        self._collected = []
+        self._terminal = ""
+        self._terminal_error_status = None
+        self._buffered = None
+        self._turn_sent = 0
+        self.upstream = ""
+        self.provider = ""
+        self.remaining = ""
+        self.client_ip = ""
+        self.base_pool = None
+        self.pool_credential_ok = False
+        self.pool_access = False
+
+    async def run(self):
         try:
-            payload = json.loads(data)
-        except (ValueError, TypeError, UnicodeDecodeError) as exc:
-            raise BridgeError(
-                "upstream returned malformed SSE JSON",
-                code="malformed_sse_json",
-            ) from exc
-        if not isinstance(payload, dict):
-            raise BridgeError("upstream SSE data must be a JSON object", code="invalid_sse_event")
-        event_type = str(payload.get("type") or event_name or "").strip()
-        if not event_type:
-            raise BridgeError("upstream SSE event has no type", code="invalid_sse_event")
-        if "type" not in payload:
-            payload["type"] = event_type
-        return SseEvent(
-            event_type,
-            payload,
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            await self.ws.accept()
+        except Exception:
+            return
+        query = self.ws.scope.get("query_string", b"") or b""
+        self.path = (self.ws.scope.get("path", "") or "").lstrip("/")
+        self.client_ip = self._request_ip()
+        self.upstream, self.provider, self.remaining = match_route(self.path)
+        if query:
+            self.upstream = f"{self.upstream}?{query.decode('utf-8', errors='replace')}"
+        self.base_pool = KEY_POOLS.get(self.upstream)
+        self.pool_credential_ok = can_use_key_pool(self.ws.headers)
+        self.pool_access = bool(self.base_pool and self.pool_credential_ok)
+        if settings.proxy_api_key and self.pool_credential_ok and self.base_pool is None:
+            await self._safe_close_error(503, "key_pool_unavailable",
+                                         "Key pool is unavailable for this upstream")
+            return
+        logger.info(
+            f"{_tag('WS→SSE', self.path, self.provider, '', self.client_ip)}"
+            f" 建立Responses WS连接 路由→{self.upstream.split('?', 1)[0]}"
         )
-
-
-@dataclass
-class Transcript:
-    response_id: str = ""
-    input_items: list = field(default_factory=list)
-    output_items: list = field(default_factory=list)
-
-    def merge(self, payload):
-        previous_id = str(payload.get("previous_response_id") or "").strip()
-        incoming = payload.get("input", [])
-        if isinstance(incoming, str):
-            if previous_id:
-                raise BridgeError(
-                    "incremental WebSocket input must be an array",
-                    status=400,
-                    code="invalid_request_error",
-                )
-            return incoming
-        if not isinstance(incoming, list):
-            raise BridgeError(
-                "WebSocket input must be a string or an array",
-                status=400,
-                code="invalid_request_error",
-            )
-        if not previous_id:
-            return list(incoming)
-        if previous_id != self.response_id:
-            raise BridgeError(
-                "Previous response was not found. Retrying the full request.",
-                status=400,
-                code="previous_response_not_found",
-            )
-        return [*self.input_items, *self.output_items, *incoming]
-
-    def remember(self, response_id, input_items, output_items):
-        self.response_id = response_id
-        if isinstance(input_items, str):
-            self.input_items = [{"role": "user", "content": input_items}]
-        else:
-            self.input_items = list(input_items) if isinstance(input_items, list) else []
-        self.output_items = list(output_items) if isinstance(output_items, list) else []
-
-
-@dataclass
-class OpenedStream:
-    result: object
-    iterator: object
-    parser: ResponsesSseParser
-    initial_events: list
-
-
-@dataclass
-class TurnMetrics:
-    started_at: float = field(default_factory=time.time)
-    total_sent: int = 0
-    retry_codes: list = field(default_factory=list)
-    key_attempts: list = field(default_factory=list)
-    bridge_attempts: int = 0
-    last_status: int = 0
-    key_id: str = ""
-    key_entry: object = None
-    first_event_s: float = 0.0
-    bridge_retry_reasons: list = field(default_factory=list)
-
-    def add_result(self, result):
-        self.total_sent += max(int(getattr(result, "total_sent", 0) or 0), 0)
-        self.retry_codes.extend(getattr(result, "retry_codes", None) or [])
-        self.key_attempts.extend(getattr(result, "key_attempts", None) or [])
-        self.last_status = int(getattr(result, "last_status", 0) or 0)
-        self.key_id = getattr(result, "key_id", "") or self.key_id
-        self.key_entry = getattr(result, "key_entry", None)
-
-
-def _safe_headers(headers):
-    output = {}
-    for name, value in headers.items():
-        lower = name.lower()
-        if lower in _SAFE_ERROR_HEADERS or lower.startswith(("x-ratelimit-", "x-codex-")):
-            output[lower] = value
-    return output
-
-
-def _error_envelope(error, headers=None):
-    if error.payload and isinstance(error.payload, dict):
-        upstream_error = error.payload.get("error", error.payload)
-        if not isinstance(upstream_error, dict):
-            upstream_error = {"message": str(upstream_error)}
-        upstream_error = dict(upstream_error)
-        upstream_error.setdefault("message", error.message)
-        upstream_error.setdefault("code", error.code)
-    else:
-        upstream_error = {
-            "type": "server_error" if error.status >= 500 else "invalid_request_error",
-            "code": error.code,
-            "message": error.message,
-        }
-    return {
-        "type": "error",
-        "status": error.status,
-        "error": upstream_error,
-        "headers": _safe_headers(headers or {}),
-    }
-
-
-async def _send_error(websocket, error, headers=None):
-    await websocket.send_text(json.dumps(
-        _error_envelope(error, headers if headers is not None else error.headers),
-        ensure_ascii=False, separators=(",", ":"),
-    ))
-
-
-def _websocket_message_size(message):
-    raw_bytes = message.get("bytes")
-    if raw_bytes is not None:
-        return len(raw_bytes)
-    raw_text = message.get("text")
-    return len(raw_text.encode("utf-8")) if isinstance(raw_text, str) else 0
-
-
-async def _reject_oversized_websocket_message(websocket, message):
-    limit = getattr(settings, "max_request_body", 64 * 1024 * 1024)
-    if _websocket_message_size(message) <= limit:
-        return False
-    await _send_error(websocket, BridgeError(
-        "Request body exceeds the maximum allowed size", status=413,
-        code="request_body_too_large",
-    ))
-    return True
-
-
-async def _deny(websocket, status=426, message="Responses WebSocket bridge is unavailable"):
-    response = Response(
-        json.dumps({"error": {"type": "websocket_unavailable", "message": message}}),
-        status_code=status,
-        media_type="application/json",
-    )
-    try:
-        await websocket.send_denial_response(response)
-    except RuntimeError:
-        await websocket.close(code=1008, reason=message[:123])
-
-
-async def _dlp_body(body):
-    max_body = getattr(settings, "max_request_body", 64 * 1024 * 1024)
-    if len(body) > max_body:
-        raise BridgeError(
-            "Request body exceeds the maximum allowed size", status=413,
-            code="request_body_too_large",
-        )
-    if settings.dlp_mode not in ("audit", "block", "redact"):
-        return body
-    if len(body) > settings.dlp_max_body_bytes:
-        if settings.dlp_mode in ("block", "redact"):
-            raise BridgeError(
-                "Request body exceeds DLP inspection limit",
-                status=413,
-                code="dlp_body_too_large",
-            )
-        return body
-    result = await asyncio.to_thread(
-        inspect_json_body,
-        body, settings.dlp_rules, settings.dlp_exempt_start, settings.dlp_exempt_end,
-        settings.dlp_strip_exempt_markers, settings.dlp_mode,
-        settings.dlp_rule_file, None, settings.dlp_allow_exemptions,
-        settings.dlp_decode_depth, settings.dlp_decode_max_candidates,
-        settings.dlp_decode_max_bytes, _key_pool_secrets(),
-        settings.dlp_known_secret_min_length,
-    )
-    if result.uninspectable and settings.dlp_fail_closed and body:
-        raise BridgeError("Request body cannot be inspected by DLP", status=422,
-                          code="dlp_uninspectable_body")
-    if result.limit_exceeded and settings.dlp_mode in ("block", "redact"):
-        raise BridgeError("Request body exceeds DLP decode inspection limits", status=413,
-                          code="dlp_decode_limit_exceeded")
-    if result.malformed_exemption and settings.dlp_mode in ("block", "redact"):
-        raise BridgeError("Malformed DLP exemption markers", status=422,
-                          code="dlp_malformed_exemption")
-    if result.blocked_rules:
-        raise BridgeError(
-            "Request blocked by sensitive data policy", status=422,
-            code="sensitive_data_blocked",
-            payload={"error": {"rules": list(result.blocked_rules)}},
-        )
-    if result.matched_rules:
-        action = "脱敏" if result.redactions else "告警"
-        logger.warning(f"SSE2WS DLP{action} rules={','.join(result.matched_rules)}")
-    return result.body
-
-
-def _event_error(event):
-    if event.event_type not in _ERROR_EVENT_TYPES and not isinstance(event.payload.get("error"), dict):
-        return None
-    status = _response_event_status(event.payload) or 502
-    error = event.payload.get("error")
-    message = error.get("message") if isinstance(error, dict) else None
-    bridge_error = BridgeError(
-        message or "upstream returned a Responses error event",
-        status=status,
-        code=(error.get("code") if isinstance(error, dict) else None) or "upstream_stream_error",
-        payload=event.payload,
-    )
-    bridge_error.stream_event_error = True
-    return bridge_error
-
-
-async def _request_stream(service, method, url, headers, body, path, provider, model, pool,
-                          session_id, result_holder=None):
-    response = None
-    result = None
-    try:
-        result = await service.request(
-            method, url, headers, body, path, provider, model, pool, session_id,
-            log_method="WS→SSE",
-            request_progress=result_holder,
-            log_cancelled=False,
-        )
-        if result_holder is not None:
-            result_holder["result"] = result
-        response = result.response
-        if response is None:
-            raise BridgeError(
-                getattr(result, "failure_reason", "") or "upstream request failed",
-                status=503,
-                code="upstream_unavailable",
-            )
-        if response.status_code >= 400:
-            raw = await response.aread()
-            try:
-                payload = json.loads(raw)
-            except (ValueError, TypeError, UnicodeDecodeError):
-                payload = None
-            error = BridgeError(
-                "upstream rejected the request", status=response.status_code,
-                code="upstream_http_error", payload=payload,
-            )
-            # RetryProxy has already recorded this HTTP response's key outcome.
-            error.key_outcome_recorded = True
-            raise error
-        if "text/event-stream" not in response.headers.get("content-type", "").lower():
-            raise BridgeError("upstream did not return text/event-stream",
-                              status=502, code="invalid_content_type")
-        response = None
-        return result
-    except BridgeError as exc:
-        exc.result = result
-        if response is not None:
-            exc.headers = response.headers
-        raise
-    finally:
-        if response is not None:
-            await response.aclose()
-
-
-async def _prime_first_event(result):
-    response = result.response
-    try:
-        parser = ResponsesSseParser()
-        iterator = response.aiter_bytes().__aiter__()
-        while True:
-            try:
-                chunk = await iterator.__anext__()
-            except StopAsyncIteration as exc:
-                parser.finish()
-                code = "missing_terminal" if parser.saw_done else "empty_stream"
-                raise BridgeError(
-                    "upstream stream closed before a valid Responses event",
-                    code=code,
-                ) from exc
-            events = parser.feed(chunk)
-            if not events:
-                continue
-            for event in events:
-                error = _event_error(event)
-                if error is not None:
-                    raise error
-            if parser.saw_done and not any(
-                    event.event_type in _TERMINAL_EVENT_TYPES for event in events):
-                raise BridgeError(
-                    "upstream sent [DONE] without a Responses terminal event",
-                    code="missing_terminal",
-                )
-            opened = OpenedStream(result, iterator, parser, events)
-            response = None
-            return opened
-    except BridgeError as exc:
-        exc.result = result
-        if response is not None:
-            exc.headers = response.headers
-        raise
-    finally:
-        if response is not None:
-            await response.aclose()
-
-
-def _record_first_event(opened, pool):
-    entry = getattr(opened.result, "key_entry", None)
-    if pool is not None and entry is not None:
-        sent_at = getattr(opened.result, "response_started_mono", 0.0)
-        if sent_at > 0:
-            pool.record_ttft(entry, time.monotonic() - sent_at)
-
-
-def _mark_deferred_failure(pool, entry, session_id, metrics, status=0):
-    if entry is None:
-        return
-    for attempt in metrics.key_attempts:
-        if attempt.get("key_id") == entry.key_id:
-            attempt["available"] = False
-    _mark_key_failure(pool, entry, settings, status, session_id=session_id)
-
-
-def _mark_key_neutral(entry, metrics):
-    if entry is None:
-        return
-    for attempt in reversed(metrics.key_attempts):
-        if (attempt.get("key_id") == entry.key_id
-                and attempt.get("available") is True):
-            attempt["available"] = None
-            break
-
-
-def _is_key_failure_status(status):
-    return status == 0 or status >= 500 or status in (429, 401, 403)
-
-
-class _ProgressWaiter:
-    def __init__(self, websocket):
-        self.websocket = websocket
-        self.receive_task = None
-
-    async def wait(self, awaitable, timeout=None):
-        if self.websocket is None:
-            if timeout is None:
-                return await awaitable
-            return await asyncio.wait_for(awaitable, timeout=timeout)
-        operation_task = asyncio.create_task(awaitable)
-        deadline = time.monotonic() + timeout if timeout is not None else None
+        turn = 0
         try:
             while True:
-                if self.receive_task is None:
-                    self.receive_task = asyncio.create_task(self.websocket.receive())
-                remaining = (max(deadline - time.monotonic(), 0.0)
-                             if deadline is not None else None)
-                done, _ = await asyncio.wait(
-                    (operation_task, self.receive_task), timeout=remaining,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if not done:
-                    raise asyncio.TimeoutError
-                if self.receive_task in done:
-                    receive_task, self.receive_task = self.receive_task, None
-                    message = await receive_task
-                    if message.get("type") == "websocket.disconnect":
-                        raise ClientDisconnected
-                    if await _reject_oversized_websocket_message(
-                            self.websocket, message):
-                        continue
-                    raw = message.get("text")
-                    if raw is None and message.get("bytes") is not None:
-                        await _send_error(self.websocket, BridgeError(
-                            "binary WebSocket messages are not supported", status=400,
-                            code="unsupported_websocket_message",
-                        ))
-                        continue
-                    try:
-                        payload = json.loads(raw or "") if raw is not None else {}
-                    except ValueError:
-                        payload = {}
-                    if (isinstance(payload, dict)
-                            and payload.get("type") == "response.cancel"):
-                        raise TurnCancelled
-                    await _send_error(self.websocket, BridgeError(
-                        "only response.cancel is allowed while a response is in progress",
-                        status=409,
-                        code="response_in_progress",
-                    ))
-                    continue
-                return await operation_task
-        finally:
-            if not operation_task.done():
-                operation_task.cancel()
-            await asyncio.gather(operation_task, return_exceptions=True)
-
-    async def close(self):
-        if self.receive_task is not None and not self.receive_task.done():
-            self.receive_task.cancel()
-        if self.receive_task is not None:
-            await asyncio.gather(self.receive_task, return_exceptions=True)
-        self.receive_task = None
-
-
-async def _open_once(service, request_args, pool, session_id, metrics, websocket=None):
-    waiter = _ProgressWaiter(websocket)
-    try:
-        return await _open_once_inner(
-            service, request_args, pool, session_id, metrics, waiter,
-        )
-    finally:
-        await waiter.close()
-
-
-async def _open_once_inner(service, request_args, pool, session_id, metrics, waiter):
-    metrics.bridge_attempts = 1
-    holder = {}
-    result = None
-    try:
-        result = await waiter.wait(
-            _request_stream(service, *request_args, result_holder=holder),
-        )
-        opened = await waiter.wait(
-            _prime_first_event(result),
-            settings.sse2ws_first_event_timeout,
-        )
-        metrics.add_result(result)
-        metrics.first_event_s = time.time() - metrics.started_at
-        _record_first_event(opened, pool)
-        return opened
-    except asyncio.TimeoutError:
-        error = BridgeError(
-            f"upstream did not produce a first event within "
-            f"{settings.sse2ws_first_event_timeout:.1f}s",
-            status=504,
-            code="first_event_timeout",
-        )
-        error.result = result
-    except BridgeError as exc:
-        error = exc
-        result = getattr(exc, "result", None)
-    except (TurnCancelled, ClientDisconnected):
-        result = holder.get("result")
-        if result is not None:
-            metrics.add_result(result)
-        else:
-            metrics.total_sent = max(metrics.total_sent, holder.get("sent", 0))
-        raise
-
-    result = result or holder.get("result")
-    if result is not None:
-        metrics.add_result(result)
-    else:
-        metrics.total_sent = max(metrics.total_sent, holder.get("sent", 0))
-        metrics.key_attempts.extend(
-            dict(attempt) for attempt in holder.get("key_attempts") or []
-        )
-        entry = holder.get("key_entry")
-        if entry is not None:
-            metrics.key_entry = entry
-            metrics.key_id = getattr(entry, "key_id", "") or ""
-
-    if error.code == "first_event_timeout":
-        entry = (getattr(result, "key_entry", None) if result is not None
-                 else holder.get("key_entry"))
-        _mark_key_neutral(entry, metrics)
-        error.key_failure_recorded = True
-    elif getattr(error, "key_outcome_recorded", False):
-        error.key_failure_recorded = True
-    elif _is_key_failure_status(error.status):
-        entry = (getattr(result, "key_entry", None) if result is not None
-                 else holder.get("key_entry"))
-        _mark_deferred_failure(pool, entry, session_id, metrics, error.status)
-        error.key_failure_recorded = True
-    raise error
-
-
-async def _receive_during_stream(websocket, chunk_task):
-    receive_task = asyncio.create_task(websocket.receive())
-    try:
-        done, _ = await asyncio.wait(
-            (chunk_task, receive_task), return_when=asyncio.FIRST_COMPLETED,
-        )
-        if receive_task in done:
-            return "client", await receive_task
-        receive_task.cancel()
-        await asyncio.gather(receive_task, return_exceptions=True)
-        return "chunk", await chunk_task
-    finally:
-        if not receive_task.done():
-            receive_task.cancel()
-
-
-async def _relay(websocket, opened):
-    response = opened.result.response
-    parser = opened.parser
-    response_id = ""
-    output_items = []
-    terminal = ""
-    sent = False
-    cache_usage = None
-
-    async def emit(events):
-        nonlocal response_id, terminal, sent, output_items, cache_usage
-        for event in events:
-            error = _event_error(event)
-            if error is not None:
-                error.headers = response.headers
-                raise error
-            response_data = event.payload.get("response")
-            if isinstance(response_data, dict) and response_data.get("id"):
-                response_id = str(response_data["id"])
-            if event.event_type == "response.output_item.done" and isinstance(event.payload.get("item"), dict):
-                output_items.append(event.payload["item"])
-            if event.event_type == "response.completed" and isinstance(response_data, dict):
-                if isinstance(response_data.get("output"), list):
-                    output_items = response_data["output"]
-                cache_usage = _response_cache_usage(event.payload)
-            await websocket.send_text(event.text)
-            sent = True
-            if event.event_type in _TERMINAL_EVENT_TYPES:
-                terminal = event.event_type
-                return True
-        return False
-
-    try:
-        if await emit(opened.initial_events):
-            return terminal, response_id, output_items, sent, cache_usage
-        chunk_task = asyncio.create_task(opened.iterator.__anext__())
-        while True:
-            kind, value = await _receive_during_stream(websocket, chunk_task)
-            if kind == "client":
-                message_type = value.get("type")
-                if message_type == "websocket.disconnect":
-                    chunk_task.cancel()
-                    await asyncio.gather(chunk_task, return_exceptions=True)
-                    raise ClientDisconnected
-                if await _reject_oversized_websocket_message(websocket, value):
-                    continue
-                raw = value.get("text")
-                if raw is None and value.get("bytes") is not None:
-                    await _send_error(websocket, BridgeError(
-                        "binary WebSocket messages are not supported", status=400,
-                        code="unsupported_websocket_message",
-                    ))
-                    continue
+                if turn == 0:
+                    timeout = settings.sse2ws_first_message_timeout
+                else:
+                    timeout = settings.sse2ws_inter_turn_idle_timeout
+                kind, raw = await self._receive(timeout=timeout)
+                if kind == "disconnect":
+                    break
+                if kind == "timeout":
+                    await self.ws.close(1000, "websocket idle timeout")
+                    break
+                if kind == "binary":
+                    await self._send_error(400, "binary frames are not supported", "invalid_request")
+                    await self.ws.close(1008, "unsupported message type")
+                    break
+                if kind != "text":
+                    await self.ws.close(1008, "protocol error")
+                    break
                 try:
-                    payload = json.loads(raw or "")
-                except ValueError:
-                    await _send_error(websocket, BridgeError(
-                        "invalid WebSocket JSON", status=400, code="invalid_json",
-                    ))
-                    continue
+                    payload = json.loads(raw) if isinstance(raw, str) else None
+                except (TypeError, ValueError):
+                    payload = None
                 if not isinstance(payload, dict):
-                    await _send_error(websocket, BridgeError(
-                        "WebSocket JSON must be an object", status=400,
-                        code="invalid_request_error",
-                    ))
-                    continue
-                if payload.get("type") == "response.cancel":
-                    chunk_task.cancel()
-                    await asyncio.gather(chunk_task, return_exceptions=True)
-                    return "cancelled", response_id, output_items, sent, cache_usage
-                await _send_error(websocket, BridgeError(
-                    "only one response may be in flight", status=409,
-                    code="response_in_progress",
-                ))
-                continue
+                    await self._send_error(400, "request must be a JSON object", "invalid_request")
+                    await self.ws.close(1008, "invalid request")
+                    break
+                msg_type = payload.get("type")
+                if msg_type != "response.create":
+                    if msg_type == "response.append":
+                        message = ("response.append is not supported; "
+                                   "use response.create with previous_response_id")
+                    else:
+                        message = f"unsupported message type: {msg_type}"
+                    await self._send_error(400, message, "invalid_request")
+                    await self.ws.close(1008, "unsupported message type")
+                    break
+                turn += 1
+                keep = await self._run_turn_guarded(payload, turn)
+                if not keep:
+                    break
+        finally:
             try:
-                events = parser.feed(value)
-            except BridgeError:
+                await self.ws.close(1000, "session ended")
+            except Exception:
+                pass
+
+    def _request_ip(self):
+        for header in ("cf-connecting-ip", "x-forwarded-for", "x-real-ip"):
+            value = self.ws.headers.get(header, "").strip()
+            if value:
+                return value.split(",", 1)[0].strip()
+        return self.ws.client.host if self.ws.client else ""
+
+    async def _receive(self, timeout=None):
+        if self._buffered is not None:
+            raw = self._buffered
+            self._buffered = None
+            return ("text", raw)
+        try:
+            if timeout and timeout > 0:
+                message = await asyncio.wait_for(self.ws.receive(), timeout=timeout)
+            else:
+                message = await self.ws.receive()
+        except asyncio.TimeoutError:
+            return ("timeout", None)
+        except WebSocketDisconnect:
+            return ("disconnect", None)
+        mtype = message.get("type")
+        if mtype == "websocket.disconnect":
+            return ("disconnect", None)
+        if mtype == "websocket.receive":
+            text = message.get("text")
+            if text is not None:
+                return ("text", text)
+            if message.get("bytes") is not None:
+                return ("binary", None)
+        return ("error", None)
+
+    async def _watch_disconnect(self):
+        while True:
+            message = await self.ws.receive()
+            mtype = message.get("type")
+            if mtype == "websocket.disconnect":
+                return
+            if mtype == "websocket.receive":
+                text = message.get("text")
+                if text is not None and self._buffered is None:
+                    self._buffered = text
+
+    async def _run_turn_guarded(self, payload, turn):
+        work = asyncio.create_task(self._run_turn(payload, turn))
+        watcher = asyncio.create_task(self._watch_disconnect())
+        done, _ = await asyncio.wait(
+            {work, watcher}, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if watcher in done:
+            work.cancel()
+            await asyncio.gather(work, return_exceptions=True)
+            return False
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+        try:
+            return work.result()
+        except _ClientDisconnected:
+            return False
+        except Exception:
+            logger.exception(f"{_tag('WS→SSE', self.path, self.provider, '', self.client_ip)} turn 处理异常")
+            return False
+
+    async def _run_turn(self, payload, turn):
+        token = set_client_ip(self.client_ip)
+        start = time.time()
+        try:
+            return await self._run_turn_inner(payload, turn, start)
+        except _ClientDisconnected:
+            return False
+        finally:
+            reset_client_ip(token)
+
+    async def _run_turn_inner(self, payload, turn, start):
+        body_payload = self._prepare_turn_payload(payload)
+        body = json.dumps(body_payload, ensure_ascii=False).encode("utf-8")
+        if len(body) > settings.sse2ws_max_body_bytes:
+            await self._safe_close_error(413, "request_body_too_large",
+                                         "Request body exceeds the maximum allowed size")
+            return False
+        body, dlp_error = await self._apply_dlp(body)
+        if dlp_error is not None:
+            status, error_type, message = dlp_error
+            await self._safe_close_error(status, error_type, message)
+            return False
+        model_name = body_payload.get("model") if isinstance(body_payload.get("model"), str) else ""
+        session_id = parse_request_session_id(body)
+        endpoint_family = classify_endpoint(self.remaining)
+        model_scope = classify_model_scope(model_name, endpoint_family)
+        outbound_headers = self._build_outbound_headers(model_name)
+        url = f"{self.upstream}/{self.remaining}" if self.remaining else self.upstream
+        request_pool = self._pick_pool(model_name, endpoint_family, model_scope)
+        if self.pool_access and request_pool is None:
+            await self._safe_close_error(
+                403, "key_pool_no_match",
+                "No compatible key pool route for this request",
+            )
+            return False
+        logger.debug(
+            f"{_tag('WS→SSE', self.path, self.provider, model_name, self.client_ip)}"
+            f" turn #{turn} 开始"
+        )
+        input_items = _extract_input_items(body_payload)
+        logger.debug(
+            f"{_tag('WS→SSE', self.path, self.provider, model_name, self.client_ip)}"
+            f" turn #{turn} 上游请求 body_bytes={len(body)} replay={'yes' if self._replay_input is not None else 'no'}"
+            f" input_items={len(input_items)} input_types={[i.get('type') for i in input_items[:10]]}"
+        )
+        self._turn_sent = 0
+        last_result = None
+        last_outcome = None
+        for attempt in range(1, settings.sse2ws_first_event_retries + 2):
+            result = await self.service.request(
+                "POST", url, outbound_headers, body, self.path,
+                self.provider, model_name, request_pool, session_id,
+                log_method="WS→SSE",
+            )
+            last_result = result
+            self._turn_sent += result.total_sent
+            response = result.response
+            if response is None:
+                last_outcome = {
+                    "status": "upstream_exhausted", "succeeded": False,
+                    "final_status": 503,
+                    "error_type": "upstream_error",
+                    "message": result.failure_reason
+                    or "upstream overloaded after repeated attempts",
+                }
+                break
+            if response.status_code >= 400:
+                try:
+                    raw = await response.aread()
+                except Exception:
+                    raw = b""
+                try:
+                    await response.aclose()
+                except Exception:
+                    pass
+                message = self._extract_error_message(raw, response.status_code)
+                last_outcome = {
+                    "status": "error", "succeeded": False,
+                    "final_status": response.status_code,
+                    "error_type": "upstream_error",
+                    "message": message,
+                }
+                break
+            outcome = await self._consume_stream(result, request_pool, start, model_name, session_id)
+            last_outcome = outcome
+            if outcome.get("first_event_ok"):
+                break
+            if outcome.get("status") == "client_disconnected":
+                return False
+            if attempt <= settings.sse2ws_first_event_retries:
+                logger.warning(
+                    f"{_tag('WS→SSE', self.path, self.provider, model_name, self.client_ip)}"
+                    f" turn #{turn} 首事件未到({outcome.get('status')}) 重试 #{attempt + 1}"
+                    f" 总{time.time() - start:.1f}s"
+                )
+                await asyncio.sleep(settings.retry_interval)
+                continue
+        if last_outcome is None:
+            last_outcome = {
+                "status": "error", "succeeded": False, "final_status": 502,
+                "error_type": "upstream_error", "message": "turn failed without result",
+            }
+        status = last_outcome.get("status")
+        if status in SSE2WS_OK_TERMINAL_EVENTS:
+            self._commit_replay()
+        elif status == "first_event_timeout":
+            self._neutralize_winner_key(last_result)
+        elif status in ("eof", "transport_error", "response.failed",
+                        "response.cancelled", "error"):
+            self._handle_stream_failure(last_result, request_pool, session_id)
+        succeeded = last_outcome.get("succeeded", False)
+        await self._write_log(last_result, start, last_outcome, model_name)
+        if status == "client_disconnected":
+            return False
+        if succeeded and status in SSE2WS_OK_TERMINAL_EVENTS:
+            logger.info(
+                f"{_tag('WS→SSE', self.path, self.provider, model_name, self.client_ip)}"
+                f" turn #{turn} 结束 status={status} HTTP={last_outcome.get('final_status')}"
+                f" 总{time.time() - start:.1f}s"
+            )
+            return True
+        # 失败轮：保持连接以便客户端续聊/重试。若上游已发出终止事件
+        # （failed/cancelled/error）则已透传，无需再补 error 帧。
+        if not last_outcome.get("forwarded_terminal"):
+            frame_status = last_outcome.get("final_status") or 502
+            if status in ("eof", "transport_error"):
+                frame_status = 502
+            await self._send_error(
+                frame_status,
+                last_outcome.get("message") or "upstream request failed",
+                str(last_outcome.get("error_type") or "upstream_error"),
+            )
+        logger.warning(
+            f"{_tag('WS→SSE', self.path, self.provider, model_name, self.client_ip)}"
+            f" turn #{turn} 失败 status={status} HTTP={last_outcome.get('final_status')}"
+            f" 总{time.time() - start:.1f}s"
+        )
+        return True
+
+    async def _apply_dlp(self, body):
+        """DLP 策略与 HTTP 代理路径一致：audit/block/redact 与豁免标记。
+        返回 (处理后的body, (status, error_type, message) 或 None)。"""
+        if settings.dlp_mode not in ("audit", "block", "redact"):
+            return body, None
+        if len(body) > settings.dlp_max_body_bytes:
+            logger.warning(
+                f"{_tag('WS→SSE', self.path, self.provider, '', self.client_ip)}"
+                f" DLP请求体超限 bytes={len(body)}"
+            )
+            if settings.dlp_mode in ("block", "redact"):
+                return body, (413, "dlp_body_too_large",
+                              "Request body exceeds DLP inspection limit")
+            return body, None
+        dlp = await asyncio.to_thread(
+            inspect_json_body, body, settings.dlp_rules,
+            settings.dlp_exempt_start, settings.dlp_exempt_end,
+            settings.dlp_strip_exempt_markers, settings.dlp_mode,
+            settings.dlp_rule_file, None, settings.dlp_allow_exemptions,
+            settings.dlp_decode_depth, settings.dlp_decode_max_candidates,
+            settings.dlp_decode_max_bytes, _key_pool_secrets(),
+            settings.dlp_known_secret_min_length,
+        )
+        if dlp.uninspectable and settings.dlp_fail_closed and body:
+            return body, (422, "dlp_uninspectable_body",
+                          "Request body cannot be inspected by DLP")
+        if dlp.limit_exceeded:
+            logger.warning(
+                f"{_tag('WS→SSE', self.path, self.provider, '', self.client_ip)} DLP解码扫描超限"
+            )
+            if settings.dlp_mode in ("block", "redact"):
+                return body, (413, "dlp_decode_limit_exceeded",
+                              "Request body exceeds DLP decode inspection limits")
+            return body, None
+        if dlp.malformed_exemption:
+            logger.warning(
+                f"{_tag('WS→SSE', self.path, self.provider, '', self.client_ip)} DLP豁免标记不完整"
+            )
+            if settings.dlp_mode in ("block", "redact"):
+                return body, (422, "dlp_malformed_exemption",
+                              "Malformed DLP exemption markers")
+            return body, None
+        body = dlp.body
+        if dlp.matched_rules:
+            rules = ",".join(dlp.matched_rules)
+            if dlp.blocked_rules:
+                logger.warning(
+                    f"{_tag('WS→SSE', self.path, self.provider, '', self.client_ip)}"
+                    f" DLP拦截 rules={','.join(dlp.blocked_rules)}"
+                )
+                return body, (422, "sensitive_data_blocked",
+                              "Request blocked by sensitive data policy")
+            action = "脱敏" if dlp.redactions else "告警"
+            logger.warning(
+                f"{_tag('WS→SSE', self.path, self.provider, '', self.client_ip)}"
+                f" DLP{action} rules={rules}"
+            )
+        if dlp.exemptions:
+            logger.info(
+                f"{_tag('WS→SSE', self.path, self.provider, '', self.client_ip)}"
+                f" DLP豁免 count={dlp.exemptions}"
+            )
+        return body, None
+
+    def _prepare_turn_payload(self, payload):
+        current_items = _extract_input_items(payload)
+        has_previous = bool((payload.get("previous_response_id") or "").strip())
+        has_tool_output = any(
+            isinstance(item, dict) and item.get("type") in TOOL_CALL_OUTPUT_TYPES
+            for item in current_items
+        )
+        payload.pop("previous_response_id", None)
+        needs_replay = has_previous or has_tool_output
+        if needs_replay and self._replay_input is not None:
+            if not current_items:
+                full = self._replay_input
+            elif not _items_have_prefix(current_items, self._replay_input):
+                full = self._replay_input + current_items
+            else:
+                full = current_items
+            payload["input"] = full
+        payload.pop("type", None)
+        payload.pop("generate", None)
+        payload["stream"] = True
+        self._pending_replay = _extract_input_items(payload)
+        return payload
+
+    def _commit_replay(self):
+        merged = list(self._pending_replay)
+        if self._collected:
+            merged = merged + _dedup_context(self._collected)
+        self._replay_input = merged
+
+    def _build_outbound_headers(self, model_name):
+        headers = outbound_request_headers(self.ws.headers, self.remaining, model_name)
+        for name in SKIP_UPSTREAM_WS_HEADERS:
+            headers.pop(name, None)
+        for name in SKIP_UPSTREAM_WS_SESSION_HEADERS:
+            headers.pop(name, None)
+        beta = headers.get("openai-beta", "")
+        if "responses_websockets" in beta:
+            # 去掉 WS v2 专用 beta，避免上游按 WebSocket 协议处理 HTTP 请求。
+            parts = [part.strip() for part in beta.split(",")
+                     if part.strip() and "responses_websockets" not in part]
+            if parts:
+                headers["openai-beta"] = ",".join(parts)
+            else:
+                headers.pop("openai-beta", None)
+        headers.pop("content-length", None)
+        headers["content-type"] = "application/json"
+        return headers
+
+    def _pick_pool(self, model_name, endpoint_family, model_scope):
+        if self.base_pool is None or not self.pool_credential_ok:
+            return None
+        return self.base_pool.for_request(model_name, self.remaining, endpoint_family, model_scope)
+
+    async def _consume_stream(self, result, request_pool, start, model_name, session_id):
+        response = result.response
+        parser = _SSEParser()
+        queue = asyncio.Queue(maxsize=128)
+        self._terminal = ""
+        self._terminal_error_status = None
+        self._collected = []
+
+        async def producer():
+            try:
+                async for chunk in response.aiter_bytes():
+                    parser.feed(chunk)
+                    for payload, raw in parser.events():
+                        await queue.put(("event", payload, raw))
+            except asyncio.CancelledError:
                 raise
-            if await emit(events):
-                return terminal, response_id, output_items, sent, cache_usage
-            chunk_task = asyncio.create_task(opened.iterator.__anext__())
-    except StopAsyncIteration as exc:
-        parser.finish()
-        code = "missing_terminal" if sent else "empty_stream"
-        raise BridgeError("upstream stream closed before response.completed", code=code) from exc
-    finally:
-        await response.aclose()
+            except Exception as exc:
+                await queue.put(("error", {"_transport": str(exc)}, None))
+            finally:
+                try:
+                    await queue.put(("eof", None, None))
+                except Exception:
+                    pass
 
+        producer_task = asyncio.create_task(producer())
+        outcome = {"first_event_ok": False}
+        try:
+            deadline = time.monotonic() + settings.sse2ws_first_event_timeout
+            first_event_raw = None
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    outcome = {
+                        "first_event_ok": False, "status": "first_event_timeout",
+                        "succeeded": False, "final_status": 504,
+                    }
+                    break
+                try:
+                    kind, payload, raw = await asyncio.wait_for(queue.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    outcome = {
+                        "first_event_ok": False, "status": "first_event_timeout",
+                        "succeeded": False, "final_status": 504,
+                    }
+                    break
+                if kind == "event":
+                    first_event_raw = raw
+                    self._handle_event(payload)
+                    break
+                if kind == "eof":
+                    outcome = {
+                        "first_event_ok": False, "status": "eof", "succeeded": False,
+                        "final_status": response.status_code,
+                        "message": "upstream stream ended before any event",
+                    }
+                    break
+                outcome = {
+                    "first_event_ok": False, "status": "transport_error",
+                    "succeeded": False, "final_status": response.status_code,
+                    "message": payload.get("_transport", "upstream transport error"),
+                }
+                break
+            if first_event_raw is not None:
+                try:
+                    await self._send_text(first_event_raw)
+                except _ClientDisconnected:
+                    return {"status": "client_disconnected", "succeeded": False,
+                            "final_status": None}
+                outcome = {"first_event_ok": True}
+                mid_error = None
+                while True:
+                    kind, payload, raw = await queue.get()
+                    if kind == "event":
+                        self._handle_event(payload)
+                        try:
+                            await self._send_text(raw)
+                        except _ClientDisconnected:
+                            return {"status": "client_disconnected", "succeeded": False,
+                                    "final_status": None}
+                    elif kind == "eof":
+                        break
+                    else:
+                        mid_error = payload.get("_transport", "upstream transport error")
+                        break
+                if mid_error is not None:
+                    outcome = {
+                        "first_event_ok": True, "status": "transport_error",
+                        "succeeded": False, "final_status": response.status_code,
+                        "message": mid_error,
+                    }
+                else:
+                    outcome = self._finish_stream_outcome(response.status_code)
+                    outcome["first_event_ok"] = True
+        finally:
+            producer_task.cancel()
+            await asyncio.gather(producer_task, return_exceptions=True)
+            try:
+                await response.aclose()
+            except Exception:
+                pass
+        return outcome
 
-async def _write_turn_log(store, path, provider, model, upstream, request_pool, client_ip,
-                          metrics, final_status, stream_status, succeeded):
-    await store.write({
-        "ts": datetime.now().isoformat(timespec="milliseconds"),
-        "method": "POST",
-        "path": "/" + path,
-        "provider": provider,
-        "model": model,
-        "upstream_status": metrics.last_status,
-        "final_status": final_status,
-        "attempts": metrics.total_sent,
-        "retries": max(metrics.total_sent - 1, 0),
-        "retry_codes": metrics.retry_codes,
-        "mode": "off",
-        "first_ok": metrics.total_sent == 1 and succeeded,
-        "key_id": metrics.key_id,
-        "key_pool": upstream if request_pool is not None else "",
-        "key_attempts": metrics.key_attempts,
-        "client_ip": client_ip,
-        "duration_s": round(time.time() - metrics.started_at, 3),
-        "succeeded": succeeded,
-        "stream_status": stream_status,
-        "downstream_transport": "websocket",
-        "upstream_transport": "sse",
-        "bridge_retries": max(metrics.bridge_attempts - 1, 0),
-        "bridge_retry_reasons": metrics.bridge_retry_reasons,
-        "first_event_s": round(metrics.first_event_s, 3) if metrics.first_event_s else None,
-    })
+    def _finish_stream_outcome(self, http_status):
+        terminal = self._terminal
+        if terminal in SSE2WS_OK_TERMINAL_EVENTS:
+            return {"status": terminal, "succeeded": True, "final_status": http_status}
+        if terminal in ("response.failed", "response.cancelled", "error"):
+            return {"status": terminal, "succeeded": False, "final_status": http_status,
+                    "forwarded_terminal": True}
+        return {"status": "eof", "succeeded": False, "final_status": http_status,
+                "message": "upstream stream ended before a terminal event"}
 
+    def _handle_event(self, payload):
+        event_type = payload.get("type")
+        if event_type in SSE2WS_TERMINAL_EVENTS:
+            self._terminal = event_type
+            status = _embedded_failure_status(payload)
+            if status is not None:
+                self._terminal_error_status = status
+        if event_type == "response.output_item.done":
+            item = payload.get("item")
+            if _is_context_item(item):
+                self._collected.append(item)
+        elif event_type in ("response.completed", "response.done"):
+            response = payload.get("response")
+            if isinstance(response, dict):
+                for item in response.get("output") or []:
+                    if _is_context_item(item):
+                        self._collected.append(item)
 
-def _key_tag(metrics):
-    key_id = str(getattr(metrics, "key_id", "") or "").strip()
-    return f" [{key_id}]" if key_id else ""
+    def _neutralize_winner_key(self, result):
+        if result is None or result.key_entry is None:
+            return
+        for attempt in reversed(result.key_attempts or []):
+            if attempt.get("key_id") == result.key_entry.key_id:
+                attempt["available"] = None
+                return
+
+    def _handle_stream_failure(self, result, request_pool, session_id):
+        status = self._terminal_error_status
+        if result is None or result.key_entry is None:
+            return
+        if status in (401, 403, 429) and request_pool is not None:
+            for attempt in reversed(result.key_attempts or []):
+                if attempt.get("key_id") == result.key_entry.key_id:
+                    attempt["available"] = False
+                    break
+            _mark_key_failure(request_pool, result.key_entry, settings, status,
+                              session_id=session_id)
+        else:
+            self._neutralize_winner_key(result)
+
+    async def _send_text(self, text):
+        try:
+            await self.ws.send_text(text)
+        except Exception as exc:
+            raise _ClientDisconnected from exc
+
+    async def _send_error(self, status, message, error_type="server_error"):
+        try:
+            await self.ws.send_text(_build_error_event(status, message, error_type))
+        except Exception:
+            raise _ClientDisconnected
+
+    async def _safe_close_error(self, status, error_type, message):
+        try:
+            await self._send_error(status, message, error_type)
+        except _ClientDisconnected:
+            return
+        try:
+            await self.ws.close(1011, "upstream error")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _extract_error_message(raw, status_code):
+        text = ""
+        if raw:
+            try:
+                payload = json.loads(raw)
+            except (TypeError, ValueError, UnicodeDecodeError):
+                text = raw.decode("utf-8", errors="replace")
+            else:
+                if isinstance(payload, dict):
+                    error = payload.get("error")
+                    if isinstance(error, dict):
+                        text = error.get("message") or error.get("detail") or ""
+                    if not text:
+                        text = payload.get("message") or payload.get("detail") or ""
+                    if not text and isinstance(error, str):
+                        text = error
+        message = " ".join(text.split())[:300] if text else ""
+        return message or f"upstream returned HTTP {status_code}"
+
+    async def _write_log(self, result, start, outcome, model_name):
+        attempts = self._turn_sent if result is not None else 1
+        record = {
+            "method": "WS→SSE",
+            "path": "/" + self.path,
+            "provider": self.provider,
+            "model": model_name,
+            "upstream_status": outcome.get("final_status") or 0,
+            "attempts": attempts,
+            "retries": max(attempts - 1, 0),
+            "retry_codes": (result.retry_codes if result is not None else []) or [],
+            "mode": "sse2ws-bridge",
+            "first_ok": result.first_ok if result is not None else False,
+            "key_id": result.key_id if result is not None else "",
+            "key_pool": self.upstream if result is not None and result.key_id else "",
+            "key_attempts": (result.key_attempts if result is not None else []) or [],
+            "client_ip": self.client_ip,
+            "ts": datetime.now().isoformat(timespec="milliseconds"),
+            "final_status": outcome.get("final_status") or 0,
+            "duration_s": round(time.time() - start, 3),
+            "succeeded": outcome.get("succeeded", False),
+            "stream_status": outcome.get("status", ""),
+        }
+        await self.store.write(record)
 
 
 def create_sse2ws_handler(service, store):
-    async def websocket_proxy(websocket: WebSocket, path: str):
-        if (settings.sse2ws_mode != "bridge" or is_excluded_path(path)):
-            await _deny(websocket)
-            return
-        upstream, provider, remaining = match_route(path)
-        if classify_endpoint(remaining) != "responses":
-            await _deny(websocket, message="WebSocket bridge only supports Responses API paths")
-            return
-        if settings.sse2ws_first_event_timeout <= 0:
-            await _deny(websocket, status=503, message="Invalid SSE2WS timeout configuration")
-            return
-
-        await websocket.accept()
-        client_ip = _request_ip(websocket)
-        transcript = Transcript()
-        base_pool = KEY_POOLS.get(upstream)
-        pool_credential_ok = can_use_key_pool(websocket.headers)
-        url = f"{upstream}/{remaining}" if remaining else upstream
-        if websocket.url.query:
-            url += f"?{websocket.url.query}"
-
-        while True:
+    async def handler(websocket: WebSocket):
+        path = (websocket.scope.get("path", "") or "").lstrip("/")
+        if not is_responses_ws_path(path):
             try:
-                message = await websocket.receive()
-                if message.get("type") == "websocket.disconnect":
-                    return
-                if await _reject_oversized_websocket_message(websocket, message):
-                    continue
-                if message.get("bytes") is not None:
-                    await _send_error(websocket, BridgeError(
-                        "binary WebSocket messages are not supported", status=400,
-                        code="unsupported_websocket_message",
-                    ))
-                    continue
-                try:
-                    payload = json.loads(message.get("text") or "")
-                except ValueError:
-                    await _send_error(websocket, BridgeError(
-                        "invalid WebSocket JSON", status=400, code="invalid_json",
-                    ))
-                    continue
-                if not isinstance(payload, dict):
-                    await _send_error(websocket, BridgeError(
-                        "WebSocket JSON must be an object", status=400,
-                        code="invalid_request_error",
-                    ))
-                    continue
-                if payload.get("type") != "response.create":
-                    await _send_error(websocket, BridgeError(
-                        "expected response.create", status=400,
-                        code="unsupported_websocket_event",
-                    ))
-                    continue
+                await websocket.close(1008)
+            except Exception:
+                pass
+            return
+        bridge = ResponsesWSBridge(websocket, path, service, store)
+        await bridge.run()
 
-                try:
-                    merged_input = transcript.merge(payload)
-                    http_payload = dict(payload)
-                    http_payload.pop("type", None)
-                    http_payload.pop("generate", None)
-                    http_payload.pop("background", None)
-                    http_payload.pop("previous_response_id", None)
-                    http_payload["input"] = merged_input
-                    http_payload["stream"] = True
-                    body = json.dumps(http_payload, ensure_ascii=False,
-                                      separators=(",", ":")).encode("utf-8")
-                    body = await _dlp_body(body)
-                    sanitized = json.loads(body)
-                    merged_input = sanitized.get("input", merged_input)
-                except BridgeError as exc:
-                    await _send_error(websocket, exc)
-                    continue
-
-                if payload.get("generate") is False:
-                    response_id = "resp_sse2ws_" + uuid.uuid4().hex
-                    response_base = {
-                        "id": response_id,
-                        "object": "response",
-                        "model": str(payload.get("model") or ""),
-                        "output": [],
-                    }
-                    for index, (event_type, status) in enumerate((
-                        ("response.created", "in_progress"),
-                        ("response.in_progress", "in_progress"),
-                        ("response.completed", "completed"),
-                    )):
-                        event = {
-                            "type": event_type,
-                            "sequence_number": index,
-                            "response": {**response_base, "status": status},
-                        }
-                        await websocket.send_text(json.dumps(
-                            event, ensure_ascii=False, separators=(",", ":"),
-                        ))
-                    transcript.remember(response_id, merged_input, [])
-                    logger.debug(f"{_tag('WS', path, provider, str(payload.get('model') or ''), client_ip)} SSE2WS warmup完成")
-                    continue
-
-                body = json.dumps(sanitized, ensure_ascii=False,
-                                  separators=(",", ":")).encode("utf-8")
-                model = parse_request_model(body, remaining)
-                session_id = parse_request_session_id(body)
-                model_scope = classify_model_scope(model, "responses")
-                outbound_headers = outbound_request_headers(websocket.headers, remaining, model)
-                outbound_headers["content-type"] = "application/json"
-                outbound_headers["accept"] = "text/event-stream"
-                if settings.proxy_api_key and pool_credential_ok and base_pool is None:
-                    await _send_error(websocket, BridgeError(
-                        "Key pool is unavailable for this upstream", status=503,
-                        code="key_pool_unavailable",
-                    ))
-                    continue
-                pool_access = bool(base_pool and pool_credential_ok)
-                request_pool = base_pool.for_request(
-                    model, remaining, "responses", model_scope,
-                ) if pool_access else None
-                if pool_access and request_pool is None:
-                    await _send_error(websocket, BridgeError(
-                        "No compatible key pool route for this endpoint and model",
-                        status=403, code="key_pool_no_compatible_route",
-                    ))
-                    continue
-
-                metrics = TurnMetrics()
-                ip_token = set_client_ip(client_ip)
-                try:
-                    request_args = (
-                        "POST", url, outbound_headers, body, path, provider, model,
-                        request_pool, session_id,
-                    )
-                    opened = await _open_once(
-                        service, request_args, request_pool, session_id, metrics,
-                        websocket,
-                    )
-                    status, response_id, output_items, sent, cache_usage = await _relay(
-                        websocket, opened,
-                    )
-                    succeeded = status == "response.completed"
-                    if (succeeded and request_pool is not None
-                            and metrics.key_entry is not None and cache_usage is not None):
-                        request_pool.record_cache_usage(
-                            metrics.key_entry, *cache_usage, session_id,
-                        )
-                    await _write_turn_log(
-                        store, path, provider, model, upstream, request_pool, client_ip,
-                        metrics, 200, status, succeeded,
-                    )
-                    if status == "response.completed":
-                        transcript.remember(response_id, merged_input, output_items)
-                    if status in _TERMINAL_EVENT_TYPES:
-                        log = logger.info if status == "response.completed" else logger.warning
-                        log(
-                            f"{_tag('SSE→WS', path, provider, model, client_ip)}"
-                            f"{_key_tag(metrics)} "
-                            f"SSE2WS流结束 status={status} HTTP=200 "
-                            f"总{time.time() - metrics.started_at:.2f}s"
-                        )
-                    if status == "cancelled":
-                        logger.info(
-                            f"{_tag('WS→SSE', path, provider, model, client_ip)}"
-                            f"{_key_tag(metrics)} SSE2WS客户端取消"
-                        )
-                except ClientDisconnected:
-                    await _write_turn_log(
-                        store, path, provider, model, upstream, request_pool, client_ip,
-                        metrics, 499, "cancelled", False,
-                    )
-                    logger.info(
-                        f"{_tag('WS→SSE', path, provider, model, client_ip)}"
-                        f"{_key_tag(metrics)} SSE2WS客户端断开"
-                    )
-                    return
-                except TurnCancelled:
-                    await _write_turn_log(
-                        store, path, provider, model, upstream, request_pool, client_ip,
-                        metrics, 499, "cancelled", False,
-                    )
-                    logger.info(
-                        f"{_tag('WS→SSE', path, provider, model, client_ip)}"
-                        f"{_key_tag(metrics)} "
-                        "SSE2WS首事件前客户端取消"
-                    )
-                    continue
-                except BridgeError as exc:
-                    if (not exc.key_failure_recorded
-                            and not getattr(exc, "key_outcome_recorded", False)
-                            and _is_key_failure_status(exc.status)):
-                        _mark_deferred_failure(
-                            request_pool, metrics.key_entry, session_id, metrics, exc.status,
-                        )
-                    await _write_turn_log(
-                        store, path, provider, model, upstream, request_pool, client_ip,
-                        metrics, exc.status, exc.code, False,
-                    )
-                    logger.warning(
-                        f"{_tag('SSE→WS', path, provider, model, client_ip)}"
-                        f"{_key_tag(metrics)} SSE2WS流失败 "
-                        f"status={exc.code} HTTP={exc.status} "
-                        f"总{time.time() - metrics.started_at:.2f}s"
-                    )
-                    try:
-                        await _send_error(websocket, exc)
-                        await websocket.close(code=1011, reason=exc.code[:123])
-                    except (RuntimeError, WebSocketDisconnect):
-                        pass
-                    return
-                finally:
-                    reset_client_ip(ip_token)
-            except WebSocketDisconnect:
-                return
-
-    return websocket_proxy
+    return handler

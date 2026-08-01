@@ -271,8 +271,6 @@ def _key_health_status(stats: dict, meta: dict) -> str:
         return "circuit_open"
     if meta.get("consecutive_failures", 0) > 0:
         return "unavailable"
-    # A successful SSE2WS response header is neutralized when its first event
-    # times out. Do not let an older failure remain the current health state.
     if stats.get("latest_neutral"):
         return "available"
     if stats.get("latest_available") is False:

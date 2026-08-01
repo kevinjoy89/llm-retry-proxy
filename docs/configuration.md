@@ -44,16 +44,29 @@
 | `RESPONSES_HEADER_TIMEOUT` | `120` | Responses API 整笔请求从开始处理到收到响应头的硬上限（秒）；预算内正常重试，`0` = 不限制 |
 | `RESPONSES_ATTEMPT_HEADER_TIMEOUT` | `15` | 流式 Responses 号池请求中单个 key 等待响应头的上限（秒）；超时后取消该次请求、熔断并换 key，`0` = 不限制 |
 
-## Codex SSE→WebSocket 桥接
+
+## Codex Responses WebSocket 桥接 (SSE2WS)
+
+> **双向桥接，上游无需支持 WebSocket。** 名称 `sse2ws` 指**响应方向**（上游 SSE → 客户端 WS）：
+>
+> - **`WS → SSE`（请求方向，客户端 → 上游）**：客户端经 WebSocket 发送 `response.create` 文本帧，桥接逐轮转成上游 HTTP/SSE Responses 请求。
+> - **`SSE → WS`（响应方向，上游 → 客户端）**：上游 SSE 事件流逐帧转成 WebSocket JSON 文本帧推回客户端，连接内可连续多轮。
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `SSE2WS_MODE` | `off` | `off` = 握手返回 426 并由客户端回退 HTTP；`bridge` = 接收 Responses WebSocket 并转为上游 HTTP/SSE |
-| `SSE2WS_FIRST_EVENT_TIMEOUT` | `30` | 桥接模式在最终上游返回 2xx 响应头后，等待首个有效 Responses 事件的超时（秒） |
+| `SSE2WS_MODE` | `off` | 设为 `bridge` 开启。关闭时不注册 WS 路由，客户端自动回退到 HTTP/SSE |
+| `SSE2WS_FIRST_EVENT_TIMEOUT` | `30` | 上游已返回响应头但迟迟不发首事件时判定该次尝试失败的超时（秒） |
+| `SSE2WS_FIRST_EVENT_RETRIES` | `2` | 首事件超时后整轮重试的次数；`0` = 不重试 |
+| `SSE2WS_FIRST_MESSAGE_TIMEOUT` | `30` | 连接建立后等待客户端第一条 `response.create` 的超时（秒） |
+| `SSE2WS_INTER_TURN_IDLE_TIMEOUT` | `300` | 轮与轮之间（等待下一条 `response.create`）的空闲超时（秒）；超时关闭连接 |
+| `SSE2WS_MAX_BODY_BYTES` | `67108864` | 单轮 `response.create` 载荷上限（字节），超出返回错误 |
 
-桥接模式只接受匹配到 Responses API 的 WebSocket 路径。客户端必须发送文本 JSON `response.create`；同一连接一次只允许一个生成请求。桥接与纯 SSE 共用响应头之前的重试与换 Key 逻辑；首事件超时从最终 2xx 响应头到达后独立计时，只结束当前轮次，不重连也不熔断 Key。`generate=false` warmup 由代理本地完成，不产生上游请求或统计记录。
+行为说明：
 
-该功能默认关闭。开启前需确保外层反向代理支持 WebSocket Upgrade，并在 Codex 自定义 provider 中设置 `supports_websockets = true`。
+- 多轮上下文通过连接内累积 + 完整 input 重放实现：续轮（携带 `previous_response_id` 或 `function_call_output`）时丢弃 `previous_response_id`，把累积的上下文 item 与当前 input 合并后发给上游，适配无状态的 HTTP/SSE 上游。
+- 终止事件以 `response.completed` / `response.incomplete` / `response.failed` / `response.cancelled` / `error` 为准；提前 EOF 视为失败并下发 error 帧，不当作成功。
+- 鉴权、号池路由、重试、熔断与日志记录与普通 HTTP 请求共用同一套引擎；日志 `method` 标记为 `WS`。
+
 
 ## 重试与退避
 

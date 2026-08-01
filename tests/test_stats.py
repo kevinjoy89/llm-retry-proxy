@@ -262,8 +262,9 @@ class KeyAvailabilityStatsTests(unittest.TestCase):
             {"ts": "2026-07-17T10:00:00", "provider": "p", "key_pool": "pool",
              "key_id": "key-1", "final_status": 503,
              "key_attempts": [{"key_id": "key-1", "available": False}]},
-            # SSE2WS response headers succeeded, but the first event timed out;
-            # this neutral sample is excluded from the availability percentage.
+            # The response headers succeeded, but the stream timed out before its
+            # first event; this neutral sample is excluded from the availability
+            # percentage.
             {"ts": "2026-07-17T10:01:00", "provider": "p", "key_pool": "pool",
              "key_id": "key-1", "final_status": 504, "stream_status": "first_event_timeout",
              "key_attempts": [{"key_id": "key-1", "available": None}]},

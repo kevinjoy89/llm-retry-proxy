@@ -20,11 +20,11 @@
 
 - 通用反向代理：透传所有路径、Header、Body、Query
 - 支持 SSE 流式响应；重试只发生在首字节之前
-- 可选 Codex Responses SSE→WebSocket 桥接，兼容只支持 HTTP/SSE 的上游
 - 503/502/504/529/429 自动重试，支持固定间隔、指数退避和 `Retry-After`
 - 默认有最大重试次数保护，可设置为无限重试
 - 响应头附带 `X-Forward-Attempts`，告知客户端本次请求尝试次数
 - 可选竞速模式、多上游路由和号池多 key 降级
+- **Codex Responses WebSocket 桥接 (SSE2WS)**：双向桥接 `/v1/responses`。`WS → SSE`（请求方向，客户端 WebSocket `response.create` → 上游 HTTP/SSE 请求）+ `SSE → WS`（响应方向，上游 SSE 事件流 → WebSocket JSON 文本帧），多轮 `response.create` 自动衔接（见 [configuration](docs/configuration.md) 的 SSE2WS 段）
 - 按天 JSONL 明细日志、Token/缓存累计汇总和内置可视化分析面板
 
 ## 快速开始
@@ -104,45 +104,13 @@ docker compose -f compose.yaml -f compose.legacy.yaml up -d --build
 | `RETRY_INTERVAL_429` | `5.0` | 429 专用重试间隔/退避基数 |
 | `RETRY_BROAD` | `off` | 是否把鉴权和网络错误也纳入重试/换 key |
 | `HEDGE_MODE` | `off` | `off` 串行；`race` / `stagger` 竞速 |
-| `SSE2WS_MODE` | `off` | `bridge` 接收 Codex WebSocket，并桥接到上游 HTTP/SSE |
 | `KEY_POOL_FILE` | 空 | CSV 号池文件；优先于 `KEY_POOLS` |
 | `ADMIN_PASSWORD` | 空 | `/stats`、`/logs` 和号池管理页的密码 |
 | `LOG_DIR` | `logs` | 日志目录 |
 | `TOKEN_STATS_INJECT_USAGE` | `false` | 是否为 OpenAI Chat 流式请求注入 usage 选项 |
+| `SSE2WS_MODE` | `off` | 设为 `bridge` 开启 Codex Responses WebSocket → 上游 HTTP/SSE 桥接 |
 
 完整配置表和默认值见[配置项](docs/configuration.md)。
-
-## Codex SSE→WebSocket 桥接
-
-当上游只支持 Responses HTTP/SSE，而 Codex 使用 WebSocket 更稳定时，可开启：
-
-```env
-SSE2WS_MODE=bridge
-SSE2WS_FIRST_EVENT_TIMEOUT=30
-```
-
-并在 Codex 的 `config.toml` 中为对应自定义 provider 声明：
-
-```toml
-[model_providers.my_proxy]
-base_url = "http://127.0.0.1:8080/v1"
-wire_api = "responses"
-supports_websockets = true
-```
-
-桥接会在下游保持 WebSocket，把每个 `response.create` 转为上游 SSE 请求。重试、换 Key 与纯 SSE 请求共用同一套处理；上游返回 2xx 响应头后，首事件超时只结束当前轮次，在 Key 可用率中记为中性结果，不在桥接层重连也不熔断 Key；空流、明确错误事件、非法 SSE 或传输失败仍按流失败处理。工具调用的后续轮次会重放完整 transcript，不依赖上游保存 `previous_response_id`。该模式不是原生上游 WebSocket：上游仍会为每轮建立 HTTP/SSE 请求。
-
-若服务前还有 Nginx，必须为代理路径透传 Upgrade：
-
-```nginx
-proxy_http_version 1.1;
-proxy_set_header Upgrade $http_upgrade;
-proxy_set_header Connection "upgrade";
-proxy_read_timeout 3600s;
-proxy_buffering off;
-```
-
-未开启桥接或 WebSocket 路径不是 Responses API 时，握手返回 `426`，使 Codex 立即回退 HTTP/SSE，而不是等待多轮连接超时。
 
 ## 文档导航
 

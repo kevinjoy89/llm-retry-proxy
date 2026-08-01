@@ -1,7 +1,6 @@
 import unittest
 from types import SimpleNamespace
 
-from starlette.routing import WebSocketRoute
 
 from retry_proxy.application import app
 from retry_proxy.routes import RouteRegistry, normalize_route_prefix
@@ -77,11 +76,7 @@ class RouteRegistryTests(unittest.TestCase):
 
 
 class ApplicationTransportRouteTests(unittest.TestCase):
-    def test_proxy_registers_websocket_and_http_catchalls(self):
-        self.assertTrue(any(
-            isinstance(route, WebSocketRoute) and route.path == "/{path:path}"
-            for route in app.routes
-        ))
+    def test_proxy_registers_http_catchall(self):
         self.assertTrue(any(
             getattr(route, "path", "") == "/{path:path}"
             and "POST" in (getattr(route, "methods", None) or set())
