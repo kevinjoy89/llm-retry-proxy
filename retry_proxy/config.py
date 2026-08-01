@@ -147,6 +147,9 @@ class Settings:
     max_request_body: int = int(os.getenv("MAX_REQUEST_BODY", str(64 * 1024 * 1024)))
     responses_header_timeout: float = float(os.getenv("RESPONSES_HEADER_TIMEOUT", "120"))
     responses_attempt_header_timeout: float = float(os.getenv("RESPONSES_ATTEMPT_HEADER_TIMEOUT", "15"))
+    responses_attempt_header_timeout_body_limit: int = int(os.getenv(
+        "RESPONSES_ATTEMPT_HEADER_TIMEOUT_BODY_LIMIT", str(1024 * 1024),
+    ))
     provider: str = os.getenv("PROVIDER", "xfyun")
     extra_upstreams: str = os.getenv("EXTRA_UPSTREAMS", "")
     log_dir: str = os.getenv("LOG_DIR", "logs")

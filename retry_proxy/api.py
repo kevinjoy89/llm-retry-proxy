@@ -35,12 +35,18 @@ SKIP_RESPONSE_HEADERS = {"content-length", "transfer-encoding", "connection", "k
 DOWNSTREAM_PROXY_REQUEST_HEADERS = {
     "cdn-loop",
     "forwarded",
+    "remote-host",
     "true-client-ip",
     "x-client-ip",
     "x-original-forwarded-for",
     "x-real-ip",
 }
 DOWNSTREAM_PROXY_REQUEST_PREFIXES = ("cf-", "x-forwarded-")
+
+_DIAGNOSTIC_VALUE_HEADERS = {
+    "accept", "content-encoding", "content-type", "originator", "user-agent",
+}
+_DIAGNOSTIC_VALUE_LIMIT = 160
 
 _GEMINI_MODEL_PATH = re.compile(
     r"(?:^|/)models/([^/:]+):(?:generatecontent|streamgeneratecontent|embedcontent|batchgeneratecontent)(?:/|$)",
@@ -294,6 +300,13 @@ def _finish_responses_stream_state(state, content_type, saw_html=False, override
     return "missing_terminal", None, False
 
 
+def _responses_stream_key_failure_status(stream_status, error_status):
+    """Return only statuses that explicitly identify a credential-level failure."""
+    if stream_status == "error" and error_status in (401, 403, 429):
+        return error_status
+    return None
+
+
 def _is_streaming_json(body):
     try:
         return json.loads(body).get("stream") is True
@@ -352,6 +365,61 @@ def outbound_request_headers(request_headers, path, model, config=settings):
     if image_request and config.image_upstream_originator:
         headers["originator"] = config.image_upstream_originator
     return headers
+
+
+def _request_diagnostic(body, inbound_headers, outbound_headers, transport="http"):
+    """Describe request shape without logging payload or credential values."""
+    try:
+        payload = json.loads(body or b"")
+    except (TypeError, ValueError, UnicodeDecodeError):
+        payload = None
+
+    details = [f"transport={transport}", f"body_bytes={len(body or b'')}"]
+    if isinstance(payload, dict):
+        fields = sorted(str(name) for name in payload)
+        incoming = payload.get("input")
+        tools = payload.get("tools")
+        instructions = payload.get("instructions")
+        client_metadata = payload.get("client_metadata")
+        details.extend((
+            "json=object",
+            f"fields={','.join(fields)}",
+            f"input_type={'array' if isinstance(incoming, list) else type(incoming).__name__}",
+            f"input_items={len(incoming) if isinstance(incoming, list) else '-'}",
+            f"tools={len(tools) if isinstance(tools, list) else '-'}",
+            f"instructions_bytes={len(instructions.encode('utf-8')) if isinstance(instructions, str) else '-'}",
+            "client_metadata_fields=" + (
+                ",".join(sorted(str(name) for name in client_metadata))
+                if isinstance(client_metadata, dict) else "-"
+            ),
+            f"previous_response_id={int(bool(payload.get('previous_response_id')))}",
+            f"stream={payload.get('stream')!r}",
+        ))
+    else:
+        details.append(f"json={type(payload).__name__ if payload is not None else 'invalid'}")
+
+    inbound = {str(name).lower(): str(value) for name, value in inbound_headers.items()}
+    outbound = {str(name).lower(): str(value) for name, value in outbound_headers.items()}
+    details.extend((
+        f"inbound_headers={','.join(sorted(inbound))}",
+        f"outbound_headers={','.join(sorted(outbound))}",
+    ))
+    protocol_values = []
+    for name in sorted(_DIAGNOSTIC_VALUE_HEADERS):
+        if name not in outbound:
+            continue
+        value = " ".join(outbound[name].split())[:_DIAGNOSTIC_VALUE_LIMIT]
+        protocol_values.append(f"{name}:{value}")
+    beta = outbound.get("openai-beta", "")
+    beta_names = sorted({
+        item.strip().split("=", 1)[0].lower()
+        for item in beta.split(",")
+        if item.strip()
+    })
+    if beta_names:
+        protocol_values.append(f"openai-beta:{','.join(beta_names)}")
+    details.append(f"protocol_headers={';'.join(protocol_values) or '-'}")
+    return " ".join(details)
 
 
 async def _run_until_disconnect(request, awaitable):
@@ -535,9 +603,10 @@ def create_handlers(service, store, pool_sync=None):
     async def proxy(path: str, request: Request):
         if is_excluded_path(path): return Response(status_code=404)
         client_ip = _request_ip(request)
+        log_method = request.method
         upstream, provider, remaining = match_route(path); url = f"{upstream}/{remaining}" if remaining else upstream
         if request.url.query: url += f"?{request.url.query}"
-        logger.debug(f"{_tag(request.method, path, provider, '', client_ip)} 收到下游请求")
+        logger.debug(f"{_tag(log_method, path, provider, '', client_ip)} 收到下游请求")
         body = b""
         if request.method not in ("GET", "HEAD"):
             max_body = getattr(settings, "max_request_body", 64 * 1024 * 1024)
@@ -561,7 +630,7 @@ def create_handlers(service, store, pool_sync=None):
                 )
         if settings.dlp_mode in ("audit", "block", "redact"):
             if len(body) > settings.dlp_max_body_bytes:
-                logger.warning(f"{_tag(request.method, path, provider, '', client_ip)} DLP请求体超限 bytes={len(body)}")
+                logger.warning(f"{_tag(log_method, path, provider, '', client_ip)} DLP请求体超限 bytes={len(body)}")
                 if settings.dlp_mode in ("block", "redact"):
                     return Response('{"error":{"type":"dlp_body_too_large","message":"Request body exceeds DLP inspection limit"}}', status_code=413, media_type="application/json")
             else:
@@ -575,20 +644,20 @@ def create_handlers(service, store, pool_sync=None):
                     settings.dlp_known_secret_min_length,
                 )
                 if dlp.uninspectable and settings.dlp_fail_closed and body:
-                    logger.warning(f"{_tag(request.method, path, provider, '', client_ip)} DLP无法解析请求正文")
+                    logger.warning(f"{_tag(log_method, path, provider, '', client_ip)} DLP无法解析请求正文")
                     return Response(
                         '{"error":{"type":"dlp_uninspectable_body","message":"Request body cannot be inspected by DLP"}}',
                         status_code=422, media_type="application/json",
                     )
                 if dlp.limit_exceeded:
-                    logger.warning(f"{_tag(request.method, path, provider, '', client_ip)} DLP解码扫描超限")
+                    logger.warning(f"{_tag(log_method, path, provider, '', client_ip)} DLP解码扫描超限")
                     if settings.dlp_mode in ("block", "redact"):
                         return Response(
                             '{"error":{"type":"dlp_decode_limit_exceeded","message":"Request body exceeds DLP decode inspection limits"}}',
                             status_code=413, media_type="application/json",
                         )
                 if dlp.malformed_exemption:
-                    logger.warning(f"{_tag(request.method, path, provider, '', client_ip)} DLP豁免标记不完整")
+                    logger.warning(f"{_tag(log_method, path, provider, '', client_ip)} DLP豁免标记不完整")
                     if settings.dlp_mode in ("block", "redact"):
                         return Response('{"error":{"type":"dlp_malformed_exemption","message":"Malformed DLP exemption markers"}}', status_code=422, media_type="application/json")
                 else:
@@ -596,21 +665,32 @@ def create_handlers(service, store, pool_sync=None):
                 if dlp.matched_rules:
                     rules = ",".join(dlp.matched_rules)
                     if dlp.blocked_rules:
-                        logger.warning(f"{_tag(request.method, path, provider, '', client_ip)} DLP拦截 rules={','.join(dlp.blocked_rules)}")
+                        logger.warning(f"{_tag(log_method, path, provider, '', client_ip)} DLP拦截 rules={','.join(dlp.blocked_rules)}")
                         payload = json.dumps({"error": {"type": "sensitive_data_blocked",
                                              "message": "Request blocked by sensitive data policy",
                                              "rules": list(dlp.blocked_rules)}}, ensure_ascii=False)
                         return Response(payload, status_code=422, media_type="application/json")
                     action = "脱敏" if dlp.redactions else "告警"
                     count = f" count={dlp.redactions}" if dlp.redactions else ""
-                    logger.warning(f"{_tag(request.method, path, provider, '', client_ip)} DLP{action} rules={rules}{count}")
+                    logger.warning(f"{_tag(log_method, path, provider, '', client_ip)} DLP{action} rules={rules}{count}")
                 if dlp.exemptions:
-                    logger.info(f"{_tag(request.method, path, provider, '', client_ip)} DLP豁免 count={dlp.exemptions}")
+                    logger.info(f"{_tag(log_method, path, provider, '', client_ip)} DLP豁免 count={dlp.exemptions}")
         endpoint_family = classify_endpoint(remaining)
         model_name = parse_request_model(body, remaining)
         session_id = parse_request_session_id(body)
         model_scope = classify_model_scope(model_name, endpoint_family)
         outbound_headers = outbound_request_headers(request.headers, remaining, model_name)
+        if endpoint_family == "responses":
+            request_logger = logger.debug
+            request_logger(
+                f"{_tag(log_method, path, provider, model_name, client_ip)} 请求摘要 "
+                + _request_diagnostic(
+                    body,
+                    request.headers,
+                    outbound_headers,
+                    "http",
+                )
+            )
         base_pool = KEY_POOLS.get(upstream)
         pool_credential_ok = can_use_key_pool(request.headers)
         if settings.proxy_api_key and pool_credential_ok and base_pool is None:
@@ -650,7 +730,8 @@ def create_handlers(service, store, pool_sync=None):
             result = await _run_until_disconnect(
                 request,
                 service.request(request.method, url, outbound_headers,
-                                body, path, provider, model_name, request_pool, session_id),
+                                body, path, provider, model_name, request_pool, session_id,
+                                log_method=""),
             )
         finally:
             reset_client_ip(ip_token)
@@ -673,7 +754,6 @@ def create_handlers(service, store, pool_sync=None):
                       "mode": service.hedge_mode_for(request_pool), "first_ok": first_ok,
                       "key_id": key_id, "key_pool": key_pool, "key_attempts": key_attempts,
                       "client_ip": client_ip}
-
         async def write_log(final_status, succeeded, **extra):
             record = dict(log_record)
             record.update({"ts": datetime.now().isoformat(timespec="milliseconds"),
@@ -686,7 +766,7 @@ def create_handlers(service, store, pool_sync=None):
         if response is None:
             await write_log(503, False)
             logger.error(
-                f"{_tag(request.method, path, provider, model_name, client_ip)}"
+                f"{_tag(log_method, path, provider, model_name, client_ip)}"
                 f"{key_tag} 放弃({total_sent}发) {time.time() - start:.1f}s"
             )
             reason = getattr(result, "failure_reason", "")
@@ -762,7 +842,7 @@ def create_handlers(service, store, pool_sync=None):
             except httpx.TransportError as e:
                 stream_override = "transport_error"
                 logger.warning(
-                    f"{_tag(request.method, path, provider, model_name, client_ip)}"
+                    f"{_tag(log_method, path, provider, model_name, client_ip)}"
                     f"{key_tag} 流式中断 #{winner_attempt} {e!r} "
                     f"总{time.time() - start:.2f}s"
                 )
@@ -785,15 +865,18 @@ def create_handlers(service, store, pool_sync=None):
                             stream_state, content_type, bad_gateway_body, stream_override,
                         )
                         if not succeeded and entry is not None:
-                            availability = None if stream_status == "cancelled" else False
+                            key_failure_status = _responses_stream_key_failure_status(
+                                stream_status, stream_error_status,
+                            )
+                            availability = False if key_failure_status is not None else None
                             for attempt in reversed(key_attempts):
                                 if attempt.get("key_id") == entry.key_id:
                                     attempt["available"] = availability
                                     break
-                            if stream_status != "cancelled":
+                            if key_failure_status is not None:
                                 _mark_key_failure(
                                     request_pool, entry, settings,
-                                    stream_error_status or 0,
+                                    key_failure_status,
                                     session_id=session_id,
                                 )
                         error_tag = f" 内嵌HTTP={stream_error_status}" if stream_error_status else ""
@@ -804,21 +887,21 @@ def create_handlers(service, store, pool_sync=None):
                                     entry, *stream_state["cache_usage"], session_id,
                                 )
                             logger.info(
-                                f"{_tag(request.method, path, provider, model_name, client_ip)}"
+                                f"{_tag(log_method, path, provider, model_name, client_ip)}"
                                 f"{key_tag} "
                                 f"Responses流结束 status={stream_status} HTTP={response.status_code} "
                                 f"总{time.time() - start:.2f}s"
                             )
                         elif stream_status == "cancelled":
                             logger.info(
-                                f"{_tag(request.method, path, provider, model_name, client_ip)}"
+                                f"{_tag(log_method, path, provider, model_name, client_ip)}"
                                 f"{key_tag} "
                                 f"Responses流客户端已结束 HTTP={response.status_code} "
                                 f"总{time.time() - start:.2f}s"
                             )
                         else:
                             logger.warning(
-                                f"{_tag(request.method, path, provider, model_name, client_ip)}"
+                                f"{_tag(log_method, path, provider, model_name, client_ip)}"
                                 f"{key_tag} "
                                 f"Responses流失败 status={stream_status} HTTP={response.status_code}"
                                 f"{error_tag} 总{time.time() - start:.2f}s"

@@ -10,7 +10,7 @@ from starlette.requests import Request
 
 from retry_proxy.config import (LogCaptureHandler, admin_session_value,
                                 can_use_key_pool, require_admin)
-from retry_proxy.api import create_handlers
+from retry_proxy.api import _responses_stream_key_failure_status, create_handlers
 from retry_proxy.key_pool import KeyEntry, KeyPool
 
 
@@ -228,7 +228,7 @@ class ProxyPoolRoutingTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertFalse(any("Responses流失败" in message for message in warning_messages))
 
-    async def test_responses_stream_logs_embedded_502_after_body_finishes(self):
+    async def test_responses_stream_embedded_502_does_not_cool_key(self):
         config = SimpleNamespace(
             proxy_api_key="", dlp_mode="off", dlp_max_body_bytes=1024,
             image_upstream_user_agent="", image_upstream_originator="",
@@ -286,8 +286,8 @@ class ProxyPoolRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(record["succeeded"])
         self.assertEqual(record["stream_status"], "error")
         self.assertEqual(record["stream_error_status"], 502)
-        self.assertFalse(record["key_attempts"][-1]["available"])
-        self.assertGreater(entry.cooldown_until, time.time())
+        self.assertIsNone(record["key_attempts"][-1]["available"])
+        self.assertEqual(entry.cooldown_until, 0)
         warning_messages = [
             LogCaptureHandler._ANSI_RE.sub("", call.args[0])
             for call in trace_logger.warning.call_args_list
@@ -296,6 +296,22 @@ class ProxyPoolRoutingTests(unittest.IsolatedAsyncioTestCase):
             "[test/grok-test] [pool-key] Responses流失败" in message
             for message in warning_messages
         ))
+
+    def test_only_explicit_stream_auth_and_rate_limit_errors_affect_key(self):
+        for status in (401, 403, 429):
+            with self.subTest(status=status):
+                self.assertEqual(
+                    _responses_stream_key_failure_status("error", status),
+                    status,
+                )
+        for stream_status, status in (
+                ("error", None), ("error", 400), ("error", 500),
+                ("error", 502), ("transport_error", 429),
+                ("missing_terminal", None)):
+            with self.subTest(stream_status=stream_status, status=status):
+                self.assertIsNone(
+                    _responses_stream_key_failure_status(stream_status, status),
+                )
 
     async def test_real_model_not_found_response_updates_the_used_group(self):
         config = SimpleNamespace(

@@ -205,7 +205,70 @@ class RetryLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.total_sent, 2)
         self.assertEqual(result.key_id, "good")
         self.assertTrue(cancelled.is_set())
+        self.assertEqual(pool.entries[0].cooldown_until, 0)
+        self.assertIsNone(result.key_attempts[0]["available"])
+
+    async def test_non_cloudflare_service_unavailable_still_cools_key(self):
+        config = SimpleNamespace(
+            responses_header_timeout=1, responses_attempt_header_timeout=0,
+            hedge_mode="off", max_retries=2, retry_interval=0,
+            retry_interval_429=0, retry_backoff=False,
+            retry_backoff_429=False, retry_backoff_max=0,
+            retry_backoff_max_429=0, key_pool_wait_timeout=1,
+            key_cooldown=30, key_cooldown_5xx=30,
+            key_cooldown_backoff=False, key_cooldown_max=60,
+        )
+        pool = KeyPool([("first", "first"), ("good", "good")])
+        proxy = RetryProxy(config=config, client=object())
+        responses = [
+            httpx.Response(
+                503,
+                json={"error": {"message": "Service temporarily unavailable"}},
+                headers={"server": "upstream"},
+                request=httpx.Request("POST", "https://upstream.test"),
+            ),
+            httpx.Response(
+                200,
+                request=httpx.Request("POST", "https://upstream.test"),
+            ),
+        ]
+        proxy._send = AsyncMock(side_effect=responses)
+
+        result = await proxy.request(
+            "POST", "https://upstream.test/responses", {},
+            b'{"model":"model","stream":true}',
+            "aihub/responses", "test", "model", pool,
+        )
+
+        self.assertEqual(result.response.status_code, 200)
         self.assertGreater(pool.entries[0].cooldown_until, time.time())
+
+    async def test_large_streaming_responses_skips_attempt_timeout(self):
+        config = SimpleNamespace(
+            responses_header_timeout=1,
+            responses_attempt_header_timeout=0.001,
+            responses_attempt_header_timeout_body_limit=32,
+            hedge_mode="off", max_retries=1,
+        )
+        pool = KeyPool([("only", "only")])
+        proxy = RetryProxy(config=config, client=object())
+
+        async def delayed_response(*_args):
+            await asyncio.sleep(0.01)
+            return httpx.Response(
+                200, request=httpx.Request("POST", "https://upstream.test"),
+            )
+
+        proxy._send = delayed_response
+        body = b'{"model":"model","stream":true,"input":"' + b"x" * 64 + b'"}'
+        result = await proxy.request(
+            "POST", "https://upstream.test/responses", {}, body,
+            "aihub/responses", "test", "model", pool,
+        )
+
+        self.assertEqual(result.response.status_code, 200)
+        self.assertEqual(result.total_sent, 1)
+        self.assertEqual(pool.entries[0].cooldown_until, 0)
 
     async def test_html_400_switches_pool_key(self):
         config = SimpleNamespace(

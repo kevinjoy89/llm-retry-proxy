@@ -42,7 +42,8 @@
 | `TIMEOUT` | `300` | 普通读写超时（秒）；流式响应中表示相邻两次数据之间的最大间隔 |
 | `MAX_REQUEST_BODY` | `67108864` | 请求体最大字节数；超出返回 413，防止超大上传耗尽内存 |
 | `RESPONSES_HEADER_TIMEOUT` | `120` | Responses API 整笔请求从开始处理到收到响应头的硬上限（秒）；预算内正常重试，`0` = 不限制 |
-| `RESPONSES_ATTEMPT_HEADER_TIMEOUT` | `15` | 流式 Responses 号池请求中单个 key 等待响应头的上限（秒）；超时后取消该次请求、熔断并换 key，`0` = 不限制 |
+| `RESPONSES_ATTEMPT_HEADER_TIMEOUT` | `15` | 流式 Responses 号池请求中单个 key 等待响应头的上限（秒）；超时后取消该次请求并仅在本请求内换 key，不写入全局熔断，`0` = 不限制 |
+| `RESPONSES_ATTEMPT_HEADER_TIMEOUT_BODY_LIMIT` | `1048576` | 仅对请求体不超过此字节数的请求启用单 key 短超时；更大的请求使用整笔响应头预算，避免上传和解析耗时被误判为 key 故障；`0` = 不限大小 |
 
 
 ## Codex Responses WebSocket 桥接 (SSE2WS)

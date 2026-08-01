@@ -10,7 +10,8 @@
 - **非429 指数退避**（默认关闭，`RETRY_BACKOFF=false`）：开启后，连续收到 503/502/504/529 等非429重试状态码时，等待时间按 `1→2→4→8→16→32→60s` 指数递增（基数 = `RETRY_INTERVAL`，倍率 = 2，上限 = `RETRY_BACKOFF_MAX`），同样含 ±20% 抖动。关闭时保持固定 `RETRY_INTERVAL` 行为。收到 429 会重置非429退避计数器。
 - 对于流式请求：先读取上游响应头与状态码，若为 503 则丢弃 body 并重试；一旦上游开始返回 200 并流式输出，中途断流**不**重试（已向客户端发送部分数据，重试会导致内容错乱）。流式 Responses 请求收到 2xx 响应头时只记录“响应头已建立”，代理会继续检查 SSE 是否以 `response.completed` 或 `response.incomplete` 结束；缺少终止事件、出现错误事件、传输中断或返回非 SSE 内容时，最终日志和统计会标记为流失败。下游客户端在终止事件前结束连接时单独记为客户端取消，不作为 key 故障；若终止事件已经收到，则随后发生的连接取消不会覆盖已确认的流结果。
 - Responses API 整笔请求等待上游响应头有独立的硬上限 `RESPONSES_HEADER_TIMEOUT`（默认 120 秒），预算内照常重试或换 key；到期后取消所有在飞请求并返回 503，防止连接仍有底层活动但业务响应长期不返回。
-- 对正文明确指定 `stream=true` 的 Responses 号池请求，单个 key 等待上游响应头还受 `RESPONSES_ATTEMPT_HEADER_TIMEOUT`（默认 15 秒）限制；超时会取消该次请求、按传输故障熔断当前 key，并立即尝试其它可用 key。非流式请求不使用这个短上限，避免完整生成耗时被误判为故障。
+- 对正文明确指定 `stream=true` 且请求体不超过 `RESPONSES_ATTEMPT_HEADER_TIMEOUT_BODY_LIMIT`（默认 1 MiB）的 Responses 号池请求，单个 key 等待上游响应头还受 `RESPONSES_ATTEMPT_HEADER_TIMEOUT`（默认 15 秒）限制；超时会取消该次尝试并在本请求内换 key，但不会据此全局熔断 key。更大的请求只使用整笔 `RESPONSES_HEADER_TIMEOUT`。非流式请求也不使用这个短上限。
+- 所有 `RETRY_STATUS_CODES` 中的 5xx（含 502/503/504/524）均按普通上游错误处理：熔断当前 key（`KEY_COOLDOWN_5XX`）并在有其它可用 key 时切换，全部 key 熔断则等待冷却后重试；不区分是否经过 Cloudflare。Responses SSE 内只有明确的 `401/403/429` 错误会熔断 key；普通服务端错误、传输中断、协议损坏或缺少终止事件只影响当前请求。
 - 下游在等待或换 key 期间主动取消请求时，代理会停止后续重试，并取消 `race` / `stagger` 模式下所有仍在飞的上游请求。
 - 请求异常（连接超时、网络断开等）同样会重试。
 - 达到 `MAX_RETRIES` 后返回一个 503 JSON 错误给客户端；`MAX_RETRIES=0` 时永不放弃。

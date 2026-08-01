@@ -122,6 +122,57 @@ class KeyPoolStickyTests(unittest.TestCase):
 
         self.assertIs(pool.pick(), pool.entries[0])
 
+    def test_strategy_change_clears_sticky_and_failover_scheduler_state(self):
+        pool = KeyPool([])
+        pool.entries = [
+            KeyEntry("cheap", "cheap", sort="0.02", group_id="cheap"),
+            KeyEntry("premium", "premium", sort="1", group_id="premium"),
+        ]
+        pool.finalize_entries()
+        premium = pool.entries[1]
+        pool._current = premium
+        pool._sticky_until = 10**12
+        pool._failover_floor = pool._sort_value(premium)
+        pool._balanced_group = "premium"
+        pool._probe_cursor_group = "premium"
+        pool._session_routes["session-1"] = {
+            "current": premium,
+            "sticky_until": 10**12,
+            "failover_floor": pool._sort_value(premium),
+            "last_used": 1,
+        }
+
+        pool.apply_settings("cost", 10, 0.5, 2, False)
+
+        self.assertIsNone(pool._current)
+        self.assertEqual(pool._sticky_until, 0)
+        self.assertIsNone(pool._failover_floor)
+        self.assertIsNone(pool._balanced_group)
+        self.assertIsNone(pool._probe_cursor_group)
+        self.assertFalse(pool._session_routes)
+        self.assertIs(pool.pick(), pool.entries[0])
+
+    def test_circuit_reset_clears_scheduler_anchors_in_cached_view(self):
+        pool = KeyPool([])
+        pool.entries = [
+            KeyEntry("cheap", "cheap", sort="0.02", group_id="cheap"),
+            KeyEntry("premium", "premium", sort="1", group_id="premium"),
+        ]
+        pool.finalize_entries()
+        view = pool.for_request("gpt-test", "v1/responses", "responses", "")
+        view._current = view.entries[1]
+        view._sticky_until = 10**12
+        view._balanced_group = "premium"
+        view._probe_cursor_group = "premium"
+
+        pool.reset_circuit()
+
+        self.assertIsNone(view._current)
+        self.assertEqual(view._sticky_until, 0)
+        self.assertIsNone(view._balanced_group)
+        self.assertIsNone(view._probe_cursor_group)
+        self.assertIs(view.pick(), view.entries[0])
+
     def test_cache_miss_ignores_short_inputs_and_never_cools_only_group(self):
         pool = KeyPool([])
         pool.entries = [KeyEntry("only", "only", group_id="only")]

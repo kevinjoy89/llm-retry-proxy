@@ -952,6 +952,12 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
         pool._selection_count = 19
         view = pool.for_request("test-model", "v1/chat/completions")
         view._selection_count = 19
+        for target in (pool, view):
+            target._current = target.entries[-1]
+            target._sticky_until = 10**12
+            target._failover_floor = target._sort_value(target.entries[-1])
+            target._balanced_group = target._group_key(target.entries[-1])
+            target._probe_cursor_group = target._group_key(target.entries[-1])
 
         status = await manager.set_source_settings(
             source_id, "balanced", 4.5, "test-model", True, 0.75, 5,
@@ -975,6 +981,12 @@ class PoolSyncManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(view.external_ttft_prior_strength, 5)
         self.assertEqual(pool._selection_count, 0)
         self.assertEqual(view._selection_count, 0)
+        for target in (pool, view):
+            self.assertIsNone(target._current)
+            self.assertEqual(target._sticky_until, 0)
+            self.assertIsNone(target._failover_floor)
+            self.assertIsNone(target._balanced_group)
+            self.assertIsNone(target._probe_cursor_group)
         with open(self.state_file, encoding="utf-8") as f:
             persisted = json.load(f)
         self.assertEqual(persisted["sources"][0]["strategy"], "balanced")

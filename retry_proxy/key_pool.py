@@ -192,10 +192,16 @@ class KeyPool:
         self.external_retest_weight = external_retest_weight
         self.external_ttft_prior_strength = external_ttft_prior_strength
         self.session_affinity = session_affinity
-        if not session_affinity:
-            self._session_routes.clear()
+        self._current = None
+        self._sticky_until = 0.0
+        self._failover_floor = None
+        self._session_routes.clear()
         self._selection_count = 0
         self._balanced_group = None
+        self._active_probe_group = None
+        self._probe_cursor_group = None
+        self._next_probe_at = 0.0
+        self._probe_reserved_until = 0.0
         for metric in self._metrics.values():
             metric.update({
                 "slow_streak": 0, "recovery_streak": 0,
@@ -299,15 +305,22 @@ class KeyPool:
         route["last_used"] = now
         return route
 
-    def _pick_for_session(self, session_id):
+    def _pick_for_session(self, session_id, exclude_keys=None):
         route = self._session_route(session_id)
         now = time.time()
+        exclude_keys = exclude_keys or set()
         if route["current"] is None and route["failover_floor"] is None:
-            return self.pick()
-        eligible = self.entries if route["failover_floor"] is None else [
+            return self.pick(exclude_keys=exclude_keys)
+        eligible = [
             entry for entry in self.entries
-            if self._sort_value(entry) >= route["failover_floor"]
+            if entry.key not in exclude_keys
         ]
+        if route["failover_floor"] is not None:
+            eligible = [
+                entry for entry in self.entries
+                if entry.key not in exclude_keys
+                and self._sort_value(entry) >= route["failover_floor"]
+            ]
         available = [entry for entry in eligible if entry.cooldown_until <= now]
         current = route["current"]
         if current is not None and current in available:
@@ -317,11 +330,15 @@ class KeyPool:
             return min(eligible, key=lambda entry: entry.cooldown_until) if eligible else None
         return min(available, key=lambda entry: (self._sort_value(entry), self.entries.index(entry)))
 
-    def pick(self, session_id=None):
+    def pick(self, session_id=None, exclude_keys=None):
+        exclude_keys = exclude_keys or set()
         if self.session_affinity and session_id:
-            return self._pick_for_session(session_id)
+            return self._pick_for_session(session_id, exclude_keys)
         now = time.time()
-        eligible = self._eligible_entries()
+        eligible = [
+            entry for entry in self._eligible_entries()
+            if entry.key not in exclude_keys
+        ]
         available = [entry for entry in eligible if entry.cooldown_until <= now]
         if not available:
             best = min(eligible, key=lambda e: e.cooldown_until) if eligible else None
@@ -714,9 +731,12 @@ class KeyPool:
         for target in targets:
             if not reset_all and not any(entry in target.entries for entry in selected):
                 continue
+            target._current = None
             target._sticky_until = 0.0
             target._failover_floor = None
             target._session_routes.clear()
+            target._balanced_group = None
+            target._probe_cursor_group = None
             if group_key is None or target._active_probe_group in reset_groups:
                 target._active_probe_group = None
                 target._probe_reserved_until = 0.0
@@ -811,8 +831,12 @@ class KeyPool:
             })
         return sorted(result, key=lambda item: (item["endpoint_family"], item["model"]))
 
-    def has_fresh(self):
-        return any(e.cooldown_until <= time.time() for e in self._eligible_entries())
+    def has_fresh(self, exclude_keys=None):
+        exclude_keys = exclude_keys or set()
+        return any(
+            entry.key not in exclude_keys and entry.cooldown_until <= time.time()
+            for entry in self._eligible_entries()
+        )
 
     def next_available_in(self):
         eligible = self._eligible_entries()
