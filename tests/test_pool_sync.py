@@ -217,6 +217,34 @@ class Sub2APIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source["group_model_cache"]["2"], ["gpt-5.4", "gpt-4.1"])
         self.assertTrue(entries[0]["routing_capabilities"]["model_list_known"])
 
+    async def test_sync_deletes_orphaned_group_key_and_hides_group_from_catalog(self):
+        adapter = Sub2APIAdapter()
+        client = FakeClient()
+        original_get = client.get
+
+        async def orphaned_group(url, params=None, headers=None, timeout=None):
+            if url.endswith("/keys"):
+                return response({"code": 0, "data": {"items": [{
+                    "id": 91, "key": "sk-orphaned", "name": "legacy",
+                    "group_id": 9, "status": "active",
+                    "group": {"id": 9, "name": "已删除套餐", "status": "inactive"},
+                }], "total": 1}})
+            return await original_get(url, params, headers, timeout)
+
+        client.get = orphaned_group
+        source = {"base_url": "https://upstream.test", "id": "source-1"}
+        session = {"access_token": "access-1", "refresh_token": "refresh-1"}
+
+        _, entries = await adapter.fetch(client, source, session)
+        _, catalog = await adapter.catalog(client, source, session)
+
+        self.assertEqual(entries, [])
+        self.assertNotIn("9", {str(group["id"]) for group in catalog})
+        self.assertIn(
+            "https://upstream.test/api/v1/keys/91",
+            [call[1] for call in client.calls if call[0] == "DELETE"],
+        )
+
     async def test_repeated_key_page_raises_instead_of_looping_forever(self):
         # Regression: a misbehaving upstream returning the same page each time
         # used to loop without bound, holding the sync lock. Now it raises.

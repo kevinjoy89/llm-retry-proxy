@@ -433,13 +433,6 @@ class NewAPIAdapter(PoolSyncAdapter):
                 "key_count": counts.get(str(group_id), 0),
                 "active_key_count": active_counts.get(str(group_id), 0),
             })
-        for group_id in counts.keys() - {str(value) for value in (groups or {})}:
-            catalog.append({
-                "id": group_id, "name": group_id, "platform": "",
-                "allow_image_generation": None, "routing_capabilities": {},
-                "rate_multiplier": "", "key_count": counts[group_id],
-                "active_key_count": active_counts.get(group_id, 0),
-            })
         return catalog
 
     async def fetch(self, client, source, session):
@@ -447,6 +440,30 @@ class NewAPIAdapter(PoolSyncAdapter):
         session, tokens = await self._fill_full_keys(client, source, session, tokens)
         session, groups = await self._fetch_groups(client, source, session)
         groups = groups if isinstance(groups, dict) else {}
+        invalid_tokens = [
+            item for item in tokens
+            if isinstance(item, dict) and item.get("id") is not None
+            and _token_group(item, session.get("user_group")) not in groups
+        ]
+        deleted_invalid = 0
+        for item in invalid_tokens:
+            try:
+                session, _ = await self._request(
+                    client, source, session, "DELETE", f"/api/token/{item['id']}",
+                )
+                deleted_invalid += 1
+            except Exception as exc:
+                logger.warning(
+                    f"失效分组 Key 自动删除失败: upstream={source['base_url']} "
+                    f"source_key_id={item['id']} error={exc}"
+                )
+        if deleted_invalid:
+            logger.info(
+                f"失效分组 Key 已自动删除: upstream={source['base_url']} "
+                f"count={deleted_invalid}"
+            )
+        invalid_ids = {str(item["id"]) for item in invalid_tokens}
+        tokens = [item for item in tokens if str(item.get("id")) not in invalid_ids]
         entries = []
         for item in tokens:
             if not isinstance(item, dict) or item.get("status") not in (

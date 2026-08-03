@@ -492,6 +492,33 @@ class NewAPIAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deleted["requested"], 1)
         self.assertEqual(deleted_paths, ["/api/token/31"])
 
+    async def test_sync_deletes_removed_group_tokens_and_hides_group(self):
+        deleted_paths = []
+
+        async def handler(request):
+            if request.url.path == "/api/token/" and request.method == "GET":
+                return api_response({"items": [{
+                    "id": 41, "key": "sk-orphaned-full", "name": "orphaned",
+                    "status": 1, "group": "removed",
+                }], "total": 1})
+            if request.url.path == "/api/user/self/groups":
+                return api_response({"default": {"ratio": 1, "desc": "默认分组"}})
+            if request.url.path == "/api/token/41" and request.method == "DELETE":
+                deleted_paths.append(request.url.path)
+                return api_response(None)
+            raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+        session = {"access_token": "access", "cookies": {"new_api_refresh": "refresh"}}
+        source = {"base_url": "https://new-api.test", "id": "source-1"}
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            adapter = NewAPIAdapter()
+            _, entries = await adapter.fetch(client, source, session)
+            _, catalog = await adapter.catalog(client, source, session)
+
+        self.assertEqual(entries, [])
+        self.assertNotIn("removed", {group["id"] for group in catalog})
+        self.assertEqual(deleted_paths, ["/api/token/41"])
+
 
 class TransportRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_get_retries_transient_request_error(self):

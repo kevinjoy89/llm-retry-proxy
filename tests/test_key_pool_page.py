@@ -125,6 +125,16 @@ class KeyPoolPageTests(unittest.TestCase):
         self.assertIn("button[data-manual-add-key]", self.html)
         self.assertIn("base_url:baseUrl,keys:[{key,", self.html)
 
+    def test_invalid_groups_are_not_rendered_or_manually_cleaned(self):
+        self.assertNotIn('id="clearInvalid"', self.html)
+        self.assertNotIn('一键删除失效 Key', self.html)
+        self.assertNotIn('失效分组不能创建 Key', self.html)
+        self.assertIn(
+            "function renderGroups(){const missing=groupCatalog.filter(g=>g.key_count===0).length",
+            self.html,
+        )
+        self.assertIn("clearKeys(ids)", self.html)
+
 
 if __name__ == "__main__":
     unittest.main()

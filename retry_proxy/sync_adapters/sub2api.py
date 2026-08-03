@@ -298,6 +298,35 @@ class Sub2APIAdapter(PoolSyncAdapter):
         groups_by_id = {
             str(group.get("id")): group for group in (groups or []) if isinstance(group, dict)
         }
+        available_group_ids = {
+            key for key, group in groups_by_id.items()
+            if group.get("status") in (None, "", "active")
+        }
+        invalid_keys = [
+            item for item in keys
+            if isinstance(item, dict) and item.get("id") is not None
+            and item.get("group_id") is not None
+            and str(item.get("group_id")) not in available_group_ids
+        ]
+        deleted_invalid = 0
+        for item in invalid_keys:
+            try:
+                session, _ = await self._authorized_delete(
+                    client, source, session, f"/api/v1/keys/{item['id']}"
+                )
+                deleted_invalid += 1
+            except Exception as exc:
+                logger.warning(
+                    f"失效分组 Key 自动删除失败: upstream={source['base_url']} "
+                    f"source_key_id={item['id']} error={exc}"
+                )
+        if deleted_invalid:
+            logger.info(
+                f"失效分组 Key 已自动删除: upstream={source['base_url']} "
+                f"count={deleted_invalid}"
+            )
+        invalid_ids = {str(item["id"]) for item in invalid_keys}
+        keys = [item for item in keys if str(item.get("id")) not in invalid_ids]
         rates = {str(key): value for key, value in (rates or {}).items()}
         entries = []
         for item in keys:
