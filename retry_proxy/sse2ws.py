@@ -30,6 +30,7 @@ from datetime import datetime
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from .access_control import resolve_client_ip
 from .api import (
     _key_pool_secrets,
     classify_endpoint,
@@ -308,11 +309,9 @@ class ResponsesWSBridge:
                 pass
 
     def _request_ip(self):
-        for header in ("cf-connecting-ip", "x-forwarded-for", "x-real-ip"):
-            value = self.ws.headers.get(header, "").strip()
-            if value:
-                return value.split(",", 1)[0].strip()
-        return self.ws.client.host if self.ws.client else ""
+        return resolve_client_ip(
+            self.ws.scope, getattr(settings, "trusted_proxy_ips", ()),
+        )
 
     async def _receive(self, timeout=None):
         if self._buffered is not None:

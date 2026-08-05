@@ -98,6 +98,11 @@ docker compose -f compose.yaml -f compose.legacy.yaml up -d --build
 | `UPSTREAM_URL` | `https://maas-coding-api.cn-huabei-1.xf-yun.com/v2` | 上游地址，不要带尾斜杠 |
 | `LISTEN_HOST` | `0.0.0.0` | 监听地址 |
 | `LISTEN_PORT` | `8080` | 监听端口 |
+| `IP_BLACKLIST` | 空 | 拒绝访问的客户端 IP/CIDR，多个值用逗号分隔 |
+| `TRUSTED_PROXY_IPS` | 本机与 Docker 172.x | 允许提供真实客户端 IP 转发头的反向代理 IP/CIDR |
+| `IP_AUTO_BAN_THRESHOLD` | `20` | 检测窗口内访问不同路径达到该数量时自动封禁；`0` 关闭 |
+| `IP_AUTO_BAN_WINDOW` | `10` | 动态封禁检测窗口（秒） |
+| `IP_AUTO_BAN_DURATION` | `0` | 动态封禁持续时间；`0` 表示永久封禁 |
 | `UVICORN_LOOP` | `auto` | Uvicorn 事件循环；旧环境模板设为 `asyncio` |
 | `MAX_RETRIES` | `60` | 单个请求的实际上游尝试总上限；`0` 表示无限重试 |
 | `RETRY_INTERVAL` | `1.0` | 非 429 错误的重试间隔/退避基数 |

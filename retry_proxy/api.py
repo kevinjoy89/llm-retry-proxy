@@ -10,6 +10,7 @@ import httpx
 from fastapi import Request
 from fastapi.responses import Response, StreamingResponse
 
+from .access_control import resolve_client_ip
 from .config import can_use_key_pool, log_capture, logger, settings
 from .dlp import inspect_json_body
 from .routes import ROUTES, is_excluded_path, match_route
@@ -482,11 +483,9 @@ def _cumulative(summary):
 
 
 def _request_ip(request):
-    for header in ("cf-connecting-ip", "x-forwarded-for", "x-real-ip"):
-        value = request.headers.get(header, "").strip()
-        if value:
-            return value.split(",", 1)[0].strip()
-    return request.client.host if request.client else ""
+    return resolve_client_ip(
+        request.scope, getattr(settings, "trusted_proxy_ips", ()),
+    )
 
 
 def _key_pool_secrets():

@@ -14,6 +14,8 @@ from io import StringIO
 from dotenv import load_dotenv
 from fastapi import HTTPException, Request
 
+from .access_control import parse_ip_networks
+
 
 def safe_load_env(path: str = ".env"):
     if not os.path.exists(path):
@@ -161,6 +163,20 @@ class Settings:
     admin_password: str = (os.getenv("ADMIN_PASSWORD") or os.getenv("ADMIN_TOKEN", "")).strip()
     admin_cookie_secure: bool = _bool("ADMIN_COOKIE_SECURE", "false")
     proxy_api_key: str = os.getenv("PROXY_API_KEY", "").strip()
+    ip_blacklist: tuple = parse_ip_networks(os.getenv("IP_BLACKLIST", ""), "IP_BLACKLIST")
+    trusted_proxy_ips: tuple = parse_ip_networks(
+        os.getenv("TRUSTED_PROXY_IPS", "127.0.0.0/8,::1,172.16.0.0/12"),
+        "TRUSTED_PROXY_IPS",
+    )
+    ip_auto_ban_threshold: int = int(os.getenv("IP_AUTO_BAN_THRESHOLD", "20"))
+    ip_auto_ban_window: float = float(os.getenv("IP_AUTO_BAN_WINDOW", "10"))
+    ip_auto_ban_duration: float = float(os.getenv("IP_AUTO_BAN_DURATION", "0"))
+    ip_auto_ban_exempt: tuple = parse_ip_networks(
+        os.getenv("IP_AUTO_BAN_EXEMPT", "127.0.0.0/8,::1"), "IP_AUTO_BAN_EXEMPT",
+    )
+    ip_ban_state_file: str = os.getenv("IP_BAN_STATE_FILE", "").strip() or os.path.join(
+        os.getenv("LOG_DIR", "logs"), ".ip_bans.json"
+    )
     key_pools_raw: str = os.getenv("KEY_POOLS", "").strip()
     key_pool_file: str = os.getenv("KEY_POOL_FILE", "").strip()
     key_cooldown: float = float(os.getenv("KEY_COOLDOWN", "30"))

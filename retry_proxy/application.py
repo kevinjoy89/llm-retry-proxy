@@ -10,6 +10,7 @@ import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from .access_control import IPBlocklistMiddleware
 from .api import create_handlers
 from .pool_sync import PoolSyncManager
 from .sync_adapters import PoolSyncError
@@ -52,6 +53,17 @@ def _log_startup():
     logger.info(f"代理: trust_env={'是(跟随系统代理)' if settings.trust_env else '否(直连)'}")
     logger.info(f"管理端鉴权: {'已启用' if settings.admin_password else '未配置（统计与日志端点已禁用）'}")
     logger.info(f"号池访问鉴权: {'已启用' if settings.proxy_api_key else '未配置（兼容开放模式）'}")
+    logger.info(
+        f"IP黑名单: {len(settings.ip_blacklist)}条, "
+        f"可信代理: {len(settings.trusted_proxy_ips)}条"
+    )
+    auto_ban = (
+        "关" if settings.ip_auto_ban_threshold <= 0 else
+        f"{settings.ip_auto_ban_window:g}s内{settings.ip_auto_ban_threshold}个不同路径"
+        + (" -> 永久封禁" if settings.ip_auto_ban_duration == 0 else
+           f" -> 封禁{settings.ip_auto_ban_duration:g}s")
+    )
+    logger.info(f"IP动态封禁: {auto_ban}")
     if KEY_POOLS:
         for pool_url, pool in KEY_POOLS.items():
             route_tag = "默认" if pool_url == settings.upstream_url else pool_url
@@ -78,6 +90,12 @@ async def lifespan(_app):
         raise ValueError("SSE2WS_FIRST_EVENT_TIMEOUT 必须大于 0")
     if settings.max_request_body <= 0:
         raise ValueError("MAX_REQUEST_BODY 必须大于 0")
+    if settings.ip_auto_ban_threshold < 0:
+        raise ValueError("IP_AUTO_BAN_THRESHOLD 不能小于 0")
+    if settings.ip_auto_ban_threshold and settings.ip_auto_ban_window <= 0:
+        raise ValueError("IP_AUTO_BAN_WINDOW 必须大于 0")
+    if settings.ip_auto_ban_duration < 0:
+        raise ValueError("IP_AUTO_BAN_DURATION 不能小于 0")
     if settings.key_cache_miss_threshold < 0:
         raise ValueError("KEY_CACHE_MISS_THRESHOLD 不能小于 0")
     if settings.key_cache_miss_min_input_tokens < 0:
@@ -127,6 +145,16 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="llm-retry-proxy", lifespan=lifespan)
+app.add_middleware(
+    IPBlocklistMiddleware,
+    blacklist=settings.ip_blacklist,
+    trusted_proxies=settings.trusted_proxy_ips,
+    auto_ban_threshold=settings.ip_auto_ban_threshold,
+    auto_ban_window=settings.ip_auto_ban_window,
+    auto_ban_duration=settings.ip_auto_ban_duration,
+    auto_ban_exempt=settings.ip_auto_ban_exempt,
+    state_file=settings.ip_ban_state_file,
+)
 service = RetryProxy(client=None, pools=KEY_POOLS, log_store=store)
 health, stats_page, stats_api, logs_page, logs_history, logs_stream, proxy = create_handlers(
     service, store, pool_sync,

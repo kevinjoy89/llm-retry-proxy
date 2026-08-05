@@ -23,7 +23,34 @@
 | `ADMIN_PASSWORD` | 空 | 管理页面密码；未配置时 `/stats*`、`/logs*` 和 `/key-pools` 禁用。兼容旧 `ADMIN_TOKEN` |
 | `ADMIN_COOKIE_SECURE` | `false` | HTTPS 部署时设为 `true`，限制登录 Cookie 仅通过 HTTPS 发送 |
 | `PROXY_API_KEY` | 空 | 下游使用号池的凭据；未携带或不匹配时仅作普通透传 |
+| `IP_BLACKLIST` | 空 | 拒绝访问的客户端 IP 或 CIDR，多个值用逗号分隔；同时覆盖 HTTP 和 WebSocket |
+| `TRUSTED_PROXY_IPS` | `127.0.0.0/8,::1,172.16.0.0/12` | 可信反向代理的直连 IP 或 CIDR；默认覆盖本机及 Docker 172.x 网络 |
+| `IP_AUTO_BAN_THRESHOLD` | `20` | 滑动窗口内访问不同路径达到该数量时动态封禁；`0` = 关闭 |
+| `IP_AUTO_BAN_WINDOW` | `10` | 动态封禁检测窗口（秒） |
+| `IP_AUTO_BAN_DURATION` | `0` | 动态封禁持续时间（秒）；`0` = 永久封禁 |
+| `IP_AUTO_BAN_EXEMPT` | `127.0.0.0/8,::1` | 不参与动态封禁的 IP/CIDR；不覆盖静态黑名单 |
+| `IP_BAN_STATE_FILE` | `LOG_DIR/.ip_bans.json` | 动态封禁状态文件，保证重启后封禁继续有效 |
 | `PROVIDER_ALIASES` | 空 | 统计 provider 显示别名，格式为 `from:to,from:to`；不会改变实际路由 |
+
+例如，直接封禁单个扫描来源及一个网段：
+
+```dotenv
+IP_BLACKLIST=152.32.129.213,198.51.100.0/24
+```
+
+黑名单在路由匹配和读取请求体之前执行，命中后 HTTP 返回 `403`，WebSocket
+以策略违规代码 `1008` 关闭，不会访问上游，也不会为每次被拒请求写日志。
+动态封禁默认检测同一 IP 在 10 秒内访问 20 个不同路径的 URL 扫描并永久封禁；重复请求
+同一路径不累计。触发时只写一条不含请求路径的动态封禁审计日志，之后的请求
+保持静默。将 `IP_AUTO_BAN_DURATION` 设置为正数可改为到期自动解除。状态文件仅保存
+IP 和到期时间（永久封禁使用 `0`），不保存扫描路径。
+
+默认可信范围适用于本机 Nginx/Caddy 以及 Docker 172.x 代理网络。若服务不经过
+反向代理直接暴露公网，可将 `TRUSTED_PROXY_IPS` 设为空；使用其它容器网段或 CDN
+时，应改为实际反向代理的地址，
+并确保代理覆盖而不是原样保留来自公网请求的 `CF-Connecting-IP`、
+`X-Forwarded-For` 和 `X-Real-IP`。应用会从可信代理链右侧开始跳过可信地址，
+使用第一个非可信地址作为客户端 IP。配置变更后需要重启服务。
 
 ## 上游、路由与网络
 

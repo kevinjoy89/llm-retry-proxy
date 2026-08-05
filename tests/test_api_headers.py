@@ -1,8 +1,10 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from starlette.requests import Request
 
+from retry_proxy.access_control import parse_ip_networks
 from retry_proxy.api import _request_diagnostic, _request_ip, outbound_request_headers
 
 
@@ -71,13 +73,16 @@ class RequestIpTests(unittest.TestCase):
             "client": (direct, 1234),
         })
 
-    def test_forwarded_for_uses_first_address(self):
+    def test_forwarded_for_uses_client_address_from_trusted_proxy(self):
         request = self._request({
             "x-forwarded-for": "203.0.113.7, 198.51.100.20",
             "x-real-ip": "192.0.2.10",
         }, "172.20.0.3")
 
-        self.assertEqual(_request_ip(request), "203.0.113.7")
+        with patch("retry_proxy.api.settings", SimpleNamespace(
+            trusted_proxy_ips=parse_ip_networks("172.20.0.3,198.51.100.20", "test"),
+        )):
+            self.assertEqual(_request_ip(request), "203.0.113.7")
 
     def test_cf_connecting_ip_takes_priority(self):
         request = self._request({
@@ -86,7 +91,18 @@ class RequestIpTests(unittest.TestCase):
             "x-real-ip": "192.0.2.10",
         }, "172.20.0.3")
 
-        self.assertEqual(_request_ip(request), "198.51.100.8")
+        with patch("retry_proxy.api.settings", SimpleNamespace(
+            trusted_proxy_ips=parse_ip_networks("172.20.0.3", "test"),
+        )):
+            self.assertEqual(_request_ip(request), "198.51.100.8")
+
+    def test_untrusted_client_cannot_override_direct_ip(self):
+        request = self._request({
+            "cf-connecting-ip": "198.51.100.8",
+            "x-forwarded-for": "203.0.113.7",
+        }, "198.51.100.50")
+
+        self.assertEqual(_request_ip(request), "198.51.100.50")
 
     def test_direct_ip_is_fallback(self):
         request = self._request({}, "172.20.0.3")
