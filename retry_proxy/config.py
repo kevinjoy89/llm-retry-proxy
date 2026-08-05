@@ -129,7 +129,7 @@ def _bool(name, default):
     return os.getenv(name, default).lower() in ("1", "true", "yes", "on")
 
 
-@dataclass(frozen=True)
+@dataclass
 class Settings:
     upstream_url: str = os.getenv("UPSTREAM_URL", "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2").rstrip("/")
     listen_host: str = os.getenv("LISTEN_HOST", "0.0.0.0")
@@ -162,6 +162,7 @@ class Settings:
     trust_env: bool = _bool("TRUST_ENV", "false")
     admin_password: str = (os.getenv("ADMIN_PASSWORD") or os.getenv("ADMIN_TOKEN", "")).strip()
     admin_cookie_secure: bool = _bool("ADMIN_COOKIE_SECURE", "false")
+    settings_page_enabled: bool = _bool("SETTINGS_PAGE_ENABLED", "false")
     proxy_api_key: str = os.getenv("PROXY_API_KEY", "").strip()
     ip_blacklist: tuple = parse_ip_networks(os.getenv("IP_BLACKLIST", ""), "IP_BLACKLIST")
     trusted_proxy_ips: tuple = parse_ip_networks(
@@ -248,8 +249,99 @@ class Settings:
         return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "key_pool.html")
 
     @property
+    def settings_html_path(self):
+        return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "settings.html")
+
+    @property
     def summary_file(self):
         return os.path.join(self.log_dir, "_summary.json")
+
+    def apply_env(self, overrides: dict) -> list:
+        """按环境变量键热更新配置项
+
+        仅处理 HOT_PARSERS 中登记的键与 PROVIDER_ALIASES；其余键直接忽略。
+        更新字段的同时同步 os.environ，保证直接读取环境变量的模块（如
+        stats.py 的 PROVIDER_ALIASES）与 Settings 保持一致。
+        返回实际生效的键列表。
+        """
+        applied = []
+        for key, raw in overrides.items():
+            if key == "PROVIDER_ALIASES":
+                os.environ[key] = str(raw).strip()
+                from .stats import reload_aliases
+
+                reload_aliases()
+                applied.append(key)
+                continue
+            parser = HOT_PARSERS.get(key)
+            if parser is None:
+                continue
+            attr, parse = parser
+            os.environ[key] = str(raw)
+            setattr(self, attr, parse(raw))
+            applied.append(key)
+        return applied
+
+
+def _parse_bool(raw) -> bool:
+    return str(raw).lower() in ("1", "true", "yes", "on")
+
+
+def _parse_csv_int(raw) -> frozenset:
+    return frozenset(int(x) for x in str(raw).split(",") if x.strip())
+
+
+def _parse_csv_str(raw) -> frozenset:
+    return frozenset(x.strip() for x in str(raw).split(",") if x.strip())
+
+
+# 支持热更新的配置键 -> (Settings 属性名, 解析函数)；与 settings_meta 的
+# hot 项一一对应，新增热更新键时必须同时登记两处
+HOT_PARSERS = {
+    "MAX_REQUEST_BODY": ("max_request_body", int),
+    "MAX_RETRIES": ("max_retries", int),
+    "RETRY_STATUS_CODES": ("retry_status_codes", _parse_csv_int),
+    "RETRY_BROAD": ("retry_broad", _parse_bool),
+    "RETRY_INTERVAL": ("retry_interval", float),
+    "RETRY_BACKOFF": ("retry_backoff", _parse_bool),
+    "RETRY_BACKOFF_MAX": ("retry_backoff_max", float),
+    "RETRY_INTERVAL_429": ("retry_interval_429", float),
+    "RETRY_BACKOFF_429": ("retry_backoff_429", _parse_bool),
+    "RETRY_BACKOFF_MAX_429": ("retry_backoff_max_429", float),
+    "HEDGE_MODE": ("hedge_mode", lambda v: str(v).strip().lower()),
+    "MAX_CONCURRENT": ("max_concurrent", int),
+    "KEY_COOLDOWN": ("key_cooldown", float),
+    "KEY_COOLDOWN_5XX": ("key_cooldown_5xx", float),
+    "KEY_COOLDOWN_429": ("key_cooldown_429", float),
+    "KEY_COOLDOWN_AUTH": ("key_cooldown_auth", float),
+    "KEY_COOLDOWN_MAX": ("key_cooldown_max", float),
+    "KEY_COOLDOWN_BACKOFF": ("key_cooldown_backoff", _parse_bool),
+    "KEY_STICKY": ("key_sticky", float),
+    "KEY_POOL_WAIT_TIMEOUT": ("key_pool_wait_timeout", float),
+    "KEY_TTFT_STALE_AFTER": ("key_ttft_stale_after", float),
+    "KEY_TTFT_RETEST_INTERVAL": ("key_ttft_retest_interval", float),
+    "KEY_TTFT_CONFIRMATIONS": ("key_ttft_confirmations", int),
+    "KEY_TTFT_HYSTERESIS": ("key_ttft_hysteresis", float),
+    "KEY_CACHE_MISS_THRESHOLD": ("key_cache_miss_threshold", int),
+    "KEY_CACHE_MISS_MIN_INPUT_TOKENS": ("key_cache_miss_min_input_tokens", int),
+    "KEY_CACHE_MISS_COOLDOWN": ("key_cache_miss_cooldown", float),
+    "TOKEN_STATS_INJECT_USAGE": ("token_stats_inject_usage", _parse_bool),
+    "IMAGE_UPSTREAM_USER_AGENT": ("image_upstream_user_agent", lambda v: str(v).strip()),
+    "IMAGE_UPSTREAM_ORIGINATOR": ("image_upstream_originator", lambda v: str(v).strip()),
+    "DLP_MODE": ("dlp_mode", lambda v: str(v).strip().lower()),
+    "DLP_RULES": ("dlp_rules", _parse_csv_str),
+    "DLP_ALLOW_EXEMPTIONS": ("dlp_allow_exemptions", _parse_bool),
+    "DLP_EXEMPT_START": ("dlp_exempt_start", str),
+    "DLP_EXEMPT_END": ("dlp_exempt_end", str),
+    "DLP_STRIP_EXEMPT_MARKERS": ("dlp_strip_exempt_markers", _parse_bool),
+    "DLP_MAX_BODY_BYTES": ("dlp_max_body_bytes", int),
+    "DLP_DECODE_DEPTH": ("dlp_decode_depth", int),
+    "DLP_DECODE_MAX_CANDIDATES": ("dlp_decode_max_candidates", int),
+    "DLP_DECODE_MAX_BYTES": ("dlp_decode_max_bytes", int),
+    "DLP_KNOWN_SECRET_MIN_LENGTH": ("dlp_known_secret_min_length", int),
+    "DLP_FAIL_CLOSED": ("dlp_fail_closed", _parse_bool),
+    "PROXY_API_KEY": ("proxy_api_key", lambda v: str(v).strip()),
+}
 
 
 settings = Settings()
@@ -270,7 +362,7 @@ def require_admin(request: Request):
     cookie_ok = bool(session and secrets.compare_digest(session, admin_session_value()))
     if bearer_ok or cookie_ok:
         return
-    if request.url.path in ("/stats", "/logs", "/key-pools"):
+    if request.url.path in ("/stats", "/logs", "/key-pools", "/settings"):
         raise HTTPException(status_code=303, headers={"Location": f"/admin/login?next={request.url.path}"})
     raise HTTPException(status_code=401, detail="invalid_admin_credentials",
                         headers={"WWW-Authenticate": "Bearer"})

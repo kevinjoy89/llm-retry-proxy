@@ -11,15 +11,17 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from .access_control import IPBlocklistMiddleware
-from .api import create_handlers
+from .api import _with_settings_nav, create_handlers
 from .pool_sync import PoolSyncManager
 from .sync_adapters import PoolSyncError
-from .config import admin_session_value, log_capture, logger, require_admin, settings
+from .config import HOT_PARSERS, admin_session_value, log_capture, logger, require_admin, settings
 from .dlp import load_policy
+from .env_file import load_env_file, update_env_file
 from .key_pool import KEY_POOLS
 from .log_store import RetryLogStore
 from .retry import RetryProxy
 from .routes import ROUTES, route_registry
+from .settings_meta import CONFIG_ITEMS, CONFIG_ITEMS_BY_KEY, GROUPS, HOT, REBUILD
 
 from .sse2ws import create_sse2ws_handler
 
@@ -162,7 +164,7 @@ health, stats_page, stats_api, logs_page, logs_history, logs_stream, proxy = cre
 
 
 def _login_page(next_path="/stats", failed=False):
-    next_path = next_path if next_path in ("/stats", "/logs", "/key-pools") else "/stats"
+    next_path = next_path if next_path in ("/stats", "/logs", "/key-pools", "/settings") else "/stats"
     error = '<p class="error">密码不正确</p>' if failed else ""
     disabled = "" if settings.admin_password else "disabled"
     message = "" if settings.admin_password else '<p class="error">管理员密码尚未配置</p>'
@@ -179,7 +181,7 @@ async def admin_login(request: Request):
     values = parse_qs((await request.body()).decode("utf-8", errors="replace"))
     password = values.get("password", [""])[0]
     next_path = values.get("next", ["/stats"])[0]
-    next_path = next_path if next_path in ("/stats", "/logs", "/key-pools") else "/stats"
+    next_path = next_path if next_path in ("/stats", "/logs", "/key-pools", "/settings") else "/stats"
     if not settings.admin_password or not secrets.compare_digest(password, settings.admin_password):
         return _login_page(next_path, failed=True)
     response = RedirectResponse(next_path, status_code=303)
@@ -198,8 +200,181 @@ async def key_pools_page():
     path = settings.key_pool_html_path
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
-            return HTMLResponse(f.read())
+            return HTMLResponse(_with_settings_nav(f.read()))
     return HTMLResponse("key_pool.html not found", status_code=404)
+
+
+# 配置中心写入的目标 .env 文件；容器模式未挂载时仅热应用不持久化
+_ENV_FILE_PATH = ".env"
+
+
+async def settings_page():
+    path = settings.settings_html_path
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return HTMLResponse(f.read())
+    return HTMLResponse("settings.html not found", status_code=404)
+
+
+def _effective_value(item) -> str:
+    """返回配置项的当前生效值（优先 Settings 属性，无属性时读环境变量）"""
+    attr = item.attr or item.key.lower()
+    if not hasattr(settings, attr):
+        # 未写入环境变量时以元数据默认值为准，避免页面把生效值误显示为空
+        value = os.getenv(item.key, item.default)
+    else:
+        value = getattr(settings, attr)
+    if isinstance(value, frozenset):
+        return ",".join(str(v) for v in sorted(value))
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+async def settings_get():
+    file_values = load_env_file(_ENV_FILE_PATH)
+    items = []
+    for item in CONFIG_ITEMS:
+        effective = _effective_value(item)
+        entry = {
+            "key": item.key,
+            "name": item.name or item.key,
+            "group": item.group,
+            "type": item.type,
+            "enum": list(item.enum),
+            "default": item.default,
+            "secret": item.secret,
+            "apply": item.apply,
+            "hidden": item.hidden,
+            "unit": item.unit,
+            "description": item.description,
+        }
+        if item.secret:
+            # 敏感项不回传 .env 明文，仅返回是否已配置
+            entry["configured"] = bool(effective)
+        else:
+            entry["effective_value"] = effective
+            entry["file_value"] = file_values.get(item.key, "")
+        items.append(entry)
+    return {"items": items, "groups": list(GROUPS), "persisted": os.path.exists(_ENV_FILE_PATH)}
+
+
+_BOOL_ACCEPTED = ("1", "true", "yes", "on", "0", "false", "no", "off")
+
+
+def _validate_value(item, raw) -> str:
+    """按元数据类型校验并规范化配置值，非法输入返回 400"""
+    text = str(raw).strip()
+    if text.endswith("\\"):
+        # python-dotenv 1.2.2 对双引号值以反斜杠结尾的解析不稳定（相邻同引号行时
+        # 整个文件被丢弃），保存时直接拒绝以避免重启后配置静默丢失
+        raise HTTPException(status_code=400,
+                            detail=f"{item.key} 不能以反斜杠结尾（python-dotenv 兼容性限制）")
+    if len(text.splitlines()) > 1:
+        # 换行（含 \v \f \u2028 等通用换行符）会破坏 .env 的单行结构，写入后无法被行式解析还原
+        raise HTTPException(status_code=400,
+                            detail=f"{item.key} 不能包含换行符")
+    if item.type == "bool":
+        if text.lower() not in _BOOL_ACCEPTED:
+            raise HTTPException(status_code=400, detail=f"{item.key} 必须是布尔值")
+        return "true" if text.lower() in ("1", "true", "yes", "on") else "false"
+    if item.type == "int":
+        try:
+            int(text)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"{item.key} 必须是整数")
+        return text
+    if item.type == "float":
+        try:
+            float(text)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"{item.key} 必须是数字")
+        return text
+    if item.type == "enum":
+        if text not in item.enum and text.lower() not in {e.lower() for e in item.enum}:
+            raise HTTPException(status_code=400,
+                                detail=f"{item.key} 可选值: {', '.join(item.enum)}")
+        return text
+    if item.type == "csv":
+        # csv 项均为热更新键，用登记解析器试解析以拦截非法值（如非整数状态码）
+        parser = HOT_PARSERS.get(item.key)
+        if parser is not None:
+            try:
+                parser[1](text)
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400,
+                                    detail=f"{item.key} 必须是逗号分隔的有效值")
+        return text
+    return text
+
+
+def _redact_secrets(values: dict) -> dict:
+    """日志脱敏：secret 配置项的值以掩码输出，避免敏感凭据写入日志"""
+    return {key: ("***" if CONFIG_ITEMS_BY_KEY[key].secret else value)
+            for key, value in values.items()}
+
+
+async def settings_post(request: Request):
+    body = await _json_object(request, allow_empty=True)
+    updates = body.get("updates") or {}
+    remove = set(body.get("remove") or [])
+    if not isinstance(updates, dict):
+        raise HTTPException(status_code=400, detail="updates 必须是对象")
+    if not isinstance(remove, (list, set, tuple)) or not all(isinstance(k, str) for k in remove):
+        raise HTTPException(status_code=400, detail="remove 必须是字符串数组")
+
+    normalized = {}
+    removals = set(remove)
+    hot_apply = {}
+    restart = []
+    rebuild = []
+    # remove 数组（页面"重置/清空"路径）：从 .env 删除该键；热更新项立即恢复默认值
+    for key in remove:
+        item = CONFIG_ITEMS_BY_KEY.get(key)
+        if item is None:
+            raise HTTPException(status_code=400, detail=f"未知配置项: {key}")
+        if item.apply == REBUILD:
+            rebuild.append(key)
+        elif item.apply == HOT:
+            hot_apply[key] = item.default
+        else:
+            restart.append(key)
+    # updates 优先于 remove：同一键写入新值时以 updates 为准（hot_apply 后写覆盖）
+    for key, raw in updates.items():
+        item = CONFIG_ITEMS_BY_KEY.get(key)
+        if item is None:
+            raise HTTPException(status_code=400, detail=f"未知配置项: {key}")
+        if str(raw).strip() == "":
+            # 空值语义 = 恢复默认：从 .env 删除该键，热更新项直接应用默认值
+            removals.add(key)
+            if item.apply == REBUILD:
+                if key not in rebuild: rebuild.append(key)
+            elif item.apply == HOT:
+                hot_apply[key] = item.default
+            elif key not in restart:
+                restart.append(key)
+            continue
+        value = _validate_value(item, raw)
+        normalized[key] = value
+        if item.apply == REBUILD:
+            if key not in rebuild: rebuild.append(key)
+        elif item.apply == HOT:
+            hot_apply[key] = value
+        elif key not in restart:
+            restart.append(key)
+
+    persisted = False
+    if normalized or removals:
+        persisted = update_env_file(_ENV_FILE_PATH, normalized, removals)
+    applied = settings.apply_env(hot_apply)
+    logger.info(f"配置中心保存: 写入={_redact_secrets(normalized)} 移除={sorted(removals)} 热应用={applied} 持久化={persisted}")
+    return {
+        "applied": applied,
+        "need_restart": restart,
+        "need_rebuild": rebuild,
+        "removed": sorted(removals),
+        "persisted": persisted,
+    }
 
 
 async def legacy_key_pools_page():
@@ -477,6 +652,19 @@ app.add_api_route("/admin/key-pools/api/manual-remove", key_pools_manual_remove,
 app.add_api_route("/admin/key-pools/api/manual-update", key_pools_manual_update, methods=["POST"], dependencies=admin_dependencies)
 app.add_api_route("/stats", stats_page, methods=["GET"], dependencies=admin_dependencies)
 app.add_api_route("/stats/api", stats_api, methods=["GET"], dependencies=admin_dependencies)
+if settings.settings_page_enabled:
+    app.add_api_route("/settings", settings_page, methods=["GET"], dependencies=admin_dependencies)
+    app.add_api_route("/admin/settings", settings_get, methods=["GET"], dependencies=admin_dependencies)
+    app.add_api_route("/admin/settings", settings_post, methods=["POST"], dependencies=admin_dependencies)
+    logger.info("配置中心页面: 已启用 (/settings)")
+else:
+    # 关闭时不注册管理路由，避免落入 /{path:path} catch-all 被透传上游；404 不带鉴权
+    async def settings_disabled():
+        return HTMLResponse("settings page disabled", status_code=404)
+
+    app.add_api_route("/settings", settings_disabled, methods=["GET"])
+    app.add_api_route("/admin/settings", settings_disabled, methods=["GET", "POST"])
+    logger.info("配置中心页面: 未启用(SETTINGS_PAGE_ENABLED=true 开启)")
 app.add_api_route("/logs", logs_page, methods=["GET"], dependencies=admin_dependencies)
 app.add_api_route("/logs/history", logs_history, methods=["GET"], dependencies=admin_dependencies)
 app.add_api_route("/logs/stream", logs_stream, methods=["GET"], dependencies=admin_dependencies)

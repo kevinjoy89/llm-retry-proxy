@@ -126,6 +126,21 @@ class DockerBuildConfigTests(unittest.TestCase):
         self.assertEqual(len(loop_values), 1)
         self.assertEqual(ast.unparse(loop_values[0]), "settings.uvicorn_loop")
 
+    def test_all_admin_pages_are_copied_into_image(self):
+        # 管理页面必须全部 COPY 进镜像，新增页面忘记打包时访问会返回 not found
+        copied = {line.split()[1] for line in DOCKERFILE.read_text().splitlines()
+                  if line.startswith("COPY ")}
+        for page in ("stats.html", "logs.html", "key_pool.html", "settings.html"):
+            self.assertIn(page, copied, f"Dockerfile 缺少 COPY {page}")
+
+    def test_compose_mounts_env_file_for_settings_persistence(self):
+        # 配置中心持久化依赖宿主机 .env 挂载：未挂载时"重启后生效"项保存无效
+        volumes = self.compose["services"]["llm-retry-proxy"]["volumes"]
+        self.assertTrue(
+            any("/app/.env" in v and v.startswith("./.env") for v in volumes),
+            f"compose.yaml volumes 缺少 ./.env:/app/.env 挂载: {volumes}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

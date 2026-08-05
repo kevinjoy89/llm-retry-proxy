@@ -21,6 +21,9 @@ services:
     volumes:
       - ./key_pool.csv:/app/key_pool.csv:ro
       - ./logs:/app/logs
+      # 挂载宿主机 .env 供配置中心读写：/settings 保存的"重启后生效"项
+      # 直接持久化到宿主机文件，重启/重建容器后经 env_file 重新注入生效
+      - ./.env:/app/.env
     healthcheck:
       test:
         - CMD

@@ -504,13 +504,23 @@ async def _read_request_body_limited(request, limit):
     return b"".join(chunks)
 
 
+_SETTINGS_NAV_LINK_RE = re.compile(r"\s*<a href=\"/settings\">配置</a>")
+
+
+def _with_settings_nav(html: str) -> str:
+    """SETTINGS_PAGE_ENABLED 关闭时移除导航中的配置入口"""
+    if settings.settings_page_enabled:
+        return html
+    return _SETTINGS_NAV_LINK_RE.sub("", html)
+
+
 def create_handlers(service, store, pool_sync=None):
     async def health():
         return {"status": "ok"}
 
     async def stats_page():
         if os.path.exists(settings.stats_html_path):
-            with open(settings.stats_html_path, encoding="utf-8") as f: return Response(f.read(), media_type="text/html; charset=utf-8")
+            with open(settings.stats_html_path, encoding="utf-8") as f: return Response(_with_settings_nav(f.read()), media_type="text/html; charset=utf-8")
         return Response("stats.html not found", status_code=404)
 
     async def stats_api(range="today", model="", provider="", plan_start="", rate_mode=""):
@@ -574,7 +584,7 @@ def create_handlers(service, store, pool_sync=None):
     async def logs_page():
         if os.path.exists(settings.logs_html_path):
             with open(settings.logs_html_path, encoding="utf-8") as f:
-                return Response(f.read(), media_type="text/html; charset=utf-8")
+                return Response(_with_settings_nav(f.read()), media_type="text/html; charset=utf-8")
         return Response("logs.html not found", status_code=404)
 
     async def logs_history(since: int = 0):
