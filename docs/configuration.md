@@ -22,6 +22,7 @@
 | `LISTEN_PORT` | `8080` | 监听端口 |
 | `ADMIN_PASSWORD` | 空 | 管理页面密码；未配置时 `/stats*`、`/logs*` 和 `/key-pools` 禁用。兼容旧 `ADMIN_TOKEN` |
 | `ADMIN_COOKIE_SECURE` | `false` | HTTPS 部署时设为 `true`，限制登录 Cookie 仅通过 HTTPS 发送 |
+| `SETTINGS_PAGE_ENABLED` | `false` | 是否启用配置中心页面（/settings）；关闭时页面与导航入口不展示 |
 | `PROXY_API_KEY` | 空 | 下游使用号池的凭据；未携带或不匹配时仅作普通透传 |
 | `IP_BLACKLIST` | 空 | 拒绝访问的客户端 IP 或 CIDR，多个值用逗号分隔；同时覆盖 HTTP 和 WebSocket |
 | `TRUSTED_PROXY_IPS` | `127.0.0.0/8,::1,172.16.0.0/12` | 可信反向代理的直连 IP 或 CIDR；默认覆盖本机及 Docker 172.x 网络 |
@@ -222,3 +223,21 @@ docker compose -f compose.yaml -f compose.legacy.yaml up -d --build
 不应在现代内核或新版 Docker 环境中使用。
 
 号池、在线同步调度和熔断状态是进程内状态，生产部署必须保持单 Uvicorn worker、单容器副本。当前不支持通过多 worker 或多副本横向扩容；多个进程会各自持有不同的号池，并竞争写入同步状态文件。
+
+## 配置中心页面
+
+默认关闭：配置 `SETTINGS_PAGE_ENABLED=true` 后重启生效。关闭时 `/settings` 页面、`/admin/settings` 接口与三个面板的导航入口均不展示。
+
+配置 `ADMIN_PASSWORD` 后，可访问 `/settings` 在网页中查看和修改全部配置项（与 `.env.example` 全集一致）：
+
+- 每项展示三态：`.env` 文件值、当前生效值与默认值；未写入 `.env` 的项以默认值生效
+- 生效类别徽标：
+  - **立即生效**：保存后无需重启即对后续请求生效（重试、超时、DLP、号池熔断等运行时参数）
+  - **重启后生效**：保存到 `.env`，需重启进程生效（监听地址、路由、SSE2WS 等启动期固化配置）
+  - **重建镜像后生效**：构建期配置（`DOCKER_REGISTRY`、`PYTHON_BASE_IMAGE`、`PIP_INDEX_URL`），保存到 `.env` 后执行 `docker compose build` 重建镜像生效
+- 敏感项（`ADMIN_PASSWORD`、`ADMIN_TOKEN`、`PROXY_API_KEY`、`KEY_POOLS`、`KEY_POOL_SYNC_SECRET`）不回显明文，输入框留空表示不修改（仅点击"重置"才恢复默认）
+- 非敏感项清空输入框或点击"重置"即恢复默认值（从 `.env` 移除对应项）
+- 容器部署（`compose.yaml`）已把宿主机 `.env` 挂载到容器内 `/app/.env`：**重启后生效**项保存后直接持久化到宿主机文件，`docker compose up -d` 重建容器后经 `env_file` 重新注入生效
+- 若自定义 compose 未挂载 `.env`：**立即生效**项保存后仅内存热更新（重启容器后丢失）；**重启后生效**项保存无效（既不写文件也不改内存），页面保存时会给出对应提示，此时请在宿主机 `.env` 或 compose 环境变量中修改后重建容器
+
+注意：`LISTEN_HOST`、`KEY_POOL_FILE`、`LOG_DIR`、`TZ` 被 `compose.yaml` 的 `environment` 覆盖，修改 `.env` 对这四个键无效，需直接改 compose 文件。

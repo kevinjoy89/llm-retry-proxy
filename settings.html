@@ -1,0 +1,652 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>配置中心 · llm-retry-proxy</title>
+  <style>
+    :root{
+      --bg:#f4f6f8;
+      --card:#fff; --card-2:#f8fafc; --border:#e2e7ee; --border-strong:#cbd3df;
+      --text:#0f172a; --text-2:#334155; --muted:#6b7280; --muted-2:#9ca3af;
+      --primary:#2563eb; --primary-d:#1d4ed8; --primary-l:#eff6ff;
+      --ok:#10b981; --ok-l:#ecfdf5; --ok-d:#047857;
+      --warn:#f59e0b; --warn-l:#fffbeb; --warn-d:#b45309;
+      --danger:#ef4444; --danger-l:#fef2f2; --danger-d:#b91c1c;
+      --radius:8px; --radius-sm:8px; --radius-xs:6px;
+      --shadow-xs:0 1px 2px rgba(15,23,42,.04);
+      --shadow:0 1px 3px rgba(15,23,42,.05),0 1px 2px rgba(15,23,42,.03);
+      --shadow-md:0 4px 12px -2px rgba(15,23,42,.08),0 2px 6px -2px rgba(15,23,42,.04);
+      --shadow-lg:0 12px 32px -8px rgba(15,23,42,.12),0 4px 12px -4px rgba(15,23,42,.06);
+    }
+    *{box-sizing:border-box}
+    body{margin:0;font-family:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Roboto,sans-serif;background:var(--bg);color:var(--text);line-height:1.5;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;font-size:14px}
+    button,input,select{font:inherit;color:inherit}button{cursor:pointer}button:disabled{cursor:not-allowed;opacity:.55}
+
+    header{background:rgba(255,255,255,.94);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--border);padding:12px 28px;display:flex;align-items:center;gap:14px;position:sticky;top:0;z-index:50;flex-wrap:wrap}
+    header .brand{display:flex;align-items:center;gap:10px;flex:0 0 200px}
+    header .logo{width:30px;height:30px;border-radius:7px;background:var(--primary);display:flex;align-items:center;justify-content:center;color:#fff;font-size:15px;font-weight:700;box-shadow:0 2px 6px rgba(37,99,235,.24)}
+    header h1{font-size:16px;margin:0;font-weight:700;letter-spacing:0}
+    header .sub{color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    header .sub .dot{width:6px;height:6px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(16,185,129,.15);animation:pulse 2s infinite}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+    header .spacer{flex:1}
+    .app-nav{display:flex;align-items:center;gap:4px;margin-left:12px}
+    .app-nav a{color:var(--muted);text-decoration:none;padding:7px 10px;border-radius:6px;font-size:13px;font-weight:500;transition:color .15s,background .15s}
+    .app-nav a:hover{background:var(--card-2);color:var(--text)}
+    .app-nav a.active{background:var(--primary-l);color:var(--primary-d)}
+    .header-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+
+    main{width:100%;padding:0}
+
+    .dashboard-layout{max-width:1720px;margin:0 auto;padding:24px 28px 56px;display:grid;grid-template-columns:200px minmax(0,1fr);gap:24px;align-items:start}
+    .side-nav{position:sticky;top:64px;max-height:calc(100vh - 84px);overflow:auto;padding:16px 10px 14px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius)}
+    .side-nav .nav-group{padding:2px 8px 4px;color:var(--muted-2);font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;display:flex;align-items:center;gap:8px}
+    .side-nav .nav-group::before{content:"";flex:1;height:1px;background:var(--border);opacity:.35}
+    .side-nav a{display:flex;align-items:center;padding:6px 10px;border-radius:6px;color:var(--text-2);font-size:12.5px;font-weight:500;text-decoration:none;transition:color .15s,background .15s;position:relative;margin:1px 0}
+    .side-nav a:hover{background:var(--card-2);color:var(--text)}
+    .side-nav a.active{background:var(--primary-l);color:var(--primary-d)}
+    .side-nav a.active::before{content:"";position:absolute;left:0;top:50%;transform:translateY(-50%);width:3px;height:16px;background:var(--primary);border-radius:2px}
+    .group{scroll-margin-top:84px}
+
+    .btn{min-height:34px;padding:0 13px;border:1px solid var(--border);border-radius:var(--radius-xs);background:var(--card);color:var(--text-2);font-size:13px;font-weight:500;transition:all .15s;display:inline-flex;align-items:center;gap:6px}
+    .btn:hover{border-color:var(--primary);color:var(--primary);background:var(--primary-l);box-shadow:var(--shadow-xs)}
+    .btn:active{transform:translateY(1px)}
+    .btn:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
+    .btn.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+    .btn.primary:hover{background:var(--primary-d);border-color:var(--primary-d);color:#fff;box-shadow:0 2px 8px rgba(37,99,235,.3)}
+    .btn.small{min-height:26px;padding:0 9px;font-size:12px}
+
+    .notice{display:none;margin-bottom:14px;padding:10px 14px;border-radius:var(--radius-xs);border:1px solid;font-size:13px}
+    .notice.show{display:block}
+    .notice.ok{color:var(--ok-d);background:var(--ok-l);border-color:#a7f3d0}
+    .notice.warn{color:var(--warn-d);background:var(--warn-l);border-color:#fde68a}
+    .notice.error{color:var(--danger-d);background:var(--danger-l);border-color:#fecaca}
+    .notice pre{margin:6px 0 0;font:11px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap}
+
+    .banner{display:none;margin-bottom:14px;padding:9px 14px;border-radius:var(--radius-xs);font-size:12px;background:var(--card-2);border:1px dashed var(--border-strong);color:var(--muted)}
+    .banner.show{display:block}
+    .settings-main{min-width:0}
+
+    .group{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--border);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:18px;overflow:hidden;box-shadow:var(--shadow)}
+    .group-head{grid-column:1/-1;display:flex;align-items:center;gap:10px;padding:13px 18px;border-bottom:1px solid var(--border);background:var(--card-2)}
+    .group-head h2{margin:0;font-size:13px;font-weight:700;color:var(--text);letter-spacing:0}
+    .group-head h2::before{content:"";display:inline-block;width:3px;height:13px;border-radius:2px;background:var(--primary);margin-right:8px;vertical-align:-2px}
+    .group-head .count{margin-left:auto;color:var(--muted);font-size:11px;font-weight:500}
+
+    .group-meta{grid-column:1/-1;display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:10px 18px;background:var(--card-2);border-bottom:1px solid var(--border);color:var(--muted);font-size:12px}
+    .group-meta .gm-label{color:var(--muted-2);font-size:11px;font-weight:600;letter-spacing:.05em;white-space:nowrap}
+    .group-meta .gm-item{display:inline-flex;align-items:center;gap:6px}
+    .group-meta .gm-item b{font-weight:600;color:var(--text-2);font-size:12px}
+    .group-meta .gm-item code{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--card);border:1px solid var(--border);border-radius:4px;padding:1px 5px;color:var(--text-2)}
+
+    .item{display:grid;grid-template-columns:minmax(0,1fr) minmax(200px,300px);gap:14px;padding:13px 16px;background:var(--card);align-items:start}
+    .item:hover{background:var(--card-2)}
+    /* Provider 显示别名多行编辑器需要横向宽度，堆叠为 label 在上、编辑器占满整行 */
+    .item-stacked{grid-template-columns:1fr}
+    .item-stacked .alias-editor{min-width:0}
+    .item-stacked .alias-row input{min-width:120px}
+    .item-label{min-width:0}
+    .item-label .key{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-weight:600;color:var(--text)}
+    .item-label .key .cname{font-size:13px}
+    .item-label .env-name{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted-2);background:var(--card-2);border:1px solid var(--border);border-radius:4px;padding:1px 5px;font-weight:400}
+    .item-label .desc{color:var(--muted);font-size:12px;margin-top:4px}
+    .item-label .meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:6px;font-size:11px;color:var(--muted-2)}
+    .item-label .meta code{background:var(--card-2);border:1px solid var(--border);border-radius:4px;padding:1px 5px;font-size:11px}
+    .item-control{min-width:0}
+    .item-control input[type=text],.item-control input[type=number],.item-control select{width:100%;height:36px;border:1px solid var(--border-strong);border-radius:var(--radius-xs);background:var(--card);padding:0 10px;color:var(--text);outline:none;transition:border-color .15s,box-shadow .15s;font-size:13px}
+    .item-control input:focus,.item-control select:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+    .item-control input:disabled,.item-control select:disabled{background:var(--card-2);color:var(--muted);cursor:not-allowed}
+    .item-control input::placeholder{color:var(--muted-2);font-size:12px}
+    .switch{display:inline-flex;align-items:center;gap:9px;height:36px;cursor:pointer;color:var(--text-2);font-size:13px;user-select:none}
+    .switch input{position:absolute;opacity:0;width:0;height:0}
+    .switch .slider{position:relative;width:40px;height:22px;background:var(--border-strong);border-radius:99px;transition:background .2s;flex:0 0 auto}
+    .switch .slider::before{content:"";position:absolute;left:3px;top:3px;width:16px;height:16px;background:#fff;border-radius:50%;transition:transform .2s;box-shadow:0 1px 3px rgba(15,23,42,.2)}
+    .switch input:checked + .slider{background:var(--primary)}
+    .switch input:checked + .slider::before{transform:translateX(18px)}
+    .switch .switch-label{color:var(--text-2)}
+    .item-control .effective{color:var(--muted);font-size:11px;margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .item-control .row{display:flex;gap:8px;align-items:center}
+    .item-control .row>*{flex:1;min-width:0}
+    .item-control .row .reset{flex:0 0 auto;width:auto}
+    .item-control .input-with-unit{display:flex;align-items:center;gap:6px;min-width:0}
+    .item-control .input-with-unit input{flex:1;min-width:0}
+    .item-control .input-with-unit .unit{flex:0 0 auto;color:var(--muted-2);font-size:12px;white-space:nowrap}
+    .item-control .reset{display:inline-flex;align-items:center;gap:3px;min-height:26px;padding:0 10px;border:1px solid transparent;border-radius:var(--radius-xs);background:transparent;color:var(--muted);font-size:12px;white-space:nowrap;transition:color .15s,background .15s}
+    .item-control .reset:hover{border-color:var(--border);background:var(--card-2);color:var(--primary-d)}
+
+    .alias-editor{display:flex;flex-direction:column;gap:6px}
+    .alias-editor .alias-rows{display:flex;flex-direction:column;gap:6px}
+    .alias-editor .alias-row{display:flex;gap:6px;align-items:center}
+    .alias-editor .alias-row input{flex:1;min-width:0;height:34px;border:1px solid var(--border-strong);border-radius:var(--radius-xs);background:var(--card);padding:0 10px;color:var(--text);outline:none;transition:border-color .15s,box-shadow .15s;font-size:13px}
+    .alias-editor .alias-row input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+    .alias-editor .alias-row input::placeholder{color:var(--muted-2);font-size:12px}
+    .alias-editor .alias-sep{flex:0 0 auto;color:var(--muted-2);font-size:12px;padding:0 1px}
+    .alias-editor .alias-del{flex:0 0 auto;width:28px;height:28px;border:1px solid transparent;border-radius:var(--radius-xs);background:transparent;color:var(--muted);font-size:13px;line-height:1;display:inline-flex;align-items:center;justify-content:center;transition:color .15s,background .15s,border-color .15s}
+    .alias-editor .alias-del:hover{border-color:#fecaca;background:var(--danger-l);color:var(--danger-d)}
+    .alias-editor .alias-add{align-self:flex-start;display:inline-flex;align-items:center;gap:4px;min-height:26px;padding:0 10px;border:1px dashed var(--border-strong);border-radius:var(--radius-xs);background:var(--card-2);color:var(--text-2);font-size:12px;transition:color .15s,border-color .15s,background .15s}
+    .alias-editor .alias-add:hover{border-color:var(--primary);color:var(--primary-d);background:var(--primary-l)}
+    .alias-editor .alias-secret-hint{color:var(--muted-2);font-size:11px;padding-left:2px}
+    .split-editor{display:flex;flex-direction:column;gap:8px}
+    .split-field{display:flex;flex-direction:column;gap:4px}
+    .split-label{font-size:12px;color:#526071}
+
+    .pill{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:99px;font-size:10.5px;font-weight:600;letter-spacing:.02em;white-space:nowrap}
+    .pill.ok{background:var(--ok-l);color:var(--ok-d)}
+    .pill.warn{background:var(--warn-l);color:var(--warn-d)}
+    .pill.muted{background:var(--card-2);color:var(--muted);border:1px solid var(--border)}
+    .pill.danger{background:var(--danger-l);color:var(--danger-d)}
+    .pill.red{background:var(--danger-l);color:var(--danger-d)}
+
+    @media(max-width:1180px){.dashboard-layout{grid-template-columns:156px minmax(0,1fr);gap:16px;padding-inline:20px}}
+    @media(max-width:820px){header{padding:10px 16px;gap:8px}.header-actions{width:100%}main{padding:0}.dashboard-layout{display:block;padding:0 16px 40px}.side-nav{position:relative;top:auto;z-index:1;display:flex;gap:6px;max-height:none;margin:0 -16px 16px;padding:10px 14px;overflow-x:auto;background:var(--card);border:0;border-bottom:1px solid var(--border);border-radius:0;box-shadow:none}.side-nav .nav-group{display:none}.side-nav a{flex:0 0 auto;min-height:32px;margin:0;padding:6px 10px;border:1px solid transparent;border-radius:6px;white-space:nowrap;font-size:12px}.side-nav a.active::before{display:none}.side-nav a.active{background:var(--primary-l);color:var(--primary-d);border-color:rgba(37,99,235,.12)}.group{grid-template-columns:1fr}.item{grid-template-columns:minmax(0,1fr) minmax(220px,340px)}.group{scroll-margin-top:64px}}
+    @media(max-width:760px){.item{grid-template-columns:1fr;gap:10px}.item-control .row{flex-wrap:wrap}}
+  </style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="logo">S</div>
+    <div>
+      <h1>配置中心</h1>
+      <span class="sub"><span class="dot"></span>环境变量配置管理与热更新</span>
+    </div>
+  </div>
+  <nav class="app-nav" aria-label="主导航"><a href="/stats">统计</a><a href="/logs">日志</a><a href="/key-pools">号池</a><a class="active" href="/settings">配置</a></nav>
+  <div class="spacer"></div>
+  <div class="header-actions">
+    <button class="btn" id="resetAll">全部重置</button>
+    <button class="btn primary" id="saveBtn">保存修改</button>
+  </div>
+</header>
+<main>
+  <div class="dashboard-layout">
+    <aside class="side-nav" aria-label="配置分组导航"></aside>
+    <div class="settings-main">
+      <div class="notice" id="notice"></div>
+      <div class="banner" id="persistBanner">当前运行环境未挂载 .env 文件（容器模式）：<b>立即生效</b>项仅内存热更新（重启丢失）；<b>重启后生效</b>项保存无效，请修改宿主机 .env 或 compose 环境变量后重建容器。</div>
+      <div id="content"><div class="group" style="grid-column:1/-1;padding:24px;text-align:center;color:var(--muted)">正在载入配置…</div></div>
+    </div>
+  </div>
+</main>
+<script>
+(function(){
+"use strict";
+const $=id=>document.getElementById(id);
+let ITEMS=[],GROUPS=[],DIRTY={},RESET_KEYS=new Set();
+
+async function api(path,options={}){
+  const endpoint=new URL('/admin/settings',window.location.origin);
+  const response=await fetch(endpoint.toString(),{headers:{'Content-Type':'application/json'},...options});
+  let data={};
+  try{data=await response.json()}catch{}
+  if(!response.ok)throw new Error(data.detail||data.message||('HTTP '+response.status));
+  return data;
+}
+
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const applyPill=it=>it.apply==='hot'?'<span class="pill ok">立即生效</span>':it.apply==='rebuild'?'<span class="pill red">重建镜像后生效</span>':'<span class="pill warn">重启后生效</span>';
+
+// enum 下拉的显示标签：下拉展示中文，option 值保持存储值（off/bridge 等）以便原样提交
+const ENUM_LABELS = {
+  HEDGE_MODE: {off: '串行重试', race: '每轮并发竞速', stagger: '交错补发（会增加上游压力）'},
+  DLP_MODE: {off: '关闭', audit: '仅告警', redact: '脱敏后转发', block: '拦截'},
+};
+
+// 二值"开启/关闭"选项渲染为拨动开关：值映射存储值（on/off）
+const TOGGLE_KEYS = {
+  SSE2WS_MODE: {on: 'bridge', off: 'off'},
+};
+
+// 多字段行编辑器配置：key -> {itemSep 组内分隔符, splitFirst 是否仅按首个分隔符分割,
+// required 必填字段, columns 列定义, parseEntry/serializeRow 可选自定义解析与拼接}；
+// 值格式为 字段间用 itemSep 连接、多组用逗号拼接
+const ROW_EDITORS = {
+  PROVIDER_ALIASES: {itemSep: ':', splitFirst: true, required: ['from', 'to'], columns: [
+    {field: 'from', cls: 'row-from', ph: '原名称'},
+    {field: 'to', cls: 'row-to', ph: '别名'},
+  ]},
+  EXTRA_UPSTREAMS: {itemSep: '|', splitFirst: false, required: ['prefix', 'url'], columns: [
+    {field: 'prefix', cls: 'row-prefix', ph: '前缀（如 /aihub）'},
+    {field: 'url', cls: 'row-url', ph: '上游地址'},
+    {field: 'provider', cls: 'row-provider', ph: '供应商（可空）'},
+  ]},
+  KEY_POOLS: {itemSep: '|', splitFirst: false, required: ['keys'], columns: [
+    {field: 'url', cls: 'row-url', ph: '上游地址（可空=默认上游）'},
+    {field: 'provider', cls: 'row-provider', ph: '供应商（可空=默认）'},
+    {field: 'keys', cls: 'row-keys', ph: 'Key 列表（分号分隔，必填）'},
+  ],
+    // 无 | 形态（url/provider 都空）归属默认上游，序列化时省略前缀，与 key_pool.build_key_pools 一致
+    parseEntry: e => e.includes('|')
+      ? (() => { const p = e.split('|'); return {url: (p[0] || '').trim(), provider: (p[1] || '').trim(), keys: (p[2] || '').trim()}; })()
+      : {url: '', provider: '', keys: e.trim()},
+    serializeRow: r => (r.url || r.provider) ? [r.url || '', r.provider || '', r.keys || ''].join('|') : (r.keys || ''),
+  },
+};
+
+// IP/CIDR 双组编辑器：IPv4 与 IPv6 分开输入，保存时以逗号拼接提交
+const SPLIT_EDITORS = {
+  TRUSTED_PROXY_IPS: {label4: 'IPv4Network', label6: 'IPv6Network'},
+  IP_AUTO_BAN_EXEMPT: {label4: 'IPv4Network', label6: 'IPv6Network'},
+};
+function splitIpGroups(value){
+  // 按逗号拆分为 IPv4/IPv6 两组：含冒号的条目归 IPv6，其余归 IPv4
+  const v4 = [], v6 = [];
+  for(const entry of String(value || '').split(',')){
+    const e = entry.trim();
+    if(!e) continue;
+    (e.includes(':') ? v6 : v4).push(e);
+  }
+  return {v4: v4.join(', '), v6: v6.join(', ')};
+}
+function joinIpGroups(v4, v6){
+  // IPv4 组在前、IPv6 组在后，逗号拼接；空组省略
+  return [v4, v6].map(s => String(s || '').trim()).filter(Boolean).join(',');
+}
+function parseRowValue(value, cfg){
+  const rows = [];
+  for(const entry of String(value || '').split(',')){
+    const e = entry.trim();
+    if(!e)continue;
+    if(cfg.parseEntry){ rows.push(cfg.parseEntry(e)); continue; }
+    let parts;
+    if(cfg.splitFirst){
+      const i = e.indexOf(cfg.itemSep);
+      parts = i < 0 ? [e] : [e.slice(0, i), e.slice(i + 1)];
+    } else {
+      parts = e.split(cfg.itemSep);
+    }
+    const row = {};
+    cfg.columns.forEach((c, idx) => { row[c.field] = (parts[idx] || '').trim(); });
+    rows.push(row);
+  }
+  return rows;
+}
+function serializeRowValue(rows, cfg){
+  return rows.filter(r => cfg.columns.some(c => r[c.field]))
+    .map(r => cfg.serializeRow ? cfg.serializeRow(r) : cfg.columns.map(c => r[c.field] || '').join(cfg.itemSep)).join(',');
+}
+function rowEditorHtml(r, cfg){
+  let html = '<div class="alias-row">';
+  cfg.columns.forEach((c, i) => {
+    html += `<input type="text" class="${c.cls}" value="${esc(r[c.field])}" placeholder="${esc(c.ph)}">`;
+    if(i < cfg.columns.length - 1) html += '<span class="alias-sep">→</span>';
+  });
+  return html + '<button type="button" class="alias-del" title="删除此行">✕</button></div>';
+}
+function rowsOfEditor(editor, cfg){
+  return [...editor.querySelectorAll('.alias-row')].map(row => {
+    const r = {};
+    cfg.columns.forEach(c => { r[c.field] = row.querySelector('.' + c.cls).value.trim(); });
+    return r;
+  });
+}
+function syncAliasEditor(editor, key){
+  const cfg = ROW_EDITORS[key];
+  DIRTY[key] = serializeRowValue(rowsOfEditor(editor, cfg), cfg);
+  updateSaveState();
+}
+function addAliasRow(editor, key){
+  const cfg = ROW_EDITORS[key];
+  const rows = editor.querySelector('.alias-rows');
+  const div = document.createElement('div');
+  div.className = 'alias-row';
+  div.innerHTML = cfg.columns.map((c, i) =>
+    `<input type="text" class="${c.cls}" placeholder="${esc(c.ph)}">` +
+    (i < cfg.columns.length - 1 ? '<span class="alias-sep">→</span>' : '')
+  ).join('') + '<button type="button" class="alias-del" title="删除此行">✕</button>';
+  rows.appendChild(div);
+  syncAliasEditor(editor, key);
+  div.querySelector('input').focus();
+}
+
+function inputValue(it){
+  if(it.secret)return '';
+  // .env 文件中有值优先显示文件值；无 .env（容器模式）时回退显示当前生效值
+  return it.file_value||it.effective_value;
+}
+function controlHtml(it){
+  const val=inputValue(it);
+  if(it.type==='bool'){
+    const checked=val==='true';
+    return `<label class="switch" id="ctrl-${it.key}" data-key="${it.key}" data-bool="1">`+
+      `<input type="checkbox" ${checked?'checked':''}>`+
+      `<span class="slider"></span>`+
+      `<span class="switch-label">${checked?'开启':'关闭'}</span>`+
+      `</label>`;
+  }
+  if(it.type==='enum'){
+    const toggle = TOGGLE_KEYS[it.key];
+    if(toggle){
+      // 二值开关：拨动样式，值映射为存储值（如 bridge/off）
+      const on = String(val).toLowerCase() === String(toggle.on).toLowerCase();
+      return `<label class="switch" id="ctrl-${it.key}" data-key="${it.key}">`+
+        `<input type="checkbox" ${on?'checked':''}>`+
+        `<span class="slider"></span>`+
+        `<span class="switch-label">${on?'开启':'关闭'}</span>`+
+        `</label>`;
+    }
+    const labels = ENUM_LABELS[it.key] || {};
+    return `<select id="ctrl-${it.key}" data-key="${it.key}">${it.enum.map(e=>`<option value="${esc(e)}" ${String(e).toLowerCase()===String(val).toLowerCase()?'selected':''}>${esc(labels[e]||e)}</option>`).join('')}</select>`;
+  }
+  if(ROW_EDITORS[it.key]){
+    // 多字段行编辑器（Provider 显示别名 / 额外上游路由 / 号池 Key 列表）：卡片内拆分多行逐一编辑，保存时拼接提交
+    const cfg = ROW_EDITORS[it.key];
+    // secret 项不回显明文：不解析现有值，仅提供空行输入（留空不修改）；无行时给一行空行便于直接输入
+    let rows = it.secret ? [{}] : parseRowValue(val, cfg);
+    if(!rows.length)rows = [{}];
+    const hint = (it.secret && it.configured) ? '<div class="alias-secret-hint">已配置（留空不修改，输入新值覆盖）</div>' : '';
+    return `<div class="alias-editor" id="ctrl-${it.key}" data-key="${it.key}">`+
+      `<div class="alias-rows">${rows.map(r => rowEditorHtml(r, cfg)).join('')}</div>`+
+      hint +
+      `<button type="button" class="alias-add" title="新增一行">＋ 添加行</button>`+
+      `</div>`;
+  }
+  if(SPLIT_EDITORS[it.key]){
+    const cfg = SPLIT_EDITORS[it.key];
+    const groups = splitIpGroups(val);
+    return `<span class="split-editor" id="ctrl-${it.key}" data-key="${it.key}">`+
+      `<span class="split-field"><span class="split-label">${esc(cfg.label4)}</span>`+
+      `<input type="text" class="split-v4" value="${esc(groups.v4)}" placeholder="如 127.0.0.0/8, 172.16.0.0/12"></span>`+
+      `<span class="split-field"><span class="split-label">${esc(cfg.label6)}</span>`+
+      `<input type="text" class="split-v6" value="${esc(groups.v6)}" placeholder="如 ::1"></span>`+
+      `</span>`;
+  }
+  const step=it.type==='int'?'step="1"':(it.type==='float'?'step="any"':'');
+  const type=it.type==='int'||it.type==='float'?'number':'text';
+  const placeholder=it.secret?(it.configured?'已配置（留空不修改，输入新值覆盖）':'未配置'):`默认: ${it.default}`;
+  const inputHtml=`<input type="${type}" id="ctrl-${it.key}" data-key="${it.key}" value="${esc(val)}" placeholder="${esc(placeholder)}" ${step}>`;
+  // 数值输入框带单位（如 秒/天）时在框后展示
+  const unitHtml = ((it.type==='int'||it.type==='float') && it.unit) ? `<span class="unit">${esc(it.unit)}</span>` : '';
+  return unitHtml ? `<span class="input-with-unit">${inputHtml}${unitHtml}</span>` : inputHtml;
+}
+
+function effectiveText(it){
+  if(it.secret)return '当前: '+(it.configured?'已配置':'未配置');
+  const eff=it.effective_value===''?'':it.effective_value;
+  const def=it.default===''?'':it.default;
+  if(it.apply==='hot'){
+    // 立即生效项：输入框即当前生效值，"当前生效"冗余，仅在与默认不同时提示默认
+    return eff!==def ? '默认: '+esc(def||'（空）') : '';
+  }
+  if(ROW_EDITORS[it.key]){
+    // 行编辑器项以行数呈现生效状态，避免重复展示拼接字符串
+    const count = parseRowValue(it.effective_value, ROW_EDITORS[it.key]).length;
+    return '当前生效: ' + (count ? count + ' 条' : '（空）');
+  }
+  if(SPLIT_EDITORS[it.key]){
+    // 双组编辑器按 IPv4/IPv6 条数呈现生效状态
+    const g = splitIpGroups(it.effective_value);
+    const n4 = g.v4 ? g.v4.split(',').filter(s => s.trim()).length : 0;
+    const n6 = g.v6 ? g.v6.split(',').filter(s => s.trim()).length : 0;
+    return '当前生效: ' + (n4 + n6 ? n4 + ' IPv4 + ' + n6 + ' IPv6' : '（空）');
+  }
+  return '当前生效: '+esc(eff||'（空）')+(eff!==def?' · 默认: '+esc(def||'（空）'):'');
+}
+
+function render(){
+  const byGroup={};
+  for(const it of ITEMS)(byGroup[it.group]=byGroup[it.group]||[]).push(it);
+  const html=GROUPS.filter(g=>byGroup[g]).map(g=>{
+    const gi=GROUPS.indexOf(g);
+    const items=byGroup[g];
+    const metaItems=items.filter(it=>it.hidden);
+    const rows=items.filter(it=>!it.hidden).map(it=>{
+      const pills=[applyPill(it),it.secret?'<span class="pill danger">敏感</span>':''].join(' ');
+      const resetBtn=`<button class="reset" data-reset="${it.key}" title="恢复默认值">↺ 重置</button>`;
+      const stacked = (ROW_EDITORS[it.key] || SPLIT_EDITORS[it.key]) ? ' item-stacked' : '';
+      return `<div class="item${stacked}" data-key="${it.key}">
+        <div class="item-label">
+          <div class="key"><span class="cname">${esc(it.name||it.key)}</span> ${pills}</div>
+          <div class="desc"><code class="env-name">${esc(it.key)}</code>${it.description?` ${esc(it.description)}`:''}</div>
+          <div class="meta">${effectiveText(it)}</div>
+        </div>
+        <div class="item-control"><div class="row">${controlHtml(it)}${resetBtn}</div></div>
+      </div>`;
+    }).join('');
+    const metaHtml=metaItems.length
+      ?`<div class="group-meta"><span class="gm-label">构建期配置（修改需重建镜像）</span>${metaItems.map(it=>{
+        const v=it.effective_value===''?'（未配置）':it.effective_value;
+        return `<span class="gm-item"><b>${esc(it.name)}</b><code>${esc(v)}</code></span>`;
+      }).join('')}</div>`
+      :'';
+    return `<section class="group" id="g${gi}"><div class="group-head"><h2>${esc(g)}</h2><span class="count">${items.length-metaItems.length} 项</span></div>${metaHtml}${rows}</section>`;
+  }).join('');
+  $('content').innerHTML=html;
+  renderSideNav();
+  bindEvents();
+}
+
+// 侧栏二次分组：完整组名 -> 导航分组；顺序与 settings_meta.GROUPS 一致
+const NAV_GROUPS=[
+  ['运行',['Docker 与运行环境','服务与访问控制','上游、路由与网络','日志']],
+  ['请求',['Codex Responses WebSocket 桥接 (SSE2WS)','连接与响应超时','重试与退避','竞速模式']],
+  ['号池',['号池来源与鉴权','号池熔断与选择','在线同步']],
+  ['防护',['Token 统计','上游兼容','请求正文敏感信息防护']],
+];
+const SHORT_NAMES={
+  'Docker 与运行环境':'Docker 环境',
+  '服务与访问控制':'访问控制',
+  '上游、路由与网络':'上游路由',
+  'Codex Responses WebSocket 桥接 (SSE2WS)':'SSE2WS 桥接',
+  '连接与响应超时':'超时',
+  '重试与退避':'重试',
+  '竞速模式':'竞速',
+  '号池来源与鉴权':'号池来源',
+  '号池熔断与选择':'熔断选择',
+  '在线同步':'在线同步',
+  'Token 统计':'Token 统计',
+  '上游兼容':'上游兼容',
+  '日志':'日志',
+  '请求正文敏感信息防护':'DLP 防护',
+};
+
+function renderSideNav(){
+  const items=NAV_GROUPS.map(([label,groups])=>{
+    const links=groups.map(g=>{
+      const gi=GROUPS.indexOf(g);
+      if(gi<0)return '';
+      return `<a href="#g${gi}" data-target="g${gi}">${esc(SHORT_NAMES[g]||g)}</a>`;
+    }).join('');
+    return `<div class="nav-group">${esc(label)}</div>${links}`;
+  }).join('');
+  document.querySelector('.side-nav').innerHTML=items;
+  setupScrollSpy();
+}
+
+function setupScrollSpy(){
+  const links=[...document.querySelectorAll('.side-nav a[data-target]')];
+  const observer=new IntersectionObserver(entries=>{
+    const visible=entries.filter(e=>e.isIntersecting)
+      .sort((a,b)=>a.boundingClientRect.top-b.boundingClientRect.top);
+    if(!visible.length)return;
+    const id=visible[0].target.id;
+    links.forEach(link=>{
+      const active=link.dataset.target===id;
+      link.classList.toggle('active',active);
+      if(active)link.setAttribute('aria-current','location');
+      else link.removeAttribute('aria-current');
+    });
+  },{rootMargin:'-18% 0px -70% 0px',threshold:0});
+  links.forEach(link=>{
+    const section=document.getElementById(link.dataset.target);
+    if(section)observer.observe(section);
+  });
+}
+
+function bindEvents(){
+  document.querySelectorAll('#content input[data-key],#content select[data-key]').forEach(el=>{
+    const key=el.dataset.key;
+    el.addEventListener('input',()=>markDirty(key));
+    el.addEventListener('change',()=>markDirty(key));
+  });
+  // 拨动开关：bool 项写入 true/false；二值 enum 项写入映射后的存储值（如 bridge/off）
+  document.querySelectorAll('.switch[data-key]').forEach(el=>{
+    const key=el.dataset.key;
+    const cfg=TOGGLE_KEYS[key];
+    const isBool=el.dataset.bool==='1';
+    const cb=el.querySelector('input[type=checkbox]');
+    cb.addEventListener('change',()=>{
+      DIRTY[key]=isBool?(cb.checked?'true':'false'):(cb.checked?cfg.on:cfg.off);
+      const lbl=el.querySelector('.switch-label');
+      if(lbl)lbl.textContent=cb.checked?'开启':'关闭';
+      updateSaveState();
+    });
+  });
+  // Provider 显示别名多行编辑器：行内输入与增删均同步拼接结果到 DIRTY
+  document.querySelectorAll('.alias-editor').forEach(editor=>{
+    const key=editor.dataset.key;
+    editor.addEventListener('input',()=>syncAliasEditor(editor,key));
+    editor.addEventListener('click',e=>{
+      const del=e.target.closest('.alias-del');
+      if(del){del.closest('.alias-row').remove();syncAliasEditor(editor,key);return;}
+      const add=e.target.closest('.alias-add');
+      if(add)addAliasRow(editor,key);
+    });
+  });
+  // IP/CIDR 双组编辑器：两个输入框的值拼接后同步到 DIRTY
+  document.querySelectorAll('.split-editor[data-key]').forEach(editor=>{
+    const key = editor.dataset.key;
+    const v4 = editor.querySelector('.split-v4');
+    const v6 = editor.querySelector('.split-v6');
+    const sync = () => { DIRTY[key] = joinIpGroups(v4.value, v6.value); updateSaveState(); };
+    v4.addEventListener('input', sync);
+    v6.addEventListener('input', sync);
+  });
+  document.querySelectorAll('[data-reset]').forEach(btn=>{
+    btn.addEventListener('click',()=>{
+      const key=btn.dataset.reset;
+      DIRTY[key]='';
+      RESET_KEYS.add(key);
+      const ctrl=$('ctrl-'+key);
+      if(ctrl){
+        if(ctrl.classList.contains('switch')){
+          const cb=ctrl.querySelector('input[type=checkbox]');
+          cb.checked=false;
+          const lbl=ctrl.querySelector('.switch-label');
+          if(lbl)lbl.textContent='关闭';
+        }else if(ctrl.type==='checkbox')ctrl.checked=false;
+        else if(ctrl.classList.contains('alias-editor')){
+          ctrl.querySelector('.alias-rows').innerHTML='';
+          syncAliasEditor(ctrl,key);
+        }else if(ctrl.classList.contains('split-editor')){ ctrl.querySelector('.split-v4').value=''; ctrl.querySelector('.split-v6').value=''; }
+        else ctrl.value='';
+      }
+      updateSaveState();
+    });
+  });
+}
+
+function markDirty(key){
+  const el=$('ctrl-'+key);
+  if(!el)return;
+  DIRTY[key]=el.type==='checkbox'?(el.checked?'true':'false'):el.value.trim();
+  updateSaveState();
+}
+
+function updateSaveState(){
+  const count=Object.keys(DIRTY).filter(k=>DIRTY[k]!==undefined).length;
+  $('saveBtn').textContent=count>0?`保存修改（${count}）`:'保存修改';
+  $('saveBtn').disabled=count===0;
+}
+
+function showNotice(kind,title,detail){
+  const el=$('notice');
+  el.className='notice show '+kind;
+  el.innerHTML='<strong>'+esc(title)+'</strong>'+(detail?'<pre>'+esc(detail)+'</pre>':'');
+}
+
+async function save(){
+  const updates={},remove=[];
+  // 敏感项输入框留空 = 不修改；仅点击"重置"才恢复默认
+  const secretConfigured=new Set(ITEMS.filter(it=>it.secret&&it.configured).map(it=>it.key));
+  for(const [k,v] of Object.entries(DIRTY)){
+    if(v===undefined)continue;
+    const rowCfg = ROW_EDITORS[k];
+    if(rowCfg && v !== ''){
+      // 行编辑器的保存校验：必填字段成对填写、字段不含逗号或组内分隔符（否则拼接后无法解析）
+      const editor = $('ctrl-' + k);
+      const rows = editor ? rowsOfEditor(editor, rowCfg) : [];
+      if(rows.some(r => rowCfg.required.some(f => !r[f]))){
+        const labels = rowCfg.required.map(f => rowCfg.columns.find(c => c.field === f).ph).join('、');
+        showNotice('error', '保存失败', k + ' 存在不完整的行：' + labels + ' 必须填写');
+        $('saveBtn').disabled = false;
+        return;
+      }
+      if(rows.some(r => rowCfg.columns.some(c => r[c.field] && (r[c.field].includes(',') || r[c.field].includes(rowCfg.itemSep))))){
+        showNotice('error', '保存失败', k + ' 的字段不能包含逗号或 ' + (rowCfg.itemSep === '|' ? '竖线' : '冒号'));
+        $('saveBtn').disabled = false;
+        return;
+      }
+      if(k === 'EXTRA_UPSTREAMS' && rows.some(r => r.prefix && (/[\s?#|,]/.test(r.prefix) || r.prefix.includes('://')))){
+        showNotice('error', '保存失败', 'EXTRA_UPSTREAMS 的前缀只能是路径（如 /aihub），不能包含空格、?、#、|、, 或协议头');
+        $('saveBtn').disabled = false;
+        return;
+      }
+      if(k === 'KEY_POOLS' && rows.some(r => !!r.url !== !!r.provider)){
+        showNotice('error', '保存失败', 'KEY_POOLS 的上游地址与供应商必须成对填写（都留空表示使用默认上游）');
+        $('saveBtn').disabled = false;
+        return;
+      }
+    }
+    if(v === ''){
+      if(secretConfigured.has(k) && !RESET_KEYS.has(k))continue;
+      remove.push(k);
+    }else updates[k] = v;
+  }
+  $('saveBtn').disabled=true;
+  try{
+    const res=await api('',{method:'POST',body:JSON.stringify({updates,remove})});
+    const lines=[];
+    if(res.applied&&res.applied.length)lines.push('立即生效: '+res.applied.join(', '));
+    if(res.need_restart&&res.need_restart.length)lines.push('需重启后生效: '+res.need_restart.join(', '));
+    if(res.need_rebuild&&res.need_rebuild.length)lines.push('需重建镜像后生效: '+res.need_rebuild.join(', '));
+    if(res.removed&&res.removed.length)lines.push('已恢复默认: '+res.removed.join(', '));
+    if(!res.persisted){
+      // 无 .env 文件时：立即生效项仅内存热更新，重启后生效项什么都没保存
+      if(res.need_restart&&res.need_restart.length)
+        lines.push('⚠️ 未持久化：重启后生效项保存无效，请修改宿主机 .env 或 compose 环境变量后重建容器');
+      else
+        lines.push('未持久化（仅内存生效，重启后丢失）');
+    }
+    DIRTY={};
+    RESET_KEYS.clear();
+    showNotice('ok','保存成功',lines.join('\n'));
+    await load();
+  }catch(err){
+    showNotice('error','保存失败',err.message);
+    $('saveBtn').disabled=false;
+  }
+}
+
+async function load(){
+  try{
+    const data=await api('',{method:'GET'});
+    ITEMS=data.items;GROUPS=data.groups;
+    if(!data.persisted)$('persistBanner').classList.add('show');
+    DIRTY={};
+    RESET_KEYS.clear();
+    render();
+    updateSaveState();
+  }catch(err){
+    $('content').innerHTML='';
+    showNotice('error','加载配置失败',err.message);
+  }
+}
+
+$('saveBtn').addEventListener('click',save);
+$('resetAll').addEventListener('click',()=>{
+  if(!confirm('确定将所有配置项恢复为默认值？\n（仅从 .env 中移除对应项，程序默认值生效）'))return;
+  DIRTY={};
+  RESET_KEYS=new Set();
+  for(const it of ITEMS){
+    DIRTY[it.key]='';
+    RESET_KEYS.add(it.key);
+  }
+  save();
+});
+load();
+})();
+</script>
+</body>
+</html>

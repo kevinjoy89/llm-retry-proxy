@@ -56,7 +56,7 @@ def _req_first_ok(r: dict) -> bool:
 # 默认别名仅归一化中文显示名；anthropic 等英文 provider 不再硬编码重映射，
 # 避免把 Anthropic 流量静默改标。可通过 PROVIDER_ALIASES 环境变量追加/覆盖，
 # 格式为 from:to,from:to。
-_PROVIDER_ALIASES = {
+_DEFAULT_PROVIDER_ALIASES = {
     "讯飞星辰 Coding Plan": "xfyun",
 }
 
@@ -77,7 +77,15 @@ def _load_extra_aliases():
     return extras
 
 
-_PROVIDER_ALIASES.update(_load_extra_aliases())
+def reload_aliases():
+    """重新加载 PROVIDER_ALIASES 环境变量别名（配置中心热更新时调用）"""
+    _PROVIDER_ALIASES.clear()
+    _PROVIDER_ALIASES.update(_DEFAULT_PROVIDER_ALIASES)
+    _PROVIDER_ALIASES.update(_load_extra_aliases())
+
+
+_PROVIDER_ALIASES = dict(_DEFAULT_PROVIDER_ALIASES)
+reload_aliases()
 
 
 def _normalize_provider(p: str) -> str:

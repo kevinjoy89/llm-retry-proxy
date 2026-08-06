@@ -26,6 +26,7 @@
 - 可选竞速模式、多上游路由和号池多 key 降级
 - **Codex Responses WebSocket 桥接 (SSE2WS)**：双向桥接 `/v1/responses`。`WS → SSE`（请求方向，客户端 WebSocket `response.create` → 上游 HTTP/SSE 请求）+ `SSE → WS`（响应方向，上游 SSE 事件流 → WebSocket JSON 文本帧），多轮 `response.create` 自动衔接（见 [configuration](docs/configuration.md) 的 SSE2WS 段）
 - 按天 JSONL 明细日志、Token/缓存累计汇总和内置可视化分析面板
+- **配置中心管理页**：`/settings` 网页查看/修改全部配置项，重试与 DLP 等运行时参数保存即生效（见 [configuration](docs/configuration.md) 的配置中心页面段）
 
 ## 快速开始
 
@@ -98,11 +99,14 @@ docker compose -f compose.yaml -f compose.legacy.yaml up -d --build
 | `UPSTREAM_URL` | `https://maas-coding-api.cn-huabei-1.xf-yun.com/v2` | 上游地址，不要带尾斜杠 |
 | `LISTEN_HOST` | `0.0.0.0` | 监听地址 |
 | `LISTEN_PORT` | `8080` | 监听端口 |
+| `SETTINGS_PAGE_ENABLED` | `false` | 是否启用配置中心页面（/settings）；关闭时页面与导航入口不展示 |
 | `IP_BLACKLIST` | 空 | 拒绝访问的客户端 IP/CIDR，多个值用逗号分隔 |
 | `TRUSTED_PROXY_IPS` | 本机与 Docker 172.x | 允许提供真实客户端 IP 转发头的反向代理 IP/CIDR |
 | `IP_AUTO_BAN_THRESHOLD` | `20` | 检测窗口内访问不同路径达到该数量时自动封禁；`0` 关闭 |
 | `IP_AUTO_BAN_WINDOW` | `10` | 动态封禁检测窗口（秒） |
 | `IP_AUTO_BAN_DURATION` | `0` | 动态封禁持续时间；`0` 表示永久封禁 |
+| `IP_AUTO_BAN_EXEMPT` | `127.0.0.0/8,::1` | 不参与动态封禁的 IP/CIDR；静态黑名单仍优先 |
+| `IP_BAN_STATE_FILE` | `LOG_DIR/.ip_bans.json` | 动态封禁状态文件，保证重启后封禁继续有效 |
 | `UVICORN_LOOP` | `auto` | Uvicorn 事件循环；旧环境模板设为 `asyncio` |
 | `MAX_RETRIES` | `60` | 单个请求的实际上游尝试总上限；`0` 表示无限重试 |
 | `RETRY_INTERVAL` | `1.0` | 非 429 错误的重试间隔/退避基数 |

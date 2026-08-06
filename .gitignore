@@ -37,8 +37,10 @@ desktop.ini
 *~
 
 # Local tooling & AI tools
+.worktrees/
 .omo/
 .opencode/
 .codegraph/
 .playwright-mcp/
 .codegraph
+.zcode
