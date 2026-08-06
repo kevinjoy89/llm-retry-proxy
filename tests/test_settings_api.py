@@ -202,10 +202,23 @@ class SettingsPostTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["applied"], ["RETRY_INTERVAL"])
             self.assertEqual(settings.retry_interval, 3.3)
             # 写文件时以写入新值为主，文件行不会被删除
-            _, updates_arg, _ = writer.call_args.args
+            _, updates_arg, removes_arg = writer.call_args.args
             self.assertIn("RETRY_INTERVAL", updates_arg)
+            self.assertNotIn("RETRY_INTERVAL", removes_arg)
+            self.assertNotIn("RETRY_INTERVAL", result["removed"])
         finally:
             settings.retry_interval = original
+
+    async def test_updates_must_be_object(self):
+        with self.assertRaises(HTTPException) as raised:
+            await self._post({"updates": []})
+        self.assertEqual(raised.exception.status_code, 400)
+
+    async def test_remove_must_be_string_array(self):
+        for remove in (1, "RETRY_INTERVAL", {}, [1]):
+            with self.subTest(remove=remove), self.assertRaises(HTTPException) as raised:
+                await self._post({"remove": remove})
+            self.assertEqual(raised.exception.status_code, 400)
 
     async def test_invalid_csv_rejected(self):
         # csv 类型需校验元素（RETRY_STATUS_CODES 必须为整数），非法值返回 400 而非 500

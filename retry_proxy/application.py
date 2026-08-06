@@ -331,12 +331,17 @@ def _redact_secrets(values: dict) -> dict:
 
 async def settings_post(request: Request):
     body = await _json_object(request, allow_empty=True)
-    updates = body.get("updates") or {}
-    remove = set(body.get("remove") or [])
+    updates = body.get("updates")
+    remove = body.get("remove")
+    if updates is None:
+        updates = {}
+    if remove is None:
+        remove = []
     if not isinstance(updates, dict):
         raise HTTPException(status_code=400, detail="updates 必须是对象")
-    if not isinstance(remove, (list, set, tuple)) or not all(isinstance(k, str) for k in remove):
+    if not isinstance(remove, list) or not all(isinstance(k, str) for k in remove):
         raise HTTPException(status_code=400, detail="remove 必须是字符串数组")
+    remove = set(remove)
 
     normalized = {}
     removals = set(remove)
@@ -378,6 +383,8 @@ async def settings_post(request: Request):
         elif key not in restart:
             restart.append(key)
 
+    # 同一键同时出现时 updates 优先，响应和日志也不应再把它报告为已移除。
+    removals.difference_update(normalized)
     persisted = False
     if normalized or removals:
         persisted = update_env_file(_ENV_FILE_PATH, normalized, removals)
