@@ -213,6 +213,28 @@ class SettingsPageTests(unittest.TestCase):
                      '在线同步', 'Token 统计', '上游兼容', '请求正文敏感信息防护'):
             self.assertIn(name, self.html, name)
 
+    def test_split_ip_editors_declared(self):
+        # IP/CIDR 双组编辑器仅覆盖 TRUSTED_PROXY_IPS 与 IP_AUTO_BAN_EXEMPT 两个键，
+        # 不得误拆其他配置项（如 IP_BLACKLIST 保持普通单行输入）
+        self.assertIn('const SPLIT_EDITORS = {', self.html, 'settings.html 缺少 SPLIT_EDITORS 声明')
+        self.assertIn('TRUSTED_PROXY_IPS: {label4: \'IPv4Network\', label6: \'IPv6Network\'}', self.html,
+                      'SPLIT_EDITORS 缺少 TRUSTED_PROXY_IPS 键')
+        self.assertIn('IP_AUTO_BAN_EXEMPT: {label4: \'IPv4Network\', label6: \'IPv6Network\'}', self.html,
+                      'SPLIT_EDITORS 缺少 IP_AUTO_BAN_EXEMPT 键')
+        self.assertNotIn('IP_BLACKLIST', self.html.split('const SPLIT_EDITORS', 1)[1], 'IP_BLACKLIST 不应被拆分为双组编辑器')
+
+    def test_split_ip_functions_present(self):
+        # 双组拆分/拼接纯函数必须存在：拆分按含冒号归 IPv6，拼接时空组省略
+        self.assertIn('function splitIpGroups(', self.html, 'settings.html 缺少 splitIpGroups 函数')
+        self.assertIn('function joinIpGroups(', self.html, 'settings.html 缺少 joinIpGroups 函数')
+
+    def test_split_editor_rendering_wired(self):
+        # 双组编辑器必须接入渲染、样式、绑定与重置四处分支，否则页面交互不生效
+        self.assertIn('if(SPLIT_EDITORS[it.key]){', self.html, 'controlHtml 缺少 SPLIT_EDITORS 分支')
+        self.assertIn('ROW_EDITORS[it.key] || SPLIT_EDITORS[it.key]', self.html, 'stacked 样式条件未包含 SPLIT_EDITORS')
+        self.assertIn('document.querySelectorAll(\'.split-editor[data-key]\')', self.html, 'bindEvents 缺少双组编辑器绑定')
+        self.assertIn('classList.contains(\'split-editor\')', self.html, '重置分支缺少 split-editor 处理')
+
 
 class NavLinkTests(unittest.TestCase):
     def test_all_pages_link_to_settings(self):

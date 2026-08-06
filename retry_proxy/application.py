@@ -216,6 +216,17 @@ async def settings_page():
     return HTMLResponse("settings.html not found", status_code=404)
 
 
+def _fmt_ip_network(net):
+    """ipaddress 网络对象转可写回 .env 的纯文本：去掉 /32、/128 全掩码后缀"""
+    s = str(net)
+    mx = getattr(net, "max_prefixlen", None)
+    if mx is not None:
+        suffix = f"/{mx}"
+        if s.endswith(suffix):
+            return s[:-len(suffix)]
+    return s
+
+
 def _effective_value(item) -> str:
     """返回配置项的当前生效值（优先 Settings 属性，无属性时读环境变量）"""
     attr = item.attr or item.key.lower()
@@ -226,6 +237,10 @@ def _effective_value(item) -> str:
         value = getattr(settings, attr)
     if isinstance(value, frozenset):
         return ",".join(str(v) for v in sorted(value))
+    if isinstance(value, tuple):
+        # IP/CIDR 元组（parse_ip_networks 产物）：还原为逗号分隔纯文本，
+        # 避免 Python repr（如 IPv4Network('...')）写入 .env 导致重启解析失败
+        return ",".join(_fmt_ip_network(v) for v in value)
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)

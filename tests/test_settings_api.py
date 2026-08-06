@@ -10,9 +10,10 @@ from unittest.mock import patch
 from fastapi import HTTPException
 from starlette.requests import Request
 
-from retry_proxy.application import settings_get, settings_post
+from retry_proxy.access_control import parse_ip_networks
+from retry_proxy.application import _effective_value, settings_get, settings_post
 from retry_proxy.config import settings
-from retry_proxy.settings_meta import CONFIG_ITEMS
+from retry_proxy.settings_meta import CONFIG_ITEMS, CONFIG_ITEMS_BY_KEY
 
 
 def _json_request(payload: dict) -> Request:
@@ -329,6 +330,48 @@ class SettingsPageToggleTests(unittest.IsolatedAsyncioTestCase):
                 body = getattr(res, "body", b"")
                 text = body.decode("utf-8") if isinstance(body, bytes) else str(body)
                 self.assertIn('<a href="/settings">配置</a>', text)
+
+
+class EffectiveValueIpTests(unittest.TestCase):
+    """IP/CIDR 元组键的生效值必须还原为纯 CIDR 逗号串，不得泄漏 Python repr"""
+
+    def test_trusted_proxy_ips_tuple_formatted_as_plain_cidr(self):
+        # 无 .env 回填场景：tuple 生效值应还原为逗号分隔纯文本，IPv6 不带 /128 后缀
+        with patch.object(settings, "trusted_proxy_ips",
+                          parse_ip_networks("127.0.0.0/8,::1", "TRUSTED_PROXY_IPS")):
+            value = _effective_value(CONFIG_ITEMS_BY_KEY["TRUSTED_PROXY_IPS"])
+        self.assertEqual(value, "127.0.0.0/8,::1",
+                         "IP 键生效值应还原为纯 CIDR 逗号串，且无 repr、无 /128")
+
+    def test_ip_auto_ban_exempt_tuple_formatted_as_plain_cidr(self):
+        with patch.object(settings, "ip_auto_ban_exempt",
+                          parse_ip_networks("127.0.0.0/8,::1", "IP_AUTO_BAN_EXEMPT")):
+            value = _effective_value(CONFIG_ITEMS_BY_KEY["IP_AUTO_BAN_EXEMPT"])
+        self.assertEqual(value, "127.0.0.0/8,::1",
+                         "IP_AUTO_BAN_EXEMPT 生效值应还原为纯 CIDR 逗号串")
+
+    def test_ip_blacklist_empty_tuple_returns_empty_string(self):
+        with patch.object(settings, "ip_blacklist", ()):
+            value = _effective_value(CONFIG_ITEMS_BY_KEY["IP_BLACKLIST"])
+        self.assertEqual(value, "", "空 IP 元组应序列化为空串而非 Python repr '()'")
+
+    def test_frozenset_branch_still_sorted_csv(self):
+        # 既有 frozenset 分支不回归：仍输出升序排序的逗号串
+        with patch.object(settings, "retry_status_codes", frozenset({504, 502, 503})):
+            value = _effective_value(CONFIG_ITEMS_BY_KEY["RETRY_STATUS_CODES"])
+        self.assertEqual(value, "502,503,504", "frozenset 分支应保持既有排序逗号串行为")
+
+    def test_bool_branch_still_lowercase(self):
+        # 既有 bool 分支不回归：仍输出小写 true/false
+        with patch.object(settings, "settings_page_enabled", False):
+            value = _effective_value(CONFIG_ITEMS_BY_KEY["SETTINGS_PAGE_ENABLED"])
+        self.assertEqual(value, "false", "bool 分支应保持既有小写串行为")
+
+    def test_str_branch_passthrough(self):
+        # 既有 str 分支不回归：普通字符串原样返回
+        with patch.object(settings, "sse2ws_mode", "bridge"):
+            value = _effective_value(CONFIG_ITEMS_BY_KEY["SSE2WS_MODE"])
+        self.assertEqual(value, "bridge", "str 分支应保持原样透传")
 
 
 if __name__ == "__main__":

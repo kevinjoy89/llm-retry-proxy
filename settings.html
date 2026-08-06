@@ -127,6 +127,9 @@
     .alias-editor .alias-add{align-self:flex-start;display:inline-flex;align-items:center;gap:4px;min-height:26px;padding:0 10px;border:1px dashed var(--border-strong);border-radius:var(--radius-xs);background:var(--card-2);color:var(--text-2);font-size:12px;transition:color .15s,border-color .15s,background .15s}
     .alias-editor .alias-add:hover{border-color:var(--primary);color:var(--primary-d);background:var(--primary-l)}
     .alias-editor .alias-secret-hint{color:var(--muted-2);font-size:11px;padding-left:2px}
+    .split-editor{display:flex;flex-direction:column;gap:8px}
+    .split-field{display:flex;flex-direction:column;gap:4px}
+    .split-label{font-size:12px;color:#526071}
 
     .pill{display:inline-flex;align-items:center;height:20px;padding:0 8px;border-radius:99px;font-size:10.5px;font-weight:600;letter-spacing:.02em;white-space:nowrap}
     .pill.ok{background:var(--ok-l);color:var(--ok-d)}
@@ -220,6 +223,26 @@ const ROW_EDITORS = {
     serializeRow: r => (r.url || r.provider) ? [r.url || '', r.provider || '', r.keys || ''].join('|') : (r.keys || ''),
   },
 };
+
+// IP/CIDR 双组编辑器：IPv4 与 IPv6 分开输入，保存时以逗号拼接提交
+const SPLIT_EDITORS = {
+  TRUSTED_PROXY_IPS: {label4: 'IPv4Network', label6: 'IPv6Network'},
+  IP_AUTO_BAN_EXEMPT: {label4: 'IPv4Network', label6: 'IPv6Network'},
+};
+function splitIpGroups(value){
+  // 按逗号拆分为 IPv4/IPv6 两组：含冒号的条目归 IPv6，其余归 IPv4
+  const v4 = [], v6 = [];
+  for(const entry of String(value || '').split(',')){
+    const e = entry.trim();
+    if(!e) continue;
+    (e.includes(':') ? v6 : v4).push(e);
+  }
+  return {v4: v4.join(', '), v6: v6.join(', ')};
+}
+function joinIpGroups(v4, v6){
+  // IPv4 组在前、IPv6 组在后，逗号拼接；空组省略
+  return [v4, v6].map(s => String(s || '').trim()).filter(Boolean).join(',');
+}
 function parseRowValue(value, cfg){
   const rows = [];
   for(const entry of String(value || '').split(',')){
@@ -319,6 +342,16 @@ function controlHtml(it){
       `<button type="button" class="alias-add" title="新增一行">＋ 添加行</button>`+
       `</div>`;
   }
+  if(SPLIT_EDITORS[it.key]){
+    const cfg = SPLIT_EDITORS[it.key];
+    const groups = splitIpGroups(val);
+    return `<span class="split-editor" id="ctrl-${it.key}" data-key="${it.key}">`+
+      `<span class="split-field"><span class="split-label">${esc(cfg.label4)}</span>`+
+      `<input type="text" class="split-v4" value="${esc(groups.v4)}" placeholder="如 127.0.0.0/8, 172.16.0.0/12"></span>`+
+      `<span class="split-field"><span class="split-label">${esc(cfg.label6)}</span>`+
+      `<input type="text" class="split-v6" value="${esc(groups.v6)}" placeholder="如 ::1"></span>`+
+      `</span>`;
+  }
   const step=it.type==='int'?'step="1"':(it.type==='float'?'step="any"':'');
   const type=it.type==='int'||it.type==='float'?'number':'text';
   const placeholder=it.secret?(it.configured?'已配置（留空不修改，输入新值覆盖）':'未配置'):`默认: ${it.default}`;
@@ -341,6 +374,13 @@ function effectiveText(it){
     const count = parseRowValue(it.effective_value, ROW_EDITORS[it.key]).length;
     return '当前生效: ' + (count ? count + ' 条' : '（空）');
   }
+  if(SPLIT_EDITORS[it.key]){
+    // 双组编辑器按 IPv4/IPv6 条数呈现生效状态
+    const g = splitIpGroups(it.effective_value);
+    const n4 = g.v4 ? g.v4.split(',').filter(s => s.trim()).length : 0;
+    const n6 = g.v6 ? g.v6.split(',').filter(s => s.trim()).length : 0;
+    return '当前生效: ' + (n4 + n6 ? n4 + ' IPv4 + ' + n6 + ' IPv6' : '（空）');
+  }
   return '当前生效: '+esc(eff||'（空）')+(eff!==def?' · 默认: '+esc(def||'（空）'):'');
 }
 
@@ -354,7 +394,7 @@ function render(){
     const rows=items.filter(it=>!it.hidden).map(it=>{
       const pills=[applyPill(it),it.secret?'<span class="pill danger">敏感</span>':''].join(' ');
       const resetBtn=`<button class="reset" data-reset="${it.key}" title="恢复默认值">↺ 重置</button>`;
-      const stacked = ROW_EDITORS[it.key] ? ' item-stacked' : '';
+      const stacked = (ROW_EDITORS[it.key] || SPLIT_EDITORS[it.key]) ? ' item-stacked' : '';
       return `<div class="item${stacked}" data-key="${it.key}">
         <div class="item-label">
           <div class="key"><span class="cname">${esc(it.name||it.key)}</span> ${pills}</div>
@@ -464,6 +504,15 @@ function bindEvents(){
       if(add)addAliasRow(editor,key);
     });
   });
+  // IP/CIDR 双组编辑器：两个输入框的值拼接后同步到 DIRTY
+  document.querySelectorAll('.split-editor[data-key]').forEach(editor=>{
+    const key = editor.dataset.key;
+    const v4 = editor.querySelector('.split-v4');
+    const v6 = editor.querySelector('.split-v6');
+    const sync = () => { DIRTY[key] = joinIpGroups(v4.value, v6.value); updateSaveState(); };
+    v4.addEventListener('input', sync);
+    v6.addEventListener('input', sync);
+  });
   document.querySelectorAll('[data-reset]').forEach(btn=>{
     btn.addEventListener('click',()=>{
       const key=btn.dataset.reset;
@@ -480,7 +529,8 @@ function bindEvents(){
         else if(ctrl.classList.contains('alias-editor')){
           ctrl.querySelector('.alias-rows').innerHTML='';
           syncAliasEditor(ctrl,key);
-        }else ctrl.value='';
+        }else if(ctrl.classList.contains('split-editor')){ ctrl.querySelector('.split-v4').value=''; ctrl.querySelector('.split-v6').value=''; }
+        else ctrl.value='';
       }
       updateSaveState();
     });

@@ -140,6 +140,42 @@ class SettingsMetaTests(unittest.TestCase):
         self.assertLess(keys.index("ADMIN_PASSWORD"), keys.index("SETTINGS_PAGE_ENABLED"))
         self.assertLess(keys.index("SETTINGS_PAGE_ENABLED"), keys.index("ADMIN_COOKIE_SECURE"))
 
+    def test_ip_ban_keys_metadata(self):
+        # IP 访问控制 7 键：分组、生效方式、敏感性与类型登记正确，且顺序位于号池鉴权键之间
+        ip_keys = [
+            "IP_BLACKLIST",
+            "TRUSTED_PROXY_IPS",
+            "IP_AUTO_BAN_THRESHOLD",
+            "IP_AUTO_BAN_WINDOW",
+            "IP_AUTO_BAN_DURATION",
+            "IP_AUTO_BAN_EXEMPT",
+            "IP_BAN_STATE_FILE",
+        ]
+        for key in ip_keys:
+            self.assertIn(key, CONFIG_ITEMS_BY_KEY, f"{key} 未登记进 settings_meta.py")
+            item = CONFIG_ITEMS_BY_KEY[key]
+            self.assertEqual(item.group, "服务与访问控制", key)
+            self.assertEqual(item.apply, RESTART, key)
+            self.assertFalse(item.secret, key)
+        self.assertEqual(CONFIG_ITEMS_BY_KEY["IP_AUTO_BAN_WINDOW"].unit, "秒")
+        self.assertEqual(CONFIG_ITEMS_BY_KEY["IP_AUTO_BAN_DURATION"].unit, "秒")
+        self.assertEqual(CONFIG_ITEMS_BY_KEY["IP_BLACKLIST"].unit, "")
+        expected_types = {
+            "IP_BLACKLIST": "csv",
+            "TRUSTED_PROXY_IPS": "csv",
+            "IP_AUTO_BAN_THRESHOLD": "int",
+            "IP_AUTO_BAN_WINDOW": "float",
+            "IP_AUTO_BAN_DURATION": "float",
+            "IP_AUTO_BAN_EXEMPT": "csv",
+            "IP_BAN_STATE_FILE": "str",
+        }
+        for key, expected in expected_types.items():
+            self.assertEqual(CONFIG_ITEMS_BY_KEY[key].type, expected, key)
+        keys = [item.key for item in CONFIG_ITEMS if item.group == "服务与访问控制"]
+        for key in ip_keys:
+            self.assertLess(keys.index("PROXY_API_KEY"), keys.index(key), key)
+            self.assertLess(keys.index(key), keys.index("PROVIDER_ALIASES"), key)
+
     def test_secret_keys_are_marked(self):
         marked = {item.key for item in CONFIG_ITEMS if item.secret}
         self.assertEqual(marked, SECRET_KEYS)
@@ -169,9 +205,13 @@ class SettingsMetaTests(unittest.TestCase):
             if key == "KEY_POOL_SYNC_STATE_FILE":
                 # config.py 字面默认是空串，实际默认由 LOG_DIR 拼接，meta 以展示默认值为准
                 continue
+            if key == "IP_BAN_STATE_FILE":
+                # config.py 字面默认是空串，实际默认由 LOG_DIR 拼接，meta 以展示默认值为准
+                continue
             self.assertEqual(item.default, cfg_default, key)
         self.assertEqual(CONFIG_ITEMS_BY_KEY["KEY_POOL_SYNC_URL"].default, "UPSTREAM_URL")
         self.assertEqual(CONFIG_ITEMS_BY_KEY["KEY_POOL_SYNC_STATE_FILE"].default, "logs/.key_pool_sync.json")
+        self.assertEqual(CONFIG_ITEMS_BY_KEY["IP_BAN_STATE_FILE"].default, "logs/.ip_bans.json")
         self.assertEqual(CONFIG_ITEMS_BY_KEY["DLP_RULE_FILE"].default, "retry_proxy/dlp_rules.yaml")
 
     def test_hot_items_are_read_per_request(self):
